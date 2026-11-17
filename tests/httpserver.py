@@ -39,6 +39,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "/ok")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif self.path == "/redir-cross-origin":
+            self.send_response(302)
+            self.send_header("Location", "http://localhost:%d/auth" % self.server.server_port)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/redir-to-auth":
+            self.send_response(302)
+            self.send_header("Location", "/auth")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/auth":
+            self._send(200, "auth=%s cookie=%s" % (
+                self.headers.get("Authorization") or "-",
+                self.headers.get("Cookie") or "-"))
         elif self.path == "/latin1":
             self._send(200, "caf\xe9".encode("iso-8859-1"), "text/plain; charset=iso-8859-1")
         elif self.path == "/chunked":

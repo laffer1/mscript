@@ -62,3 +62,16 @@ WScript.Echo "noop-ok"
 w.Open "GET", BASE & "/ok", False
 w.Abort
 WScript.Echo "aborted=" & w.readyState
+
+' --- shared request validation, including Option(0) user agent ---
+On Error Resume Next
+w.Open "GET" & vbCrLf & "X-Evil: 1", BASE & "/ok", False
+WScript.Echo "method-rejected=" & (Err.Number <> 0)
+Err.Clear
+w.Open "GET", BASE & "/ok", False
+w.SetRequestHeader "X-Test", "ok" & vbCrLf & "X-Evil: 1"
+WScript.Echo "header-rejected=" & (Err.Number <> 0)
+Err.Clear
+w.Option(0) = "agent" & vbCrLf & "X-Evil: 1"
+WScript.Echo "ua-rejected=" & (Err.Number <> 0)
+On Error GoTo 0

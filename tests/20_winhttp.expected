@@ -15,3 +15,6 @@ noredir=302
 missing=404|nope
 noop-ok
 aborted=0
+method-rejected=True
+header-rejected=True
+ua-rejected=True
