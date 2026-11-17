@@ -40,8 +40,13 @@ targets
 .Qq Scripting.Dictionary ,
 .Qq Scripting.FileSystemObject ,
 .Qq WScript.Shell ,
+.Qq WScript.Network ,
 and
-.Qq WScript.Network .
+.Qq ADODB.Stream
+(in-memory text/binary streams with
+.Dv LoadFromFile
+and
+.Dv SaveToFile ) .
 .Pp
 When the script is given as
 .Qq - ,
@@ -115,6 +120,14 @@ classes and error handling).
 .Sh LIMITATIONS
 .Fn CreateObject
 supports only the progIDs listed above; other COM objects raise error 429.
+In
+.Qq ADODB.Stream ,
+.Dv Position
+is a byte offset and
+.Dv Write /
+.Dv WriteText /
+.Dv CopyTo
+overwrite at the current position, as in ADODB.
 .Dv MsgBox
 prints to stdout and returns
 .Dv vbOK

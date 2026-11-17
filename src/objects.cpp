@@ -655,6 +655,236 @@ static std::shared_ptr<MapObject> makeFSO(Interp& ip) {
     return f;
 }
 
+// ---------- ADODB.Stream ----------
+
+struct AdoData {
+    int type = 2;            // adTypeText (1 = adTypeBinary)
+    int mode = 3;            // adModeReadWrite
+    std::string charset = "utf-8";
+    std::string buf;         // raw bytes
+    size_t pos = 0;          // byte offset
+    int lineSep = -1;        // adCRLF
+    bool open = false;
+};
+
+static std::string charsetEncode(const std::string& s, const std::string& cs) {
+    if (cs == "utf-8" || cs == "utf8") return s;
+    // ascii / latin-1 family: one byte per char, '?' for unencodable
+    std::string out;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = s[i];
+        unsigned cp; size_t adv;
+        if (c < 0x80) { cp = c; adv = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; adv = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; adv = 3; }
+        else { cp = c & 0x07; adv = 4; }
+        for (size_t k = 1; k < adv && i + k < s.size(); k++) cp = (cp << 6) | (s[i + k] & 0x3F);
+        i += adv;
+        out += (cp <= 0xFF) ? (char)cp : '?';
+    }
+    return out;
+}
+
+static std::string charsetDecode(const std::string& bytes, const std::string& cs) {
+    if (cs == "utf-8" || cs == "utf8") return bytes;
+    std::string out;
+    for (unsigned char c : bytes) {
+        if (c < 0x80) out += (char)c;
+        else { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
+    }
+    return out;
+}
+
+static std::string normCharset(std::string cs) {
+    cs = lower(trim(cs));
+    if (cs == "utf8") return "utf-8";
+    if (cs == "ascii" || cs == "us-ascii") return "us-ascii";
+    if (cs == "latin1" || cs == "iso-8859-1" || cs == "windows-1252" || cs == "iso8859-1") return "iso-8859-1";
+    return cs; // unknown charsets pass through as utf-8
+}
+
+struct AdoStream : MapObject {
+    std::shared_ptr<AdoData> d;
+    explicit AdoStream(std::shared_ptr<AdoData> data) : d(std::move(data)) { kind = "ADODB.Stream"; }
+
+    Variant getMember(const std::string& n) override {
+        if (n == "type") return Variant::mkInt(d->type);
+        if (n == "mode") return Variant::mkInt(d->mode);
+        if (n == "charset") return Variant::mkStr(d->charset);
+        if (n == "position") return Variant::mkLong((long long)d->pos);
+        if (n == "size") return Variant::mkLong((long long)d->buf.size());
+        if (n == "eos") return Variant::mkBool(d->pos >= d->buf.size());
+        if (n == "lineseparator") return Variant::mkInt(d->lineSep);
+        if (n == "state") return Variant::mkInt(d->open ? 1 : 0); // adStateOpen / adStateClosed
+        return MapObject::getMember(n);
+    }
+    void setMember(const std::string& n, const Variant& v) override {
+        if (n == "type") { long long t = toInt64(v); if (t != 1 && t != 2) throwErr(5, errDesc(5)); d->type = (int)t; return; }
+        if (n == "mode") { d->mode = (int)toInt64(v); return; }
+        if (n == "charset") { d->charset = normCharset(toStr(v)); return; }
+        if (n == "position") {
+            long long p = toInt64(v);
+            if (p < 0) p = 0;
+            if ((size_t)p > d->buf.size()) p = (long long)d->buf.size();
+            d->pos = (size_t)p;
+            return;
+        }
+        if (n == "lineseparator") { long long ls = toInt64(v); if (ls != -1 && ls != 10 && ls != 13) throwErr(5, errDesc(5)); d->lineSep = (int)ls; return; }
+        MapObject::setMember(n, v);
+    }
+};
+
+static std::shared_ptr<MapObject> makeAdoStream() {
+    auto data = std::make_shared<AdoData>();
+    auto s = std::make_shared<AdoStream>(data);
+
+    auto requireOpen = [data]() {
+        if (!data->open) throwErr(3001, "Operation is not allowed when the object is closed");
+    };
+    s->methods["open"] = [data](MapObject*, std::vector<Variant>&) -> Variant {
+        data->open = true;
+        data->pos = 0;
+        return Variant();
+    };
+    s->methods["close"] = [data](MapObject*, std::vector<Variant>&) -> Variant {
+        data->open = false;
+        return Variant();
+    };
+    s->methods["cancel"] = [](MapObject*, std::vector<Variant>&) -> Variant { return Variant(); };
+    s->methods["flush"] = [requireOpen](MapObject*, std::vector<Variant>&) -> Variant {
+        requireOpen();
+        return Variant();
+    };
+    s->methods["writetext"] = [data, requireOpen](MapObject*, std::vector<Variant>& a) -> Variant {
+        requireOpen();
+        if (a.empty()) throwErr(450, errDesc(450));
+        std::string text = toStr(a[0]);
+        std::string bytes = charsetEncode(text, data->charset);
+        // ADODB overwrites at the current position (extending if needed)
+        data->buf.replace(data->pos, bytes.size(), bytes);
+        data->pos += bytes.size();
+        return Variant();
+    };
+    s->methods["write"] = [data, requireOpen](MapObject*, std::vector<Variant>& a) -> Variant {
+        requireOpen();
+        if (a.empty()) throwErr(450, errDesc(450));
+        const Variant& v = a[0];
+        std::string bytes;
+        if (v.t == VT::Array && v.arr) {
+            for (auto& e : v.arr->data) {
+                long long b = toInt64(e);
+                if (b < 0 || b > 255) throwErr(5, errDesc(5));
+                bytes += (char)b;
+            }
+        } else {
+            bytes = toStr(v); // raw bytes of the string
+        }
+        data->buf.replace(data->pos, bytes.size(), bytes);
+        data->pos += bytes.size();
+        return Variant();
+    };
+    s->methods["read"] = [data, requireOpen](MapObject*, std::vector<Variant>& a) -> Variant {
+        requireOpen();
+        long long n = a.empty() ? -1 : toInt64(a[0]); // -1 = adReadAll
+        size_t avail = data->buf.size() - data->pos;
+        size_t take = (n < 0) ? avail : std::min(avail, (size_t)n);
+        auto arr = std::make_shared<VArray>();
+        arr->base = 0;
+        arr->dims = {(long long)take};
+        for (size_t i = 0; i < take; i++) arr->data.push_back(Variant::mkInt((unsigned char)data->buf[data->pos + i]));
+        arr->allocated = true;
+        data->pos += take;
+        return Variant::mkArr(arr);
+    };
+    s->methods["readtext"] = [data, requireOpen](MapObject*, std::vector<Variant>& a) -> Variant {
+        requireOpen();
+        long long n = a.empty() ? -1 : toInt64(a[0]); // -1 adReadAll, -2 adReadLine
+        if (n == -2) {
+            // read one line (terminated by LF, CR, or CRLF), without the terminator
+            size_t start = data->pos;
+            size_t nl = data->buf.find('\n', start);
+            size_t cr = data->buf.find('\r', start);
+            size_t end, next;
+            if (nl == std::string::npos && cr == std::string::npos) { end = data->buf.size(); next = end; }
+            else if (cr != std::string::npos && (nl == std::string::npos || cr < nl)) {
+                end = cr;
+                next = (cr + 1 < data->buf.size() && data->buf[cr + 1] == '\n') ? cr + 2 : cr + 1;
+            } else { end = nl; next = nl + 1; }
+            std::string line = charsetDecode(data->buf.substr(start, end - start), data->charset);
+            data->pos = next;
+            return Variant::mkStr(line);
+        }
+        size_t avail = data->buf.size() - data->pos;
+        if (n < 0) {
+            std::string s = charsetDecode(data->buf.substr(data->pos), data->charset);
+            data->pos = data->buf.size();
+            return Variant::mkStr(s);
+        }
+        // n characters (code points) for utf-8, bytes otherwise
+        size_t take = std::min(avail, (size_t)n);
+        if (data->charset == "utf-8" || data->charset == "utf8") {
+            // count n code points
+            size_t i = data->pos, cnt = 0;
+            while (i < data->buf.size() && cnt < (size_t)n) {
+                unsigned char c = data->buf[i];
+                size_t adv = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2 : ((c & 0xF0) == 0xE0) ? 3 : 4;
+                i += adv; cnt++;
+            }
+            take = i - data->pos;
+        }
+        std::string s = charsetDecode(data->buf.substr(data->pos, take), data->charset);
+        data->pos += take;
+        return Variant::mkStr(s);
+    };
+    s->methods["savetofile"] = [data, requireOpen](MapObject*, std::vector<Variant>& a) -> Variant {
+        requireOpen();
+        if (a.empty()) throwErr(450, errDesc(450));
+        std::string path = toStr(a[0]);
+        long long opt = a.size() >= 2 ? toInt64(a[1]) : 2; // default adSaveCreateOverWrite
+        std::error_code ec;
+        if (opt == 1 && fs::exists(path, ec)) throwErr(58, "File already exists");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) throwErr(70, "Permission denied");
+        out.write(data->buf.data(), (std::streamsize)data->buf.size());
+        return Variant();
+    };
+    s->methods["loadfromfile"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.empty()) throwErr(450, errDesc(450));
+        std::string path = toStr(a[0]);
+        std::error_code ec;
+        if (!fs::is_regular_file(path, ec)) throwErr(53, "File not found");
+        std::ifstream in(path, std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        data->buf = ss.str();
+        data->pos = 0;
+        data->open = true;
+        return Variant();
+    };
+    s->methods["copyto"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.empty()) throwErr(450, errDesc(450));
+        const Variant& dst = a[0];
+        if (dst.t != VT::Object || !dst.obj) throwErr(424, errDesc(424));
+        auto* other = dynamic_cast<AdoStream*>(dst.obj.get());
+        if (!other) throwErr(13, errDesc(13));
+        long long n = a.size() >= 2 ? toInt64(a[1]) : -1; // -1 = all remaining
+        size_t avail = data->buf.size() - data->pos;
+        size_t take = (n < 0) ? avail : std::min(avail, (size_t)n);
+        std::string chunk = data->buf.substr(data->pos, take);
+        other->d->buf.replace(other->d->pos, chunk.size(), chunk); // overwrite like ADODB
+        other->d->pos += take;
+        data->pos += take;
+        return Variant();
+    };
+    s->methods["seteos"] = [data, requireOpen](MapObject*, std::vector<Variant>&) -> Variant {
+        requireOpen();
+        data->buf.resize(data->pos);
+        return Variant();
+    };
+    return s;
+}
+
 // ---------- WScript.Shell / WScript.Network ----------
 
 static std::shared_ptr<MapObject> makeShell() {
@@ -730,5 +960,6 @@ std::shared_ptr<VBObject> createHostObject(Interp& ip, const std::string& progId
     if (progId == "scripting.filesystemobject") return makeFSO(ip);
     if (progId == "wscript.shell") return makeShell();
     if (progId == "wscript.network") return makeNetwork();
+    if (progId == "adodb.stream" || progId.rfind("adodb.stream.", 0) == 0) return makeAdoStream();
     return nullptr;
 }

@@ -78,7 +78,10 @@ WScript.Echo "sum = " & total        ' sum = 5050
 - **Host objects** — `WScript` (`Echo`, `Quit`, `Sleep`, `Arguments`, `StdIn/StdOut/StdErr`,
   `ScriptName`), `Err`, and `CreateObject` for `Scripting.Dictionary`,
   `Scripting.FileSystemObject` (files, folders, `TextStream`), `WScript.Shell`,
-  `WScript.Network`
+  `WScript.Network`, and `ADODB.Stream` (in-memory text/binary streams:
+  `Type`, `Mode`, `Charset`, `Position`, `Size`, `EOS`, `LineSeparator`,
+  `Open`/`Close`/`Read`/`ReadText`/`Write`/`WriteText`/`Flush`/`CopyTo`/`SetEOS`/
+  `LoadFromFile`/`SaveToFile`, plus the `adType*`/`adMode*`/`adSave*`/`adRead*`/`adCR`/`adLF`/`adCRLF`/`adState*` constants)
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
@@ -104,8 +107,11 @@ WScript.Echo "sum = " & total        ' sum = 5050
 
 ## Known limitations
 
-- `CreateObject` supports only the progIDs listed above; other COM objects raise
-  error 429 ("ActiveX component can't create object").
+- `CreateObject` supports only the progIDs listed above (`Scripting.Dictionary`,
+  `Scripting.FileSystemObject`, `WScript.Shell`, `WScript.Network`, `ADODB.Stream`);
+  other COM objects raise error 429 ("ActiveX component can't create object").
+  In `ADODB.Stream`, `Position` is a byte offset and `Write`/`WriteText`/`CopyTo`
+  overwrite at the current position, as in ADODB.
 - `MsgBox` prints to stdout and returns `vbOK` (no GUI); `InputBox` reads stdin.
 - Case folding (`UCase`/`LCase`/text compare) is ASCII-only; strings are UTF-8.
 - No named arguments (`:=`), no `GetRef`, no `VBScript.RegExp`.

@@ -352,6 +352,25 @@ void registerConstants(Interp& ip) {
     add("TristateUseDefault", Variant::mkInt(-2));
     add("TristateTrue", Variant::mkInt(-1));
     add("TristateFalse", Variant::mkInt(0));
+    // ADODB.Stream constants
+    add("adTypeBinary", Variant::mkInt(1));
+    add("adTypeText", Variant::mkInt(2));
+    add("adModeUnknown", Variant::mkInt(0));
+    add("adModeRead", Variant::mkInt(1));
+    add("adModeWrite", Variant::mkInt(2));
+    add("adModeReadWrite", Variant::mkInt(3));
+    add("adModeShareDenyRead", Variant::mkInt(4));
+    add("adModeShareDenyWrite", Variant::mkInt(8));
+    add("adModeShareExclusive", Variant::mkInt(12));
+    add("adSaveCreateNotExist", Variant::mkInt(1));
+    add("adSaveCreateOverWrite", Variant::mkInt(2));
+    add("adReadAll", Variant::mkInt(-1));
+    add("adReadLine", Variant::mkInt(-2));
+    add("adCRLF", Variant::mkInt(-1));
+    add("adLF", Variant::mkInt(10));
+    add("adCR", Variant::mkInt(13));
+    add("adStateClosed", Variant::mkInt(0));
+    add("adStateOpen", Variant::mkInt(1));
 }
 
 void registerBuiltins(Interp& ip) {

@@ -1,0 +1,21 @@
+0
+1 True 0
+size=30 eos=True
+line
+ one
+line two
+line three
+eos=True
+[line one
+line two
+line three]
+binsize=5
+4 72 111 He
+72
+2
+file exists: True
+loaded size=26
+saved content
+second line
+[Xcdef]
+[abc]
