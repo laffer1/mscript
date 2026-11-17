@@ -149,8 +149,9 @@ WScript.Echo "sum = " & total        ' sum = 5050
   is accepted but ignored, `onreadystatechange` is not fired — there is no `GetRef`;
   `WaitForResponse` returns `True` immediately). Over `https://`/`file://` (libfetch)
   response headers are not exposed, so `getResponseHeader` returns `""` and `status` is
-  200 on success or mapped from the error reason (e.g. 404); binary request bodies over
-  `https://` are truncated at the first NUL byte (libfetch takes a C string).
+  200 on success or mapped from the error reason (e.g. 404); binary request bodies
+  containing NUL over `https://` are rejected because libfetch takes a C string.
+  Responses are limited to 64 MiB.
   `WinHttpRequest` honors `Option(6)` (EnableRedirects) only on the built-in `http://`
   path — libfetch always follows redirects. `SetProxy`/`SetClientCertificate` are no-ops
   (proxies come from `http_proxy`/`HTTP_PROXY`).

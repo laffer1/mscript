@@ -17,3 +17,10 @@ xmlb=two
 latin=café|True
 file=200|True
 aborted=0
+method-rejected=True
+url-rejected=True
+header-rejected=True
+framing-rejected=True
+cross-origin=auth=- cookie=-
+same-origin=auth=Bearer private cookie=-
+open-clears-headers=auth=- cookie=-
