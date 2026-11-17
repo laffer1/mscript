@@ -131,8 +131,7 @@ and
 backed by SQLite3, the database library in the base system
 (connection strings
 .Qq Provider=SQLite3;Data Source=file.db ,
-a bare path or
-.Qq :memory: ;
+a bare path or ":memory:" also work;
 only the SQLite3 provider is supported;
 .Dv Mode
 .Dv adModeRead
@@ -166,7 +165,7 @@ supports
 .Pq Dv adCmdText / adCmdTable ) ,
 .Dv CreateParameter
 and positional
-.Pq Dv ? )
+.Pq Sq ? )
 or named
 .Pq Dv :name )
 parameter binding.
