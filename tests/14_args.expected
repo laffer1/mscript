@@ -1,0 +1,4 @@
+argc=2
+arg(0)=hello
+arg(1)=42
+tests/14_args.vbs

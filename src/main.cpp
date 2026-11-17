@@ -1,0 +1,84 @@
+// main.cpp — mscript command line entry point.
+// usage: mscript [options] <script.vbs> [args...]
+//        mscript -e "code"
+#include "interpreter.h"
+#include "lexer.h"
+#include "objects.h"
+#include "parser.h"
+
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+static void usage() {
+    std::fputs(
+        "mscript — VBScript-compatible interpreter (C++23)\n"
+        "usage:\n"
+        "  mscript <script.vbs> [args...]   run a script file ('-' reads stdin)\n"
+        "  mscript -e \"<code>\"              run code from the command line\n"
+        "  mscript --version                 print version\n"
+        "  mscript --help                    this help\n",
+        stderr);
+}
+
+int main(int argc, char** argv) {
+    std::vector<std::string> args(argv + 1, argv + argc);
+    if (args.empty()) { usage(); return 2; }
+
+    std::string code;
+    std::string srcName = "<command line>";
+    std::vector<std::string> scriptArgs;
+
+    if (args[0] == "--version" || args[0] == "-v") {
+        std::printf("mscript 1.0 (VBScript-compatible interpreter, C++23/clang)\n");
+        return 0;
+    }
+    if (args[0] == "--help" || args[0] == "-h" || args[0] == "/?") {
+        usage();
+        return 0;
+    }
+    if (args[0] == "-e" || args[0] == "--eval") {
+        if (args.size() < 2) { std::fputs("mscript: -e requires an argument\n", stderr); return 2; }
+        code = args[1];
+        scriptArgs.assign(args.begin() + 2, args.end());
+        srcName = "-e";
+    } else {
+        srcName = args[0];
+        scriptArgs.assign(args.begin() + 1, args.end());
+        std::ifstream in(srcName == "-" ? "/dev/stdin" : srcName, std::ios::binary);
+        if (!in) {
+            std::fprintf(stderr, "mscript: cannot open '%s'\n", srcName.c_str());
+            return 2;
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        code = ss.str();
+    }
+
+    Program prog;
+    try {
+        prog = Parser(lex(code)).parseProgram();
+    } catch (ParseError& e) {
+        std::fprintf(stderr, "mscript: %s(%d): syntax error: %s\n", srcName.c_str(), e.line, e.msg.c_str());
+        return 1;
+    }
+
+    Interp ip;
+    initWScript(ip, srcName, srcName, scriptArgs);
+    ip.load(prog, srcName);
+    try {
+        ip.run();
+    } catch (VBSError& e) {
+        unsigned hex = (unsigned)(e.number | 0x800A0000);
+        std::fprintf(stderr, "mscript: %s(%d): Microsoft VBScript runtime error '%08x': %s\n",
+                     srcName.c_str(), e.line, hex, e.what());
+        return 1;
+    } catch (ParseError& e) {
+        std::fprintf(stderr, "mscript: %s(%d): syntax error: %s\n", srcName.c_str(), e.line, e.msg.c_str());
+        return 1;
+    }
+    return ip.exitCode;
+}

@@ -1,0 +1,10 @@
+after div0: err=11 Division by zero
+cleared: 0
+type mismatch: 13
+handler off
+1234 mysource custom problem
+boom err=11
+True True True
+null arith err=11
+subscript err=9
+survived

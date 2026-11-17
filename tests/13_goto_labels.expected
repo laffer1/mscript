@@ -1,0 +1,4 @@
+goto loop i=3
+caught 11
+done
+at 100

@@ -1,0 +1,20 @@
+/tmp/mscript_test.txt
+exists before: False
+exists after: True
+atend before: False
+line one
+part two
+line: 3
+
+line three
+
+atend after: True
+mscript_test.txt True File
+mscript_test.txt mscript_test .txt
+True
+exists deleted: False
+appended
+
+True
+False
+True
