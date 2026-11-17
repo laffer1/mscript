@@ -676,7 +676,8 @@ ExprPtr Parser::parseBinRest(ExprPtr left, int minPrec) {
         } else break;
         if (prec < 0 || prec < minPrec) break;
         advance();
-        ExprPtr right = parseExpr(op == "^" ? prec : prec + 1);
+        // VBScript binary operators, including exponentiation, associate left to right.
+        ExprPtr right = parseExpr(prec + 1);
         left = Expr::mkBin(op, std::move(left), std::move(right), tk.line);
     }
     return left;

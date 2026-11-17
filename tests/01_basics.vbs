@@ -45,3 +45,10 @@ WScript.Echo e + 5, "x" & e, IsEmpty(e), VarType(e)
 ' Rem comment
 Rem this is a rem comment
 WScript.Echo "done"
+
+' Exponentiation associates left to right; unary signs retain higher precedence.
+WScript.Echo 2^3^2, (2^3)^2, 2^(3^2)
+WScript.Echo -2^2, (-2)^2, -(2^2), +2^2
+WScript.Echo 2^-2, 2^(-2), 2^-2^2, 2^((-2)^2)
+WScript.Echo 2*3^2, 2^3*2, 2^3^2^1
+WScript.Echo Eval("2^3^2"), Eval("-2^2"), Eval("2^-2^2")
