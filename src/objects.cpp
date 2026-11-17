@@ -3,6 +3,7 @@
 
 #include "objects.h"
 #include "interpreter.h"
+#include "regexp.h"
 #include "xmldom.h"
 #include "xmlhttp.h"
 
@@ -971,5 +972,10 @@ std::shared_ptr<VBObject> createHostObject(Interp& ip, const std::string& progId
     if (progId.find("xmlhttp") != std::string::npos &&
         (progId.rfind("msxml", 0) == 0 || progId.rfind("microsoft", 0) == 0))
         return makeXmlHttp(ip);
+    // WinHTTP: WinHttp.WinHttpRequest[.5.1]
+    if (progId.find("winhttprequest") != std::string::npos && progId.rfind("winhttp", 0) == 0)
+        return makeWinHttpRequest(ip);
+    // VBScript.RegExp
+    if (progId == "vbscript.regexp") return makeRegExp(ip);
     return nullptr;
 }

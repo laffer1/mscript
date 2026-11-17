@@ -24,6 +24,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -52,7 +53,7 @@ struct XhrData {
     std::string method = "GET";
     std::string url;
     std::string user, password;
-    long long timeoutMs = 0; // 0 = no timeout
+    long long timeoutMs = 0; // 0 = no timeout (XMLHTTP timeout property)
     bool aborted = false;
     std::vector<std::pair<std::string, std::string>> reqHeaders;
     HttpResponse resp;
@@ -60,6 +61,13 @@ struct XhrData {
     std::string charset = "utf-8";
     std::shared_ptr<VBObject> responseXml;
     bool responseXmlTried = false;
+    // WinHttp.WinHttpRequest additions
+    bool isWinHttp = false;
+    std::string userAgent = "mscript/1.0";   // Option(0)
+    bool enableRedirects = true;             // Option(6), default true in WinHTTP
+    long long maxRedirects = 10;             // Option(14)
+    long long tResolve = 0, tConnect = 0, tSend = 0, tReceive = 0; // SetTimeouts (ms)
+    std::map<std::string, Variant> extraOptions; // other Option values, stored/ignored
 };
 
 std::string headerValue(const std::vector<std::pair<std::string, std::string>>& hs, const std::string& name) {
@@ -356,8 +364,9 @@ std::string decodeBody(const std::string& bytes, const std::string& charset) {
 
 struct XmlHttpRequest : MapObject {
     std::shared_ptr<XhrData> d;
-    explicit XmlHttpRequest(std::shared_ptr<XhrData> data) : d(std::move(data)) {
-        kind = "MSXML2.XMLHTTP";
+    explicit XmlHttpRequest(std::shared_ptr<XhrData> data, bool winhttp = false) : d(std::move(data)) {
+        d->isWinHttp = winhttp;
+        kind = winhttp ? "WinHttp.WinHttpRequest.5.1" : "MSXML2.XMLHTTP";
     }
 
     Variant getMember(const std::string& n) override {
@@ -407,6 +416,166 @@ struct XmlHttpRequest : MapObject {
     }
 };
 
+// ---- shared method implementations (MSXML2.XMLHTTP and WinHttp.WinHttpRequest) ----
+
+static void xhrOpen(const std::shared_ptr<XhrData>& data, std::vector<Variant>& a, bool winhttp) {
+    if (a.size() < 2) throwErr(450, errDesc(450));
+    std::string m = trim(toStr(a[0]));
+    for (auto& ch : m) ch = (char)std::toupper((unsigned char)ch);
+    data->method = m;
+    data->url = trim(toStr(a[1]));
+    if (winhttp) {
+        // a[2] (async) is accepted but requests are always synchronous
+        if (a.size() > 2) data->extraOptions["async"] = Variant::mkBool(toBool(a[2]));
+    } else {
+        if (a.size() > 3) data->user = toStr(a[3]);
+        if (a.size() > 4) data->password = toStr(a[4]);
+    }
+    data->readyState = 1;
+    data->aborted = false;
+    data->hasResponse = false;
+    data->resp = HttpResponse {};
+    data->responseXml.reset();
+    data->responseXmlTried = false;
+}
+
+static void xhrSend(const std::shared_ptr<XhrData>& data, std::vector<Variant>& a) {
+    const char* who = data->isWinHttp ? "WinHttpRequest" : "XMLHTTP";
+    if (data->readyState != 1)
+        throwErr(5, std::string(who) + ": open() must be called before send()");
+    if (data->aborted) {
+        data->aborted = false;
+        data->readyState = 0;
+        return;
+    }
+    std::string body;
+    if (!a.empty()) {
+        const Variant& c = a[0];
+        if (c.t == VT::Array && c.arr) {
+            for (auto& e : c.arr->data) {
+                long long b = toInt64(e);
+                if (b < 0 || b > 255) throwErr(5, errDesc(5));
+                body += (char)b;
+            }
+        } else if (c.t != VT::Empty && c.t != VT::Null) {
+            body = toStr(c); // internal strings are utf-8
+        }
+    }
+    if (data->isWinHttp) {
+        // Option(0) user agent overrides any User-Agent request header
+        bool found = false;
+        for (auto& h : data->reqHeaders)
+            if (lower(h.first) == "user-agent") { h.second = data->userAgent; found = true; }
+        if (!found) data->reqHeaders.emplace_back("User-Agent", data->userAgent);
+    }
+    long long effTimeout = data->timeoutMs;
+    if (effTimeout <= 0) effTimeout = std::max(data->tSend, data->tReceive);
+    int redirects = data->enableRedirects
+        ? (int)std::min<long long>(data->maxRedirects > 0 ? data->maxRedirects : 10, 50)
+        : 0;
+    UrlParts u = parseUrl(data->url);
+    std::string ct = headerValue(data->reqHeaders, "content-type");
+    HttpResponse r = (u.scheme == "http")
+        ? httpRaw(data->method, data->url, data->reqHeaders, body, effTimeout, redirects)
+        : httpViaLibfetch(data->method, data->url, ct, body, data->user, data->password, effTimeout);
+    data->resp = std::move(r);
+    data->hasResponse = true;
+    data->readyState = 4;
+    data->charset = charsetFromContentType(data->resp.header("content-type"));
+    data->responseXml.reset();
+    data->responseXmlTried = false;
+}
+
+static void xhrSetRequestHeader(const std::shared_ptr<XhrData>& data, std::vector<Variant>& a) {
+    if (a.size() < 2) throwErr(450, errDesc(450));
+    if (data->readyState != 1)
+        throwErr(5, "setRequestHeader must be called after open() and before send()");
+    std::string name = toStr(a[0]);
+    std::string value = toStr(a[1]);
+    std::string ln = lower(name);
+    for (auto& h : data->reqHeaders) {
+        if (lower(h.first) == ln) { h.second = value; return; }
+    }
+    data->reqHeaders.emplace_back(name, value);
+}
+
+static Variant xhrGetAllResponseHeaders(const std::shared_ptr<XhrData>& data) {
+    if (!data->hasResponse) return Variant::mkStr("");
+    std::string s;
+    for (auto& h : data->resp.headers) s += h.first + ": " + h.second + "\r\n";
+    return Variant::mkStr(s);
+}
+
+static Variant xhrGetResponseHeader(const std::shared_ptr<XhrData>& data, std::vector<Variant>& a) {
+    if (a.empty()) throwErr(450, errDesc(450));
+    if (!data->hasResponse) return Variant::mkStr("");
+    return Variant::mkStr(data->resp.header(lower(toStr(a[0]))));
+}
+
+static void xhrAbort(const std::shared_ptr<XhrData>& data) {
+    data->aborted = true;
+    data->readyState = 0;
+    data->hasResponse = false;
+    data->resp = HttpResponse {};
+}
+
+// ---- WinHttp.WinHttpRequest Option property (parameterized: x.Option(n) [/= v]) ----
+// WinHttpRequestOption values (winhttp.h): 0 UserAgentString, 1 URL (read-only),
+// 6 EnableRedirects, 14 MaxAutomaticRedirects, others accepted and stored.
+
+static Variant xhrGetOption(XhrData& d, long long n) {
+    switch (n) {
+    case 0: return Variant::mkStr(d.userAgent);
+    case 1: return Variant::mkStr(d.url);
+    case 6: return Variant::mkBool(d.enableRedirects);
+    case 14: return Variant::mkLong(d.maxRedirects);
+    default: {
+        auto it = d.extraOptions.find(std::to_string(n));
+        return it != d.extraOptions.end() ? it->second : Variant();
+    }
+    }
+}
+
+static void xhrSetOption(XhrData& d, long long n, const Variant& v) {
+    switch (n) {
+    case 0: d.userAgent = toStr(v); return;
+    case 1: throwErr(5, "WinHttpRequestOption_URL (Option(1)) is read-only"); return;
+    case 6: d.enableRedirects = toBool(v); return;
+    case 14: {
+        long long m = toInt64(v);
+        if (m < 0) throwErr(5, errDesc(5));
+        d.maxRedirects = m;
+        return;
+    }
+    default: d.extraOptions[std::to_string(n)] = v; return;
+    }
+}
+
+struct OptionProxy : VBObject {
+    std::shared_ptr<XhrData> d;
+    explicit OptionProxy(std::shared_ptr<XhrData> data) : d(std::move(data)) {}
+    Variant invoke(const std::vector<Variant>& args) override { // x.Option(n)
+        if (args.empty()) throwErr(450, errDesc(450));
+        return xhrGetOption(*d, toInt64(args[0]));
+    }
+    void assignInvoke(const std::vector<Variant>& args, const Variant& v) override { // x.Option(n) = v
+        if (args.empty()) throwErr(450, errDesc(450));
+        xhrSetOption(*d, toInt64(args[0]), v);
+    }
+    std::string objectKind() const override { return "WinHttpRequestOption"; }
+};
+
+struct WinHttpRequest : XmlHttpRequest {
+    explicit WinHttpRequest(std::shared_ptr<XhrData> data) : XmlHttpRequest(data, true) {}
+    bool hasMember(const std::string& n) const override {
+        return n == "option" || XmlHttpRequest::hasMember(n);
+    }
+    Variant getMember(const std::string& n) override {
+        if (n == "option") return Variant::mkObj(std::make_shared<OptionProxy>(d));
+        return XmlHttpRequest::getMember(n);
+    }
+};
+
 } // namespace
 
 std::shared_ptr<VBObject> makeXmlHttp(Interp& interp) {
@@ -415,90 +584,77 @@ std::shared_ptr<VBObject> makeXmlHttp(Interp& interp) {
     auto o = std::make_shared<XmlHttpRequest>(data);
 
     o->methods["open"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
-        if (a.size() < 2) throwErr(450, errDesc(450));
-        std::string m = trim(toStr(a[0]));
-        for (auto& ch : m) ch = (char)std::toupper((unsigned char)ch);
-        data->method = m;
-        data->url = trim(toStr(a[1]));
-        if (a.size() > 3) data->user = toStr(a[3]);
-        if (a.size() > 4) data->password = toStr(a[4]);
-        // a[2] (async) is accepted but requests are always synchronous
-        data->readyState = 1;
-        data->aborted = false;
-        data->hasResponse = false;
-        data->resp = HttpResponse {};
-        data->responseXml.reset();
-        data->responseXmlTried = false;
+        xhrOpen(data, a, false);
         return Variant();
     };
-
     o->methods["send"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
-        if (data->readyState != 1) throwErr(5, "XMLHTTP: open() must be called before send()");
-        if (data->aborted) {
-            data->aborted = false;
-            data->readyState = 0;
-            return Variant();
-        }
-        std::string body;
-        if (!a.empty()) {
-            const Variant& c = a[0];
-            if (c.t == VT::Array && c.arr) {
-                for (auto& e : c.arr->data) {
-                    long long b = toInt64(e);
-                    if (b < 0 || b > 255) throwErr(5, errDesc(5));
-                    body += (char)b;
-                }
-            } else if (c.t != VT::Empty && c.t != VT::Null) {
-                body = toStr(c); // internal strings are utf-8
-            }
-        }
-        UrlParts u = parseUrl(data->url);
-        std::string ct = headerValue(data->reqHeaders, "content-type");
-        HttpResponse r = (u.scheme == "http")
-            ? httpRaw(data->method, data->url, data->reqHeaders, body, data->timeoutMs, 5)
-            : httpViaLibfetch(data->method, data->url, ct, body, data->user, data->password, data->timeoutMs);
-        data->resp = std::move(r);
-        data->hasResponse = true;
-        data->readyState = 4;
-        data->charset = charsetFromContentType(data->resp.header("content-type"));
-        data->responseXml.reset();
-        data->responseXmlTried = false;
+        xhrSend(data, a);
         return Variant();
     };
-
     o->methods["setrequestheader"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
-        if (a.size() < 2) throwErr(450, errDesc(450));
-        if (data->readyState != 1) throwErr(5, "XMLHTTP: setRequestHeader must be called after open()");
-        std::string name = toStr(a[0]);
-        std::string value = toStr(a[1]);
-        std::string ln = lower(name);
-        for (auto& h : data->reqHeaders) {
-            if (lower(h.first) == ln) { h.second = value; return Variant(); }
-        }
-        data->reqHeaders.emplace_back(name, value);
+        xhrSetRequestHeader(data, a);
         return Variant();
     };
-
     o->methods["getallresponseheaders"] = [data](MapObject*, std::vector<Variant>&) -> Variant {
-        if (!data->hasResponse) return Variant::mkStr("");
-        std::string s;
-        for (auto& h : data->resp.headers) s += h.first + ": " + h.second + "\r\n";
-        return Variant::mkStr(s);
+        return xhrGetAllResponseHeaders(data);
     };
-
     o->methods["getresponseheader"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
-        if (a.empty()) throwErr(450, errDesc(450));
-        if (!data->hasResponse) return Variant::mkStr("");
-        return Variant::mkStr(data->resp.header(lower(toStr(a[0]))));
+        return xhrGetResponseHeader(data, a);
     };
-
     o->methods["abort"] = [data](MapObject*, std::vector<Variant>&) -> Variant {
-        data->aborted = true;
-        data->readyState = 0;
-        data->hasResponse = false;
-        data->resp = HttpResponse {};
+        xhrAbort(data);
         return Variant();
     };
+    return o;
+}
 
+std::shared_ptr<VBObject> makeWinHttpRequest(Interp& interp) {
+    auto data = std::make_shared<XhrData>();
+    data->interp = &interp;
+    auto o = std::make_shared<WinHttpRequest>(data);
+
+    o->methods["open"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        xhrOpen(data, a, true);
+        return Variant();
+    };
+    o->methods["send"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        xhrSend(data, a);
+        return Variant();
+    };
+    o->methods["setrequestheader"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        xhrSetRequestHeader(data, a);
+        return Variant();
+    };
+    o->methods["getallresponseheaders"] = [data](MapObject*, std::vector<Variant>&) -> Variant {
+        return xhrGetAllResponseHeaders(data);
+    };
+    o->methods["getresponseheader"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        return xhrGetResponseHeader(data, a);
+    };
+    o->methods["abort"] = [data](MapObject*, std::vector<Variant>&) -> Variant {
+        xhrAbort(data);
+        return Variant();
+    };
+    o->methods["waitforresponse"] = [](MapObject*, std::vector<Variant>&) -> Variant {
+        return Variant::mkBool(true); // requests are always synchronous
+    };
+    o->methods["settimeouts"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.size() < 4) throwErr(450, errDesc(450));
+        data->tResolve = toInt64(a[0]);
+        data->tConnect = toInt64(a[1]);
+        data->tSend = toInt64(a[2]);
+        data->tReceive = toInt64(a[3]);
+        return Variant();
+    };
+    o->methods["setcredentials"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.size() < 2) throwErr(450, errDesc(450));
+        data->user = toStr(a[0]);
+        data->password = toStr(a[1]); // a[2] (flags) accepted, ignored
+        return Variant();
+    };
+    // Proxies are honored via http_proxy/HTTP_PROXY env (and libfetch env vars);
+    // SetProxy/SetClientCertificate are accepted as no-ops.
+    o->methods["setproxy"] = [](MapObject*, std::vector<Variant>&) -> Variant { return Variant(); };
+    o->methods["setclientcertificate"] = [](MapObject*, std::vector<Variant>&) -> Variant { return Variant(); };
     return o;
 }

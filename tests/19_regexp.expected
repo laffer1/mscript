@@ -1,0 +1,28 @@
+defaults=|False|False|False
+test=True
+noglobal-test=False
+count=2
+m=12-xy @4 len=5 subs=2 s0=12 s1=xy
+m=34-q @13 len=4 subs=2 s0=34 s1=q
+item1=34-q
+item-missing-isnothing=True
+empty-sub=True|a
+rep1=bX bX!
+repg=b[aa] b[aa]!
+repl-groups=mail <b@a> end
+repl-dollar=a[a|b|c']c
+repl-2digit=<k|$|i>
+s-class=True|False
+class-d=True|False
+d-range=True
+noncap-shift=[1]!
+dot-nl=False
+ml=True
+noml=False
+icase=True
+case=False
+empty-count=4
+err-b=5 Invalid regular expression: \b is not supported by the system regex
+err-backref=5
+err-nongreedy=5
+err-look=5

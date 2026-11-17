@@ -1,0 +1,17 @@
+default-ua=mscript/1.0
+default-redir=True
+ua-set=mscript-test/1.0
+wait=True
+readyState=4
+status=200 OK
+text=hello-body
+hdr=yes
+url-opt=http://127.0.0.1:18099/ok
+bodylen=10
+has-hdr=True
+echo=ct=application/x-test x-test=zz ua=agent-x body=hello=1
+redir=200|hello-body
+noredir=302
+missing=404|nope
+noop-ok
+aborted=0
