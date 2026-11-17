@@ -139,8 +139,8 @@ WScript.Echo "sum = " & total        ' sum = 5050
   but ignored, `onreadystatechange` is not fired — there is no `GetRef`). Over
   `https://`/`file://` (libfetch) response headers are not exposed, so
   `getResponseHeader` returns `""` and `status` is 200 on success or mapped from the
-  error reason (e.g. 404); binary request bodies over `https://` are truncated at the
-  first NUL byte (libfetch takes a C string).
+  error reason (e.g. 404); binary request bodies containing NUL over `https://` are
+  rejected because libfetch takes a C string. Responses are limited to 64 MiB.
 - `MsgBox` prints to stdout and returns `vbOK` (no GUI); `InputBox` reads stdin.
 - Case folding (`UCase`/`LCase`/text compare) is ASCII-only; strings are UTF-8.
 - No named arguments (`:=`), no `GetRef`, no `VBScript.RegExp`.

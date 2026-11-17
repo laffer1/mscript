@@ -25,6 +25,8 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -32,6 +34,8 @@
 #include <vector>
 
 namespace {
+
+constexpr size_t MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 
 struct HttpResponse {
     int status = 0;
@@ -68,6 +72,27 @@ std::string headerValue(const std::vector<std::pair<std::string, std::string>>& 
     return "";
 }
 
+bool isToken(const std::string& s) {
+    if (s.empty()) return false;
+    for (unsigned char c : s)
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9')) &&
+            std::string("!#$%&'*+-.^_`|~").find(c) == std::string::npos)
+            return false;
+    return true;
+}
+
+bool hasControl(const std::string& s) {
+    for (unsigned char c : s) if (c < 0x20 || c == 0x7f) return true;
+    return false;
+}
+
+void validateUrl(const std::string& url) {
+    // A URL becomes the HTTP request target (or a libfetch C string).
+    if (url.empty() || hasControl(url) || url.find(' ') != std::string::npos)
+        throwErr(5, "XMLHTTP: invalid URL");
+}
+
 // ---- URL helpers (parsing via libfetch) ----
 
 struct UrlParts {
@@ -75,6 +100,7 @@ struct UrlParts {
 };
 
 UrlParts parseUrl(const std::string& url) {
+    validateUrl(url);
     UrlParts p;
     struct url* u = fetchParseURL(url.c_str());
     if (!u) throwErr(5, "XMLHTTP: invalid URL '" + url + "'");
@@ -85,12 +111,16 @@ UrlParts parseUrl(const std::string& url) {
     p.port = std::to_string(port);
     p.doc = (u->doc && *u->doc) ? u->doc : "/";
     fetchFreeURL(u);
-    if ((p.scheme == "http" || p.scheme == "https") && p.host.empty())
+    if (p.scheme != "http" && p.scheme != "https" && p.scheme != "file")
+        throwErr(5, "XMLHTTP: unsupported URL scheme");
+    if ((p.scheme == "http" || p.scheme == "https") &&
+        (p.host.empty() || hasControl(p.host)))
         throwErr(5, "XMLHTTP: invalid URL '" + url + "'");
     return p;
 }
 
 std::string resolveUrl(const std::string& base, const std::string& loc) {
+    validateUrl(loc);
     if (loc.rfind("http://", 0) == 0 || loc.rfind("https://", 0) == 0) return loc;
     UrlParts b = parseUrl(base);
     std::string origin = b.scheme + "://" + b.host;
@@ -101,6 +131,11 @@ std::string resolveUrl(const std::string& base, const std::string& loc) {
     size_t slash = dir.rfind('/');
     if (slash != std::string::npos) dir = dir.substr(0, slash + 1); else dir = "/";
     return origin + dir + loc;
+}
+
+bool sameOrigin(const std::string& a, const std::string& b) {
+    UrlParts x = parseUrl(a), y = parseUrl(b);
+    return x.scheme == y.scheme && lower(x.host) == lower(y.host) && x.port == y.port;
 }
 
 // ---- raw HTTP/1.1 over POSIX sockets (http://) ----
@@ -115,10 +150,11 @@ bool dechunk(const std::string& in, std::string& out) {
         if (semi != std::string::npos) line = line.substr(0, semi);
         char* end = nullptr;
         long sz = std::strtol(line.c_str(), &end, 16);
-        if (end == line.c_str() || sz < 0) return false;
+        if (end == line.c_str() || *end != '\0' || sz < 0) return false;
         if (sz == 0) return true;
         i = e + 2;
-        if (i + (size_t)sz + 2 > in.size()) return false;
+        if ((size_t)sz > in.size() - i || in.size() - i - (size_t)sz < 2) return false;
+        if (in[i + (size_t)sz] != '\r' || in[i + (size_t)sz + 1] != '\n') return false;
         out.append(in, i, (size_t)sz);
         i += (size_t)sz + 2; // data + CRLF
     }
@@ -136,6 +172,7 @@ HttpResponse httpRaw(const std::string& method, const std::string& url,
     if (!proxy) proxy = std::getenv("HTTP_PROXY");
     if (proxy && *proxy) {
         std::string ps = proxy;
+        validateUrl(ps);
         size_t s = ps.find("://");
         if (s != std::string::npos) ps = ps.substr(s + 3);
         size_t slash = ps.find('/');
@@ -144,6 +181,8 @@ HttpResponse httpRaw(const std::string& method, const std::string& url,
         if (colon != std::string::npos) { connectHost = ps.substr(0, colon); connectPort = ps.substr(colon + 1); }
         else connectHost = ps;
         if (connectPort.empty()) connectPort = "8080";
+        if (connectHost.empty() || hasControl(connectHost) || hasControl(connectPort))
+            throwErr(5, "XMLHTTP: invalid proxy");
         target = url; // absolute URI for proxies
     }
 
@@ -198,6 +237,10 @@ HttpResponse httpRaw(const std::string& method, const std::string& url,
         ssize_t n = recv(fd, buf, sizeof buf, 0);
         if (n < 0) { close(fd); throwErr(5, "XMLHTTP: receive failed (timeout or connection error)"); }
         if (n == 0) break;
+        if ((size_t)n > MAX_RESPONSE_BYTES - raw.size()) {
+            close(fd);
+            throwErr(5, "XMLHTTP: response too large");
+        }
         raw.append(buf, (size_t)n);
     }
     close(fd);
@@ -246,7 +289,21 @@ HttpResponse httpRaw(const std::string& method, const std::string& url,
         std::string loc = out.header("location");
         if (!loc.empty()) {
             bool toGet = (out.status == 303);
-            return httpRaw(toGet ? "GET" : method, resolveUrl(url, loc), headers,
+            std::string next = resolveUrl(url, loc);
+            // Never send credentials to a different origin after a redirect.
+            auto nextHeaders = headers;
+            if (!sameOrigin(url, next)) {
+                nextHeaders.erase(std::remove_if(nextHeaders.begin(), nextHeaders.end(), [](const auto& h) {
+                    std::string n = lower(h.first);
+                    return n == "authorization" || n == "proxy-authorization" || n == "cookie";
+                }), nextHeaders.end());
+            }
+            if (toGet) {
+                nextHeaders.erase(std::remove_if(nextHeaders.begin(), nextHeaders.end(), [](const auto& h) {
+                    return lower(h.first) == "content-type";
+                }), nextHeaders.end());
+            }
+            return httpRaw(toGet ? "GET" : method, next, nextHeaders,
                            toGet ? "" : body, timeoutMs, redirectsLeft - 1);
         }
     }
@@ -276,9 +333,18 @@ HttpResponse httpViaLibfetch(const std::string& method, const std::string& url,
                              const std::string& contentType, const std::string& body,
                              const std::string& user, const std::string& password,
                              long long timeoutMs) {
-    if (timeoutMs > 0) fetchTimeout = (int)(timeoutMs / 1000);
+    struct TimeoutGuard {
+        int old = fetchTimeout;
+        ~TimeoutGuard() { fetchTimeout = old; }
+    } timeoutGuard;
+    if (timeoutMs > 0)
+        fetchTimeout = (int)std::min(timeoutMs / 1000 + (timeoutMs % 1000 != 0), (long long)INT_MAX);
     struct url* u = fetchParseURL(url.c_str());
     if (!u) throwErr(5, "XMLHTTP: invalid URL '" + url + "'");
+    if (user.size() >= sizeof u->user || password.size() >= sizeof u->pwd) {
+        fetchFreeURL(u);
+        throwErr(5, "XMLHTTP: credentials too long");
+    }
     if (!user.empty()) {
         std::strncpy(u->user, user.c_str(), sizeof u->user - 1);
         u->user[sizeof u->user - 1] = '\0';
@@ -291,12 +357,18 @@ HttpResponse httpViaLibfetch(const std::string& method, const std::string& url,
     FILE* f = nullptr;
     if (scheme == "file") {
         f = fetchGetFile(u, "");
-    } else {
+    } else if (scheme == "https") {
+        if (body.find('\0') != std::string::npos) {
+            fetchFreeURL(u);
+            throwErr(5, "XMLHTTP: libfetch cannot send a binary request body");
+        }
         f = fetchReqHTTP(u, method.c_str(), "",
                          contentType.empty() ? nullptr : contentType.c_str(),
                          body.empty() ? nullptr : body.c_str());
     }
     fetchFreeURL(u);
+    if (scheme != "file" && scheme != "https")
+        throwErr(5, "XMLHTTP: unsupported URL scheme");
 
     HttpResponse out;
     if (!f) {
@@ -315,8 +387,16 @@ HttpResponse httpViaLibfetch(const std::string& method, const std::string& url,
     out.statusText = "OK";
     char buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.body.append(buf, n);
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        if (n > MAX_RESPONSE_BYTES - out.body.size()) {
+            fclose(f);
+            throwErr(5, "XMLHTTP: response too large");
+        }
+        out.body.append(buf, n);
+    }
+    bool readError = ferror(f);
     fclose(f);
+    if (readError) throwErr(5, "XMLHTTP: response read failed");
     return out;
 }
 
@@ -418,10 +498,14 @@ std::shared_ptr<VBObject> makeXmlHttp(Interp& interp) {
         if (a.size() < 2) throwErr(450, errDesc(450));
         std::string m = trim(toStr(a[0]));
         for (auto& ch : m) ch = (char)std::toupper((unsigned char)ch);
+        if (!isToken(m)) throwErr(5, "XMLHTTP: invalid method");
+        std::string url = trim(toStr(a[1]));
+        parseUrl(url);
         data->method = m;
-        data->url = trim(toStr(a[1]));
-        if (a.size() > 3) data->user = toStr(a[3]);
-        if (a.size() > 4) data->password = toStr(a[4]);
+        data->url = url;
+        data->user = a.size() > 3 ? toStr(a[3]) : "";
+        data->password = a.size() > 4 ? toStr(a[4]) : "";
+        data->reqHeaders.clear();
         // a[2] (async) is accepted but requests are always synchronous
         data->readyState = 1;
         data->aborted = false;
@@ -472,6 +556,11 @@ std::shared_ptr<VBObject> makeXmlHttp(Interp& interp) {
         std::string name = toStr(a[0]);
         std::string value = toStr(a[1]);
         std::string ln = lower(name);
+        if (!isToken(name) || hasControl(value)) throwErr(5, "XMLHTTP: invalid header");
+        // Framing and connection headers are generated by this client.
+        if (ln == "host" || ln == "content-length" || ln == "transfer-encoding" ||
+            ln == "connection" || ln == "proxy-connection")
+            throwErr(5, "XMLHTTP: reserved header");
         for (auto& h : data->reqHeaders) {
             if (lower(h.first) == ln) { h.second = value; return Variant(); }
         }

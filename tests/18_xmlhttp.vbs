@@ -87,3 +87,34 @@ WScript.Echo "file=" & x8.status & "|" & (InStr(x8.responseText, "Option Explici
 x8.Open "GET", BASE & "/ok", False
 x8.abort
 WScript.Echo "aborted=" & x8.readyState
+
+' --- request validation and redirect credential isolation ---
+Dim x9
+Set x9 = CreateObject("MSXML2.XMLHTTP")
+On Error Resume Next
+x9.Open "GET" & vbCrLf & "X-Evil: 1", BASE & "/ok", False
+WScript.Echo "method-rejected=" & (Err.Number <> 0)
+Err.Clear
+x9.Open "GET", BASE & "/ok" & vbCrLf & "X-Evil: 1", False
+WScript.Echo "url-rejected=" & (Err.Number <> 0)
+Err.Clear
+x9.Open "GET", BASE & "/ok", False
+x9.setRequestHeader "X-Test", "ok" & vbCrLf & "X-Evil: 1"
+WScript.Echo "header-rejected=" & (Err.Number <> 0)
+Err.Clear
+x9.setRequestHeader "Content-Length", "0"
+WScript.Echo "framing-rejected=" & (Err.Number <> 0)
+Err.Clear
+x9.Open "GET", BASE & "/redir-cross-origin", False
+x9.setRequestHeader "Authorization", "Bearer private"
+x9.setRequestHeader "Cookie", "session=private"
+x9.Send
+WScript.Echo "cross-origin=" & x9.responseText
+x9.Open "GET", BASE & "/redir-to-auth", False
+x9.setRequestHeader "Authorization", "Bearer private"
+x9.Send
+WScript.Echo "same-origin=" & x9.responseText
+x9.Open "GET", BASE & "/auth", False
+x9.Send
+WScript.Echo "open-clears-headers=" & x9.responseText
+On Error GoTo 0
