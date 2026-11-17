@@ -1,0 +1,133 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\" Copyright (c) 2026 Lucas Holt. All rights reserved.
+.Dd November 17, 2026
+.Dt MSCRIPT 1
+.Os
+.Sh NAME
+.Nm mscript
+.Nd VBScript-compatible interpreter
+.Sh SYNOPSIS
+.Nm
+.Op Fl e Ar code | Ar script.vbs Op Ar args ...
+.Nm
+.Fl v | Fl Fl version
+.Nm
+.Fl h | Fl Fl help
+.Sh DESCRIPTION
+.Nm
+is a tree-walking interpreter for the VBScript language, written in C++23 and
+built with the system Clang compiler.
+It executes
+.Pa .vbs
+scripts directly, without WSH/cscript.
+.Pp
+The interpreter implements Variant semantics (Empty, Null, Boolean, Integer,
+Long, Double, Date, String, arrays and objects), the full VBScript operator
+set, all standard control-flow constructs, procedures with
+.Ar ByVal/ByRef
+parameters, classes, error handling via
+.Dv On Error
+and the
+.Dv Err
+object, and the usual built-in functions (string, math, date/time,
+conversion).
+Host objects include
+.Dv WScript ,
+.Dv Err ,
+and
+.Fn CreateObject
+targets
+.Qq Scripting.Dictionary ,
+.Qq Scripting.FileSystemObject ,
+.Qq WScript.Shell ,
+and
+.Qq WScript.Network .
+.Pp
+When the script is given as
+.Qq - ,
+source is read from standard input.
+Arguments following the script name are available to the script through
+.Dv WScript.Arguments .
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl e , Fl Fl eval Ar code
+Execute
+.Ar code
+instead of a script file.
+.It Fl h , Fl Fl help
+Print a usage summary and exit.
+.It Fl v , Fl Fl version
+Print the version and exit.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev WSCRIPT_PATH
+Reported by
+.Dv WScript.Path
+when set (defaults to
+.Qq / ) .
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /usr/local/bin/mscript
+The interpreter binary.
+.It Pa /usr/local/share/man/man1/mscript.1
+This manual page.
+.El
+.Sh EXIT STATUS
+.Ex -std mscript
+Normally, the exit status is 0.
+If the script calls
+.Dv WScript.Quit ,
+the given code is used.
+A usage error exits with 2.
+A syntax error or an unhandled VBScript runtime error exits with 1 and prints
+a diagnostic of the form:
+.Bd -literal -offset indent
+mscript: script.vbs(12): Microsoft VBScript runtime error
+    '800a0009': Subscript out of range
+.Ed
+.Sh EXAMPLES
+Run a script file:
+.Bd -literal -offset indent
+$ mscript hello.vbs
+Hello, World!
+.Ed
+.Pp
+Run code from the command line:
+.Bd -literal -offset indent
+$ mscript -e 'WScript.Echo 6 * 7'
+42
+.Ed
+.Pp
+Read a script from standard input:
+.Bd -literal -offset indent
+$ echo 'WScript.Echo "hi"' | mscript -
+hi
+.Ed
+.Pp
+A larger example ships in
+.Pa examples/demo.vbs
+(a word-frequency report using
+.Qq Scripting.Dictionary ,
+.Qq Scripting.FileSystemObject ,
+classes and error handling).
+.Sh LIMITATIONS
+.Fn CreateObject
+supports only the progIDs listed above; other COM objects raise error 429.
+.Dv MsgBox
+prints to stdout and returns
+.Dv vbOK
+(no GUI);
+.Dv InputBox
+reads a line from standard input.
+Case folding is ASCII-only.
+Named arguments (:=), GetRef and VBScript.RegExp are not supported.
+.Sh SEE ALSO
+.Lk https://github.com/laffer1/mscript "mscript on GitHub"
+.Sh LICENSE
+BSD 2-Clause.
+See the
+.Pa LICENSE
+file in the source distribution.
+Copyright (c) 2026 Lucas Holt.

@@ -14,7 +14,19 @@ mscript: $(SRC) $(HDR)
 test: mscript
 	sh tests/run.sh
 
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+MANDIR ?= $(PREFIX)/share/man
+
+install: mscript
+	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(MANDIR)/man1
+	install -m 755 mscript $(DESTDIR)$(BINDIR)/mscript
+	install -m 644 man/mscript.1 $(DESTDIR)$(MANDIR)/man1/mscript.1
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/mscript $(DESTDIR)$(MANDIR)/man1/mscript.1
+
 clean:
 	rm -f mscript
 
-.PHONY: test clean
+.PHONY: test install uninstall clean

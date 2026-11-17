@@ -12,6 +12,13 @@ $ make test           # runs the test suite (18 scripts)
 passed: 18  failed: 0
 ```
 
+Install the binary and its manual page system-wide (default prefix `/usr/local`):
+
+```
+$ sudo make install   # → /usr/local/bin/mscript, /usr/local/share/man/man1/mscript.1
+$ man mscript         # read the mscript(1) manual page
+```
+
 ## Usage
 
 ```
@@ -91,6 +98,7 @@ WScript.Echo "sum = " & total        ' sum = 5050
 │   ├── builtins.{h,cpp}     built-in functions and vb* constants
 │   └── objects.{h,cpp}      WScript, Err, Scripting.Dictionary, FileSystemObject
 ├── tests/              18 .vbs tests + .expected outputs + run.sh (make test)
+├── man/mscript.1       mdoc manual page (installed by make install)
 └── examples/demo.vbs   word-frequency report demo
 ```
 
