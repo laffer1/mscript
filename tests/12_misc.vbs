@@ -1,3 +1,6 @@
+' SPDX-License-Identifier: BSD-2-Clause
+' Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 ' misc: logical ops, comparisons, conversions, misc functions
 WScript.Echo IIf(3 > 2, "yes", "no"), IIf(1 > 2, "yes", "no")
 WScript.Echo Choose(2, "a", "b", "c"), IsNull(Choose(9, "a"))

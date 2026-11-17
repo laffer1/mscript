@@ -1,3 +1,6 @@
+' SPDX-License-Identifier: BSD-2-Clause
+' Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 ' basics: output, arithmetic, strings, coercion, comments, colons, continuation
 WScript.Echo "Hello, World!"
 

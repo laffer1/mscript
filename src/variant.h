@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 // variant.h — VBScript Variant value model, coercions, operators, arrays, dates.
 #pragma once
 

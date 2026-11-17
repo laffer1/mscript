@@ -1,3 +1,6 @@
+' SPDX-License-Identifier: BSD-2-Clause
+' Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 ' dates (fixed dates only, deterministic)
 Dim d
 d = DateSerial(2024, 2, 29)

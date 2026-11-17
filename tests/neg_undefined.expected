@@ -1,1 +1,1 @@
-mscript: tests/neg_undefined.vbs(4): Microsoft VBScript runtime error '800a01f4': Variable is undefined
+mscript: tests/neg_undefined.vbs(7): Microsoft VBScript runtime error '800a01f4': Variable is undefined

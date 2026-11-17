@@ -1,3 +1,6 @@
+' SPDX-License-Identifier: BSD-2-Clause
+' Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 ' arrays
 Dim a(4)
 a(0) = 10 : a(1) = 20 : a(2) = 30 : a(3) = 40 : a(4) = 50

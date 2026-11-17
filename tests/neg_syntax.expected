@@ -1,2 +1,2 @@
-mscript: tests/neg_syntax.vbs(2): syntax error: expected expression (found '
+mscript: tests/neg_syntax.vbs(5): syntax error: expected expression (found '
 ')

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 # mscript — build with the system clang (BSD make syntax)
 # (plain '=' so the ambient CXX/CXXFLAGS env vars don't override; command line still can)
 CXX      = clang++

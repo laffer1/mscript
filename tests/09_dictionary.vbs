@@ -1,3 +1,6 @@
+' SPDX-License-Identifier: BSD-2-Clause
+' Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 ' Scripting.Dictionary
 Dim d
 Set d = CreateObject("Scripting.Dictionary")
