@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Lucas Holt. All rights reserved.
 
 #include "objects.h"
+#include "adodb.h"
 #include "interpreter.h"
 #include "regexp.h"
 #include "xmldom.h"
@@ -964,6 +965,10 @@ std::shared_ptr<VBObject> createHostObject(Interp& ip, const std::string& progId
     if (progId == "wscript.shell") return makeShell();
     if (progId == "wscript.network") return makeNetwork();
     if (progId == "adodb.stream" || progId.rfind("adodb.stream.", 0) == 0) return makeAdoStream();
+    // ADODB database objects on SQLite3 (base system): ADODB.Connection / Recordset / Command
+    if (progId == "adodb.connection" || progId.rfind("adodb.connection.", 0) == 0) return makeAdoConnection(ip);
+    if (progId == "adodb.recordset" || progId.rfind("adodb.recordset.", 0) == 0) return makeAdoRecordset(ip);
+    if (progId == "adodb.command" || progId.rfind("adodb.command.", 0) == 0) return makeAdoCommand(ip);
     // MSXML DOM: MSXML2.DOMDocument[.x.y], MSXML3/4/6.DOMDocument, Microsoft.XMLDOM, ...
     if (progId == "microsoft.xmldom" ||
         (progId.find("domdocument") != std::string::npos && progId.rfind("msxml", 0) == 0))

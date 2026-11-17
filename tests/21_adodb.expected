@@ -1,0 +1,28 @@
+state=1 provider=SQLite3 ver-prefix=True
+empty-eof=True count=0 state=1
+count=2 bof=False eof=False
+1|alice|9.5|True
+2|bob|3.25|False
+eof=True
+last=bob abspos=2
+prev=alice
+first=alice bof=False
+move1=bob
+abs1=alice
+fields=4
+  f=id type=3 val=1
+  f=name type=200 val=alice
+  f=score type=5 val=9.5
+  f=active type=11 val=True
+item-name=alice item-idx=name
+g=3x1 g(1,0)=alice g(1,1)=bob
+upd=1.25
+after-del=1
+after-rb=1
+after-commit=2
+cmd=alice params=1
+cmd-named=tx
+cmd-table=2
+closed-state=0
+file=one=1 count=1
+ro-missing-err=5
