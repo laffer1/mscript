@@ -7,14 +7,15 @@ no WSH/cscript required.
 **Build requirements:** XML support (`MSXML2.DOMDocument`) is parsed with
 [bsdxml](https://github.com/bugaevc/serd) (expat 2) — on MidnightBSD/FreeBSD that's the
 system `libbsdxml` (`-lbsdxml`); HTTPS fetching (`MSXML2.XMLHTTP`) uses the system
-`libfetch` (`-lfetch`). Both are already linked by the Makefile.
+`libfetch` (`-lfetch`); database access (`ADODB.*`) uses the base-system SQLite3
+(`-lsqlite3`). All are already linked by the Makefile.
 
 ```
-$ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml -lfetch
+$ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml -lfetch -lsqlite3
 $ ./mscript hello.vbs
 Hello, World!
-$ make test           # runs the test suite (23 scripts)
-passed: 23  failed: 0
+$ make test           # runs the test suite (24 scripts)
+passed: 24  failed: 0
 ```
 
 Install the binary and its manual page system-wide (default prefix `/usr/local`):
@@ -102,12 +103,23 @@ WScript.Echo "sum = " & total        ' sum = 5050
   `Option` property — 0 UserAgentString, 1 URL (read-only), 6 EnableRedirects,
   14 MaxAutomaticRedirects — `SetTimeouts`, `WaitForResponse`, `SetCredentials`;
   `SetProxy`/`SetClientCertificate` are accepted no-ops),
-  and `VBScript.RegExp` (on the system libc POSIX regex: `Pattern`/`Global`/`IgnoreCase`/`Multiline`,
+  `VBScript.RegExp` (on the system libc POSIX regex: `Pattern`/`Global`/`IgnoreCase`/`Multiline`,
   `Test`/`Execute`/`Replace` with `Match` (`FirstIndex`/`Length`/`Value`/`SubMatches`)
-  and match collections supporting `Count`/`Item(i)`/For Each)
+  and match collections supporting `Count`/`Item(i)`/For Each),
+  and `ADODB.Connection` / `ADODB.Recordset` / `ADODB.Command` on SQLite3 (base system):
+  connection strings `Provider=SQLite3;Data Source=file.db` (bare path and `:memory:`
+  work too; `Mode` `adModeRead` opens read-only), `Execute`/`BeginTrans`/`CommitTrans`/
+  `RollbackTrans` (savepoint-nested), recordset navigation (`MoveFirst/Last/Next/Previous/Move`,
+  `AbsolutePosition`, `RecordCount`, `BOF`/`EOF`), `Fields` (`Count`/`Item(i)`/For Each;
+  `Field` `Name`/`Value`/`Type`/`ActualSize`), `GetRows`/`GetString`, `AddNew`/`Update`/`Delete`/
+  `CancelUpdate` (writes need a simple single-table SELECT — the SQL is rewritten to
+  prepend `rowid`; anything else is read-only), and `Command` with `CommandText`/
+  `CommandType` (`adCmdText`/`adCmdTable`), `CreateParameter` and positional (`?`) or
+  named (`:name`) parameter binding
 - **XML parsing** uses the system bsdxml (expat 2) library, linked via `-lbsdxml`;
   **HTTP fetching** uses the system libfetch, linked via `-lfetch`;
-  **regular expressions** use the libc POSIX regex (`regcomp`/`regexec`, no extra library)
+  **regular expressions** use the libc POSIX regex (`regcomp`/`regexec`, no extra library);
+  **database access** uses the base-system SQLite3, linked via `-lsqlite3`
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
@@ -129,7 +141,8 @@ WScript.Echo "sum = " & total        ' sum = 5050
 ├── src/xmldom.{h,cpp}  MSXML2.DOMDocument-compatible DOM on bsdxml (expat)
 ├── src/xmlhttp.{h,cpp} MSXML2.XMLHTTP + WinHttp.WinHttpRequest.5.1 client (raw HTTP/1.1 + libfetch)
 ├── src/regexp.{h,cpp}  VBScript.RegExp on the libc POSIX regex
-├── tests/              23 .vbs tests + .expected outputs + run.sh (make test);
+├── src/adodb.{h,cpp}   ADODB Connection/Recordset/Command on SQLite3
+├── tests/              24 .vbs tests + .expected outputs + run.sh (make test);
 │                       18_xmlhttp.vbs / 20_winhttp.vbs run against tests/httpserver.py
 │                       (python3, 127.0.0.1:18099)
 ├── man/mscript.1       mdoc manual page (installed by make install)
@@ -141,7 +154,8 @@ WScript.Echo "sum = " & total        ' sum = 5050
 - `CreateObject` supports only the progIDs listed above (`Scripting.Dictionary`,
   `Scripting.FileSystemObject`, `WScript.Shell`, `WScript.Network`, `ADODB.Stream`,
   `MSXML*.DOMDocument`, `MSXML*.XMLHTTP`/`Microsoft.XMLHTTP`, `WinHttp.WinHttpRequest[.5.1]`,
-  `VBScript.RegExp`); other COM objects raise error 429 ("ActiveX component can't create object").
+  `VBScript.RegExp`, `ADODB.Connection`/`ADODB.Recordset`/`ADODB.Command`); other COM objects
+  raise error 429 ("ActiveX component can't create object").
   In `ADODB.Stream`, `Position` is a byte offset and `Write`/`WriteText`/`CopyTo`
   overwrite at the current position, as in ADODB. The DOM's XPath support is the
   subset listed above, not full XPath 1.0; XML names are case-sensitive.
@@ -161,6 +175,11 @@ WScript.Echo "sum = " & total        ' sum = 5050
   clear message): backreferences (`\1`), non-greedy quantifiers (`*? +? ??`), lookaround
   (`?= (?! (?<= (?<!`), named groups, and `\b` — the BSD libc regex has no word boundary.
   With `Multiline` on, negated classes like `[^a]` do not match `\n` (REG_NEWLINE semantics).
+- `ADODB` is SQLite3-only. Recordsets materialize the full result in memory at
+  `Open`/`Execute`. `recordsAffected` out-parameters of `Execute` are not supported (host
+  method calls don't pass `ByRef`); use a `SELECT COUNT(*)`. Binary columns come back as
+  byte arrays; dates bind as their serial double; `OpenSchema` and stored procedures are
+  unsupported; `Errors` is empty.
 - `MsgBox` prints to stdout and returns `vbOK` (no GUI); `InputBox` reads stdin.
 - Case folding (`UCase`/`LCase`/text compare) is ASCII-only; strings are UTF-8.
 - No named arguments (`:=`), no `GetRef`.

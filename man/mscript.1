@@ -123,7 +123,52 @@ and match collections supporting
 .Dv Count ,
 .Dv Item(i)
 and
-.Dv For Each ) .
+.Dv For Each ) , and
+.Qq ADODB.Connection ,
+.Qq ADODB.Recordset
+and
+.Qq ADODB.Command
+backed by SQLite3, the database library in the base system
+(connection strings
+.Qq Provider=SQLite3;Data Source=file.db ,
+a bare path or ":memory:" also work;
+only the SQLite3 provider is supported;
+.Dv Mode
+.Dv adModeRead
+opens read-only).
+Recordsets support
+.Dv Execute ,
+.Dv MoveFirst/Last/Next/Previous/Move ,
+.Dv AbsolutePosition ,
+.Dv RecordCount ,
+.Dv BOF/EF ,
+.Dv Fields
+(with
+.Dv Count ,
+.Dv Item(i) ,
+.Dv For Each
+and field
+.Dv Name/Value/Type ) ,
+.Dv GetRows ,
+.Dv GetString ,
+.Dv AddNew/Update/Delete/CancelUpdate
+(writes require a simple single-table
+.Dv SELECT ;
+other sources are read-only),
+and transactions
+.Dv BeginTrans/CommitTrans/RollbackTrans
+(nested via savepoints).
+.Dv Command
+supports
+.Dv CommandText ,
+.Dv CommandType
+.Pq Dv adCmdText / adCmdTable ) ,
+.Dv CreateParameter
+and positional
+.Pq Sq ? )
+or named
+.Pq Dv :name )
+parameter binding.
 .Pp
 When the script is given as
 .Qq - ,
@@ -229,10 +274,26 @@ bodies over
 .Dv https://
 are truncated at the first NUL byte.
 Building requires the bsdxml (expat 2) library
-.Pq Fl lbsdxml )
-and libfetch
-.Pq Fl lfetch ;
+.Pq Fl lbsdxml ) ,
+libfetch
+.Pq Fl lfetch ) ,
+and SQLite3 from the base system
+.Pq Fl lsqlite3 ;
 regular expressions use the libc POSIX regex, no extra library.
+.Dv ADODB
+recordsets materialize the full result in memory; the
+.Dv recordsAffected
+out-parameter of
+.Dv Execute
+is not supported (host method calls do not pass
+.Ar ByRef ) —
+use
+.Qq SELECT COUNT(*) .
+Binary columns come back as byte arrays, dates bind as their serial double,
+.Dv OpenSchema ,
+stored procedures and the
+.Dv Errors
+collection are not supported.
 .Dv VBScript.RegExp
 translates patterns to POSIX ERE:
 .Dv \ed \eD \ew \eW \es \eS ,
