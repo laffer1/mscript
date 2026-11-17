@@ -8,7 +8,7 @@ missing-hdr=
 has-custom=True
 bodylen=10
 sum=1007
-echo=ct=application/x-test x-test=abc body=payload=1
+echo=ct=application/x-test x-test=abc ua=mscript/1.0 body=payload=1
 missing=404|nope
 redir=200|hello-body
 chunked=chunked-body

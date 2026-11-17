@@ -35,7 +35,7 @@ for t in tests/*.vbs; do
     exp="tests/$name.expected"
     [ -f "$exp" ] || continue
     case "$name" in
-    18_*) [ -n "$SRV_PID" ] || continue ;; # needs the local test server
+    18_*|20_*) [ -n "$SRV_PID" ] || continue ;; # need the local test server
     esac
     "$BIN" "$t" hello 42 >"$tmp" 2>&1
     rc=$?

@@ -13,8 +13,8 @@ system `libbsdxml` (`-lbsdxml`); HTTPS fetching (`MSXML2.XMLHTTP`) uses the syst
 $ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml -lfetch
 $ ./mscript hello.vbs
 Hello, World!
-$ make test           # runs the test suite (21 scripts)
-passed: 21  failed: 0
+$ make test           # runs the test suite (23 scripts)
+passed: 23  failed: 0
 ```
 
 Install the binary and its manual page system-wide (default prefix `/usr/local`):
@@ -97,9 +97,17 @@ WScript.Echo "sum = " & total        ' sum = 5050
   progID: `open`/`send`/`setRequestHeader`/`abort`/`getAllResponseHeaders`/`getResponseHeader`,
   properties `readyState`/`status`/`statusText`/`responseText`/`responseBody`/`responseXML`/`timeout`;
   `http://` uses a built-in HTTP/1.1 client with full status, response headers, chunked
-  decoding and redirect following, `https://` and `file://` go through libfetch)
+  decoding and redirect following, `https://` and `file://` go through libfetch),
+  `WinHttp.WinHttpRequest.5.1` (same transport, plus the WinHTTP-specific
+  `Option` property — 0 UserAgentString, 1 URL (read-only), 6 EnableRedirects,
+  14 MaxAutomaticRedirects — `SetTimeouts`, `WaitForResponse`, `SetCredentials`;
+  `SetProxy`/`SetClientCertificate` are accepted no-ops),
+  and `VBScript.RegExp` (on the system libc POSIX regex: `Pattern`/`Global`/`IgnoreCase`/`Multiline`,
+  `Test`/`Execute`/`Replace` with `Match` (`FirstIndex`/`Length`/`Value`/`SubMatches`)
+  and match collections supporting `Count`/`Item(i)`/For Each)
 - **XML parsing** uses the system bsdxml (expat 2) library, linked via `-lbsdxml`;
-  **HTTP fetching** uses the system libfetch, linked via `-lfetch`
+  **HTTP fetching** uses the system libfetch, linked via `-lfetch`;
+  **regular expressions** use the libc POSIX regex (`regcomp`/`regexec`, no extra library)
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
@@ -119,9 +127,11 @@ WScript.Echo "sum = " & total        ' sum = 5050
 │   ├── builtins.{h,cpp}     built-in functions and vb* constants
 │   └── objects.{h,cpp}      WScript, Err, Scripting.Dictionary, FileSystemObject
 ├── src/xmldom.{h,cpp}  MSXML2.DOMDocument-compatible DOM on bsdxml (expat)
-├── src/xmlhttp.{h,cpp} MSXML2.XMLHTTP-compatible client (raw HTTP/1.1 + libfetch)
-├── tests/              21 .vbs tests + .expected outputs + run.sh (make test);
-│                       18_xmlhttp.vbs runs against tests/httpserver.py (python3, 127.0.0.1:18099)
+├── src/xmlhttp.{h,cpp} MSXML2.XMLHTTP + WinHttp.WinHttpRequest.5.1 client (raw HTTP/1.1 + libfetch)
+├── src/regexp.{h,cpp}  VBScript.RegExp on the libc POSIX regex
+├── tests/              23 .vbs tests + .expected outputs + run.sh (make test);
+│                       18_xmlhttp.vbs / 20_winhttp.vbs run against tests/httpserver.py
+│                       (python3, 127.0.0.1:18099)
 ├── man/mscript.1       mdoc manual page (installed by make install)
 └── examples/demo.vbs   word-frequency report demo
 ```
@@ -130,20 +140,29 @@ WScript.Echo "sum = " & total        ' sum = 5050
 
 - `CreateObject` supports only the progIDs listed above (`Scripting.Dictionary`,
   `Scripting.FileSystemObject`, `WScript.Shell`, `WScript.Network`, `ADODB.Stream`,
-  `MSXML*.DOMDocument`, `MSXML*.XMLHTTP`/`Microsoft.XMLHTTP`); other COM objects raise
-  error 429 ("ActiveX component can't create object").
+  `MSXML*.DOMDocument`, `MSXML*.XMLHTTP`/`Microsoft.XMLHTTP`, `WinHttp.WinHttpRequest[.5.1]`,
+  `VBScript.RegExp`); other COM objects raise error 429 ("ActiveX component can't create object").
   In `ADODB.Stream`, `Position` is a byte offset and `Write`/`WriteText`/`CopyTo`
   overwrite at the current position, as in ADODB. The DOM's XPath support is the
   subset listed above, not full XPath 1.0; XML names are case-sensitive.
-- `XMLHTTP` requests are always synchronous (the `async` flag of `open` is accepted
-  but ignored, `onreadystatechange` is not fired — there is no `GetRef`). Over
-  `https://`/`file://` (libfetch) response headers are not exposed, so
-  `getResponseHeader` returns `""` and `status` is 200 on success or mapped from the
-  error reason (e.g. 404); binary request bodies over `https://` are truncated at the
-  first NUL byte (libfetch takes a C string).
+- `XMLHTTP`/`WinHttpRequest` requests are always synchronous (the `async` flag of `open`
+  is accepted but ignored, `onreadystatechange` is not fired — there is no `GetRef`;
+  `WaitForResponse` returns `True` immediately). Over `https://`/`file://` (libfetch)
+  response headers are not exposed, so `getResponseHeader` returns `""` and `status` is
+  200 on success or mapped from the error reason (e.g. 404); binary request bodies over
+  `https://` are truncated at the first NUL byte (libfetch takes a C string).
+  `WinHttpRequest` honors `Option(6)` (EnableRedirects) only on the built-in `http://`
+  path — libfetch always follows redirects. `SetProxy`/`SetClientCertificate` are no-ops
+  (proxies come from `http_proxy`/`HTTP_PROXY`).
+- `VBScript.RegExp` translates patterns to POSIX ERE: `\d \D \w \W \s \S`, `\n \r \t \f \v`,
+  `(?:...)` (group indices are remapped, so `$1`/`SubMatches` count only capturing groups),
+  `.` never matches `\n`, and `Multiline` uses `REG_NEWLINE`. Not supported (error 5 with a
+  clear message): backreferences (`\1`), non-greedy quantifiers (`*? +? ??`), lookaround
+  (`?= (?! (?<= (?<!`), named groups, and `\b` — the BSD libc regex has no word boundary.
+  With `Multiline` on, negated classes like `[^a]` do not match `\n` (REG_NEWLINE semantics).
 - `MsgBox` prints to stdout and returns `vbOK` (no GUI); `InputBox` reads stdin.
 - Case folding (`UCase`/`LCase`/text compare) is ASCII-only; strings are UTF-8.
-- No named arguments (`:=`), no `GetRef`, no `VBScript.RegExp`.
+- No named arguments (`:=`), no `GetRef`.
 - `Option Explicit` is enforced at statement-execution time (mscript interprets
   rather than compiles), so the error surfaces when the statement runs — same
   error number, message, and line as WSH.

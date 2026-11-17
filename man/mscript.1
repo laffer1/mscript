@@ -91,7 +91,39 @@ chunked transfer decoding, redirect following, custom request headers);
 and
 .Dv file://
 requests go through the system libfetch library, which provides TLS for
-.Dv https:// ) .
+.Dv https:// ) ,
+.Qq WinHttp.WinHttpRequest.5.1
+(same transport, plus the WinHTTP-specific
+.Dv Option
+parameterized property — 0 UserAgentString, 1 URL (read-only), 6
+EnableRedirects, 14 MaxAutomaticRedirects —
+.Dv SetTimeouts ,
+.Dv WaitForResponse
+and
+.Dv SetCredentials ;
+.Dv SetProxy
+and
+.Dv SetClientCertificate
+are accepted no-ops), and
+.Qq VBScript.RegExp
+(built on the libc POSIX regex,
+.Fn regcomp / regexec :
+.Dv Pattern ,
+.Dv Global ,
+.Dv IgnoreCase ,
+.Dv Multiline ,
+.Dv Test ,
+.Dv Execute ,
+.Dv Replace ,
+with
+.Dv Match
+objects
+.Pq Dv FirstIndex , Dv Length , Dv Value , Dv SubMatches
+and match collections supporting
+.Dv Count ,
+.Dv Item(i)
+and
+.Dv For Each ) .
 .Pp
 When the script is given as
 .Qq - ,
@@ -199,7 +231,31 @@ are truncated at the first NUL byte.
 Building requires the bsdxml (expat 2) library
 .Pq Fl lbsdxml )
 and libfetch
-.Pq Fl lfetch .
+.Pq Fl lfetch ;
+regular expressions use the libc POSIX regex, no extra library.
+.Dv VBScript.RegExp
+translates patterns to POSIX ERE:
+.Dv \ed \eD \ew \eW \es \eS ,
+.Dv \en \er \et \ef \ev ,
+non-capturing groups
+.Pq Dv (?:... )
+(group indices are remapped so
+.Dv $1
+and
+.Dv SubMatches
+count only capturing groups),
+.Sq .
+never matches a newline, and
+.Dv Multiline
+uses
+.Dv REG_NEWLINE .
+Backreferences
+.Pq Dv \e1 ) ,
+non-greedy quantifiers
+.Pq Dv *? +? ?? ) ,
+lookaround, named groups and
+.Dv \eb
+(the BSD libc regex has no word boundary) raise error 5 with a clear message.
 .Dv MsgBox
 prints to stdout and returns
 .Dv vbOK
@@ -207,7 +263,17 @@ prints to stdout and returns
 .Dv InputBox
 reads a line from standard input.
 Case folding is ASCII-only.
-Named arguments (:=), GetRef and VBScript.RegExp are not supported.
+Named arguments (:=) and GetRef are not supported.
+.Dv WinHttpRequest
+requests are always synchronous
+.Pq Dv WaitForResponse
+returns
+.Dv True
+immediately;
+.Dv Option(6)
+(EnableRedirects) is honored only on the built-in
+.Dv http://
+path, as libfetch always follows redirects.
 .Sh SEE ALSO
 .Lk https://github.com/laffer1/mscript "mscript on GitHub"
 .Sh LICENSE

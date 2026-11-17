@@ -55,9 +55,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/echo":
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n).decode("utf-8", "replace")
-            out = "ct=%s x-test=%s body=%s" % (
+            out = "ct=%s x-test=%s ua=%s body=%s" % (
                 self.headers.get("Content-Type") or "-",
                 self.headers.get("X-Test") or "-",
+                self.headers.get("User-Agent") or "-",
                 body)
             self._send(200, out)
         else:
