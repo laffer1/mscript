@@ -7,9 +7,10 @@ CXX      = clang++
 CXXFLAGS = -std=c++23 -O2 -Wall -Wextra -Wno-unused-parameter
 SRC      != ls src/*.cpp
 HDR      != ls src/*.h
+LDLIBS   = -lbsdxml
 
 mscript: $(SRC) $(HDR)
-	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
+	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(LDLIBS)
 
 test: mscript
 	sh tests/run.sh

@@ -1,0 +1,26 @@
+True
+parseError: 0
+catalog 1 3
+book id=b1 lang=en
+book id=b2 lang=fr
+book id=b3 lang=en
+3
+Les Miserables
+3
+2
+Les Miserables
+3
+Austen
+1
+book book
+title Great Expectations
+
+<?xml version="1.0"?><greeting lang="en">Hello &amp; &lt;world&gt;</greeting>
+Hello & <world>
+2
+1 en
+False
+True 1 True
+True
+catalog 3
+b3

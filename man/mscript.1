@@ -41,12 +41,30 @@ targets
 .Qq Scripting.FileSystemObject ,
 .Qq WScript.Shell ,
 .Qq WScript.Network ,
-and
 .Qq ADODB.Stream
 (in-memory text/binary streams with
 .Dv LoadFromFile
 and
-.Dv SaveToFile ) .
+.Dv SaveToFile ) ,
+and any
+.Qq MSXML Ns Ar 2/3/4/6 . Ns Qq DOMDocument
+(progIDs such as
+.Qq MSXML2.DOMDocument.6.0 ,
+parsed with the system
+.Xr bsdxml 3
+expat library; supports
+.Dv load ,
+.Dv loadXML ,
+.Dv save ,
+.Dv documentElement ,
+.Dv parseError ,
+node traversal and attributes,
+.Dv selectNodes /
+.Dv selectSingleNode
+with an XPath subset, and document construction via
+.Dv createElement
+and
+.Dv appendChild ) .
 .Pp
 When the script is given as
 .Qq - ,
@@ -128,6 +146,10 @@ is a byte offset and
 .Dv WriteText /
 .Dv CopyTo
 overwrite at the current position, as in ADODB.
+The DOM's XPath support is the subset listed in DESCRIPTION, not full XPath 1.0;
+XML names are case-sensitive.
+Building requires the bsdxml (expat 2) library
+.Pq Fl lbsdxml .
 .Dv MsgBox
 prints to stdout and returns
 .Dv vbOK

@@ -4,12 +4,16 @@ A **VBScript-compatible interpreter** written in **C++23**, built with the syste
 Clang compiler. Run `.vbs` scripts directly on any platform with a C++23 toolchain —
 no WSH/cscript required.
 
+**Build requirement:** XML support (`MSXML2.DOMDocument`) is parsed with
+[bsdxml](https://github.com/bugaevc/serd) (expat 2) — on MidnightBSD/FreeBSD that's the
+system `libbsdxml` (`-lbsdxml`), already linked by the Makefile.
+
 ```
-$ make                # builds ./mscript with clang++ -std=c++23
+$ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml
 $ ./mscript hello.vbs
 Hello, World!
-$ make test           # runs the test suite (18 scripts)
-passed: 18  failed: 0
+$ make test           # runs the test suite (19 scripts)
+passed: 19  failed: 0
 ```
 
 Install the binary and its manual page system-wide (default prefix `/usr/local`):
@@ -78,10 +82,17 @@ WScript.Echo "sum = " & total        ' sum = 5050
 - **Host objects** — `WScript` (`Echo`, `Quit`, `Sleep`, `Arguments`, `StdIn/StdOut/StdErr`,
   `ScriptName`), `Err`, and `CreateObject` for `Scripting.Dictionary`,
   `Scripting.FileSystemObject` (files, folders, `TextStream`), `WScript.Shell`,
-  `WScript.Network`, and `ADODB.Stream` (in-memory text/binary streams:
+  `WScript.Network`, `ADODB.Stream` (in-memory text/binary streams:
   `Type`, `Mode`, `Charset`, `Position`, `Size`, `EOS`, `LineSeparator`,
   `Open`/`Close`/`Read`/`ReadText`/`Write`/`WriteText`/`Flush`/`CopyTo`/`SetEOS`/
-  `LoadFromFile`/`SaveToFile`, plus the `adType*`/`adMode*`/`adSave*`/`adRead*`/`adCR`/`adLF`/`adCRLF`/`adState*` constants)
+  `LoadFromFile`/`SaveToFile`, plus the `adType*`/`adMode*`/`adSave*`/`adRead*`/`adCR`/`adLF`/`adCRLF`/`adState*` constants),
+  and `MSXML2.DOMDocument` (any `MSXML*.DOMDocument[.x]` progID, parsed with bsdxml/expat:
+  `load`/`loadXML`/`save`, `documentElement`, `parseError`, node properties `nodeName`/`nodeValue`/`text`/`nodeType`/`xml`,
+  `childNodes`/`attributes` collections with `length`/`item(i)`/For Each, `getAttribute`/`setAttribute`,
+  `appendChild`/`removeChild`/`replaceChild`/`insertBefore`/`cloneNode`, `createElement`/`createTextNode`/`createAttribute`,
+  `getElementsByTagName`, and `selectNodes`/`selectSingleNode` with an XPath subset:
+  `/a/b`, `//tag`, `*`, `.`, `..`, `text()`, `@attr`, `[n]`, `[@a='v']`, `[tag]`, `[contains(@a,'x')]` and `[contains(tag,'x')]`)
+- **XML parsing** uses the system bsdxml (expat 2) library, linked via `-lbsdxml`
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
@@ -100,7 +111,8 @@ WScript.Echo "sum = " & total        ' sum = 5050
 │   ├── interpreter.{h,cpp}  tree-walking evaluator: scopes, procs, classes, errors
 │   ├── builtins.{h,cpp}     built-in functions and vb* constants
 │   └── objects.{h,cpp}      WScript, Err, Scripting.Dictionary, FileSystemObject
-├── tests/              18 .vbs tests + .expected outputs + run.sh (make test)
+├── src/xmldom.{h,cpp}  MSXML2.DOMDocument-compatible DOM on bsdxml (expat)
+├── tests/              19 .vbs tests + .expected outputs + run.sh (make test)
 ├── man/mscript.1       mdoc manual page (installed by make install)
 └── examples/demo.vbs   word-frequency report demo
 ```
@@ -108,10 +120,11 @@ WScript.Echo "sum = " & total        ' sum = 5050
 ## Known limitations
 
 - `CreateObject` supports only the progIDs listed above (`Scripting.Dictionary`,
-  `Scripting.FileSystemObject`, `WScript.Shell`, `WScript.Network`, `ADODB.Stream`);
-  other COM objects raise error 429 ("ActiveX component can't create object").
+  `Scripting.FileSystemObject`, `WScript.Shell`, `WScript.Network`, `ADODB.Stream`,
+  `MSXML*.DOMDocument`); other COM objects raise error 429 ("ActiveX component can't create object").
   In `ADODB.Stream`, `Position` is a byte offset and `Write`/`WriteText`/`CopyTo`
-  overwrite at the current position, as in ADODB.
+  overwrite at the current position, as in ADODB. The DOM's XPath support is the
+  subset listed above, not full XPath 1.0; XML names are case-sensitive.
 - `MsgBox` prints to stdout and returns `vbOK` (no GUI); `InputBox` reads stdin.
 - Case folding (`UCase`/`LCase`/text compare) is ASCII-only; strings are UTF-8.
 - No named arguments (`:=`), no `GetRef`, no `VBScript.RegExp`.

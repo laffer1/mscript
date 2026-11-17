@@ -3,6 +3,7 @@
 
 #include "objects.h"
 #include "interpreter.h"
+#include "xmldom.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -961,5 +962,9 @@ std::shared_ptr<VBObject> createHostObject(Interp& ip, const std::string& progId
     if (progId == "wscript.shell") return makeShell();
     if (progId == "wscript.network") return makeNetwork();
     if (progId == "adodb.stream" || progId.rfind("adodb.stream.", 0) == 0) return makeAdoStream();
+    // MSXML DOM: MSXML2.DOMDocument[.x.y], MSXML3/4/6.DOMDocument, Microsoft.XMLDOM, ...
+    if (progId == "microsoft.xmldom" ||
+        (progId.find("domdocument") != std::string::npos && progId.rfind("msxml", 0) == 0))
+        return makeDomDocument(ip);
     return nullptr;
 }
