@@ -62,7 +62,36 @@ node traversal and attributes,
 with an XPath subset, and document construction via
 .Dv createElement
 and
-.Dv appendChild ) .
+.Dv appendChild ) ,
+and any
+.Qq MSXML Ns Ar 2/3/4/6 . Ns Qq XMLHTTP
+(progIDs such as
+.Qq MSXML2.XMLHTTP.6.0 ,
+.Qq MSXML2.ServerXMLHTTP ,
+.Qq Microsoft.XMLHTTP ;
+.Dv open ,
+.Dv send ,
+.Dv setRequestHeader ,
+.Dv abort ,
+.Dv getAllResponseHeaders ,
+.Dv getResponseHeader ,
+with properties
+.Dv readyState ,
+.Dv status ,
+.Dv statusText ,
+.Dv responseText ,
+.Dv responseBody ,
+.Dv responseXML ,
+.Dv timeout .
+.Pp
+.Dv http://
+requests use a built-in HTTP/1.1 client (status line, response headers,
+chunked transfer decoding, redirect following, custom request headers);
+.Dv https://
+and
+.Dv file://
+requests go through the system libfetch library, which provides TLS for
+.Dv https:// ) .
 .Pp
 When the script is given as
 .Qq - ,
@@ -146,8 +175,31 @@ is a byte offset and
 overwrite at the current position, as in ADODB.
 The DOM's XPath support is the subset listed in DESCRIPTION, not full XPath 1.0;
 XML names are case-sensitive.
+.Dv XMLHTTP
+requests are always synchronous (the
+.Ar async
+flag of
+.Dv open
+is accepted but ignored, and
+.Dv onreadystatechange
+is not fired, as there is no
+.Dv GetRef ) .
+Over
+.Dv https://
+and
+.Dv file://
+(libfetch), response headers are not exposed, so
+.Dv getResponseHeader
+returns an empty string and
+.Dv status
+is 200 on success or derived from the error reason (e.g. 404); binary request
+bodies over
+.Dv https://
+are truncated at the first NUL byte.
 Building requires the bsdxml (expat 2) library
-.Pq Fl lbsdxml .
+.Pq Fl lbsdxml )
+and libfetch
+.Pq Fl lfetch .
 .Dv MsgBox
 prints to stdout and returns
 .Dv vbOK

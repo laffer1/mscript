@@ -1,0 +1,19 @@
+after-open=1
+readyState=4
+status=200
+statusText=OK
+text=hello-body
+custom=yes
+missing-hdr=
+has-custom=True
+bodylen=10
+sum=1007
+echo=ct=application/x-test x-test=abc body=payload=1
+missing=404|nope
+redir=200|hello-body
+chunked=chunked-body
+xmlroot=root
+xmlb=two
+latin=café|True
+file=200|True
+aborted=0
