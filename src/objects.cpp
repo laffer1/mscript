@@ -4,6 +4,7 @@
 #include "objects.h"
 #include "interpreter.h"
 #include "xmldom.h"
+#include "xmlhttp.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -966,5 +967,9 @@ std::shared_ptr<VBObject> createHostObject(Interp& ip, const std::string& progId
     if (progId == "microsoft.xmldom" ||
         (progId.find("domdocument") != std::string::npos && progId.rfind("msxml", 0) == 0))
         return makeDomDocument(ip);
+    // MSXML HTTP: MSXML2.XMLHTTP[.x], MSXML2.ServerXMLHTTP, MSXML3/6.XMLHTTP, Microsoft.XMLHTTP
+    if (progId.find("xmlhttp") != std::string::npos &&
+        (progId.rfind("msxml", 0) == 0 || progId.rfind("microsoft", 0) == 0))
+        return makeXmlHttp(ip);
     return nullptr;
 }

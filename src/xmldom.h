@@ -10,3 +10,6 @@ struct Interp;
 
 // Creates a new MSXML2.DOMDocument-compatible object.
 std::shared_ptr<VBObject> makeDomDocument(Interp& interp);
+
+// Creates a DOMDocument and parses xml into it; ok is set to the parse result.
+std::shared_ptr<VBObject> makeDomDocumentFromXML(Interp& interp, const std::string& xml, bool& ok);

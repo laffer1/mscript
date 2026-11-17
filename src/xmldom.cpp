@@ -887,3 +887,9 @@ std::shared_ptr<VBObject> makeDomDocument(Interp& interp) {
     auto d = std::make_shared<XmlDocument>(&interp);
     return d;
 }
+
+std::shared_ptr<VBObject> makeDomDocumentFromXML(Interp& interp, const std::string& xml, bool& ok) {
+    auto d = std::make_shared<XmlDocument>(&interp);
+    ok = parseXml(*d, xml);
+    return d;
+}

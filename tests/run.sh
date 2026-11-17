@@ -9,10 +9,34 @@ BIN=./mscript
 pass=0
 fail=0
 tmp=$(mktemp)
+
+# Start the local HTTP test server for the 18_xmlhttp test (needs python3).
+SRV_PID=
+if command -v python3 >/dev/null 2>&1; then
+    python3 tests/httpserver.py 18099 >/dev/null 2>&1 &
+    SRV_PID=$!
+    i=0
+    while [ "$i" -lt 25 ]; do
+        if python3 -c "import socket; s=socket.create_connection(('127.0.0.1',18099),0.2); s.close()" 2>/dev/null; then
+            break
+        fi
+        i=$((i + 1))
+        sleep 0.2
+    done
+    if ! python3 -c "import socket; s=socket.create_connection(('127.0.0.1',18099),0.2); s.close()" 2>/dev/null; then
+        kill "$SRV_PID" 2>/dev/null
+        SRV_PID=
+    fi
+fi
+trap '[ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null' EXIT
+
 for t in tests/*.vbs; do
     name=$(basename "$t" .vbs)
     exp="tests/$name.expected"
     [ -f "$exp" ] || continue
+    case "$name" in
+    18_*) [ -n "$SRV_PID" ] || continue ;; # needs the local test server
+    esac
     "$BIN" "$t" hello 42 >"$tmp" 2>&1
     rc=$?
     case "$name" in

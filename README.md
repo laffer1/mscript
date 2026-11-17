@@ -4,16 +4,17 @@ A **VBScript-compatible interpreter** written in **C++23**, built with the syste
 Clang compiler. Run `.vbs` scripts directly on any platform with a C++23 toolchain —
 no WSH/cscript required.
 
-**Build requirement:** XML support (`MSXML2.DOMDocument`) is parsed with
+**Build requirements:** XML support (`MSXML2.DOMDocument`) is parsed with
 [bsdxml](https://github.com/bugaevc/serd) (expat 2) — on MidnightBSD/FreeBSD that's the
-system `libbsdxml` (`-lbsdxml`), already linked by the Makefile.
+system `libbsdxml` (`-lbsdxml`); HTTPS fetching (`MSXML2.XMLHTTP`) uses the system
+`libfetch` (`-lfetch`). Both are already linked by the Makefile.
 
 ```
-$ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml
+$ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml -lfetch
 $ ./mscript hello.vbs
 Hello, World!
-$ make test           # runs the test suite (19 scripts)
-passed: 19  failed: 0
+$ make test           # runs the test suite (21 scripts)
+passed: 21  failed: 0
 ```
 
 Install the binary and its manual page system-wide (default prefix `/usr/local`):
@@ -91,8 +92,14 @@ WScript.Echo "sum = " & total        ' sum = 5050
   `childNodes`/`attributes` collections with `length`/`item(i)`/For Each, `getAttribute`/`setAttribute`,
   `appendChild`/`removeChild`/`replaceChild`/`insertBefore`/`cloneNode`, `createElement`/`createTextNode`/`createAttribute`,
   `getElementsByTagName`, and `selectNodes`/`selectSingleNode` with an XPath subset:
-  `/a/b`, `//tag`, `*`, `.`, `..`, `text()`, `@attr`, `[n]`, `[@a='v']`, `[tag]`, `[contains(@a,'x')]` and `[contains(tag,'x')]`)
-- **XML parsing** uses the system bsdxml (expat 2) library, linked via `-lbsdxml`
+  `/a/b`, `//tag`, `*`, `.`, `..`, `text()`, `@attr`, `[n]`, `[@a='v']`, `[tag]`, `[contains(@a,'x')]` and `[contains(tag,'x')]`),
+  and `MSXML2.XMLHTTP` (any `MSXML*.XMLHTTP[.x]`, `MSXML2.ServerXMLHTTP`, `Microsoft.XMLHTTP`
+  progID: `open`/`send`/`setRequestHeader`/`abort`/`getAllResponseHeaders`/`getResponseHeader`,
+  properties `readyState`/`status`/`statusText`/`responseText`/`responseBody`/`responseXML`/`timeout`;
+  `http://` uses a built-in HTTP/1.1 client with full status, response headers, chunked
+  decoding and redirect following, `https://` and `file://` go through libfetch)
+- **XML parsing** uses the system bsdxml (expat 2) library, linked via `-lbsdxml`;
+  **HTTP fetching** uses the system libfetch, linked via `-lfetch`
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
@@ -112,7 +119,9 @@ WScript.Echo "sum = " & total        ' sum = 5050
 │   ├── builtins.{h,cpp}     built-in functions and vb* constants
 │   └── objects.{h,cpp}      WScript, Err, Scripting.Dictionary, FileSystemObject
 ├── src/xmldom.{h,cpp}  MSXML2.DOMDocument-compatible DOM on bsdxml (expat)
-├── tests/              19 .vbs tests + .expected outputs + run.sh (make test)
+├── src/xmlhttp.{h,cpp} MSXML2.XMLHTTP-compatible client (raw HTTP/1.1 + libfetch)
+├── tests/              21 .vbs tests + .expected outputs + run.sh (make test);
+│                       18_xmlhttp.vbs runs against tests/httpserver.py (python3, 127.0.0.1:18099)
 ├── man/mscript.1       mdoc manual page (installed by make install)
 └── examples/demo.vbs   word-frequency report demo
 ```
@@ -121,10 +130,17 @@ WScript.Echo "sum = " & total        ' sum = 5050
 
 - `CreateObject` supports only the progIDs listed above (`Scripting.Dictionary`,
   `Scripting.FileSystemObject`, `WScript.Shell`, `WScript.Network`, `ADODB.Stream`,
-  `MSXML*.DOMDocument`); other COM objects raise error 429 ("ActiveX component can't create object").
+  `MSXML*.DOMDocument`, `MSXML*.XMLHTTP`/`Microsoft.XMLHTTP`); other COM objects raise
+  error 429 ("ActiveX component can't create object").
   In `ADODB.Stream`, `Position` is a byte offset and `Write`/`WriteText`/`CopyTo`
   overwrite at the current position, as in ADODB. The DOM's XPath support is the
   subset listed above, not full XPath 1.0; XML names are case-sensitive.
+- `XMLHTTP` requests are always synchronous (the `async` flag of `open` is accepted
+  but ignored, `onreadystatechange` is not fired — there is no `GetRef`). Over
+  `https://`/`file://` (libfetch) response headers are not exposed, so
+  `getResponseHeader` returns `""` and `status` is 200 on success or mapped from the
+  error reason (e.g. 404); binary request bodies over `https://` are truncated at the
+  first NUL byte (libfetch takes a C string).
 - `MsgBox` prints to stdout and returns `vbOK` (no GUI); `InputBox` reads stdin.
 - Case folding (`UCase`/`LCase`/text compare) is ASCII-only; strings are UTF-8.
 - No named arguments (`:=`), no `GetRef`, no `VBScript.RegExp`.
