@@ -798,6 +798,13 @@ Variant Interp::evalExpr(Expr& e, Frame& f) {
 // ---------- procedure calls ----------
 
 Variant Interp::callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self) {
+    // recursion guard: raise VBScript error 28 instead of overflowing the C++ stack
+    constexpr int MAX_CALL_DEPTH = 1000;
+    if (++callDepth > MAX_CALL_DEPTH) {
+        callDepth--;
+        throwErr(28, errDesc(28));
+    }
+    struct DepthGuard { Interp& i; ~DepthGuard() { i.callDepth--; } } guard { *this };
     Frame f;
     f.local = std::make_unique<Scope>();
     f.local->parent = self ? &self->fields : &global; // class methods see instance fields

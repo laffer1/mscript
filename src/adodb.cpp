@@ -43,7 +43,21 @@ struct DbConn {
     long long cmdTimeout = 30;
     int transLevel = 0;
     bool isOpen = false;
+    ~DbConn() { if (db) sqlite3_close(db); } // don't leak the handle if Close is never called
 };
+
+// Quote an SQL identifier for interpolation into generated statements
+// (table/column names parsed from the recordset source): doubles embedded
+// '"' so a crafted source SELECT cannot break out of the quoted identifier.
+std::string quoteIdent(const std::string& ident) {
+    std::string out = "\"";
+    for (char c : ident) {
+        out += c;
+        if (c == '"') out += '"';
+    }
+    out += '"';
+    return out;
+}
 
 [[noreturn]] void sqlErr(sqlite3* db, const std::string& prefix) {
     throwErr(5, prefix + sqlite3_errmsg(db));
@@ -257,10 +271,20 @@ std::string rewriteForRowid(const std::string& sql, std::string& tableOut) {
     if (q < s.size() && (s[q] == '"' || s[q] == '`' || s[q] == '\'' || s[q] == '[')) {
         char open = s[q], close = (open == '[') ? ']' : open;
         q++;
-        while (q < s.size() && s[q] != close) q++;
-        if (q >= s.size()) return "";
-        tableOut = s.substr(qStart + 1, q - qStart - 1);
-        q++;
+        std::string tok;
+        bool closed = false;
+        while (q < s.size()) {
+            if (s[q] == close) {
+                // doubled close-quote is an escaped quote inside the identifier
+                if (close != ']' && q + 1 < s.size() && s[q + 1] == close) { tok += close; q += 2; continue; }
+                q++;
+                closed = true;
+                break;
+            }
+            tok += s[q++];
+        }
+        if (!closed) return "";
+        tableOut = tok;
     } else {
         while (q < s.size() && !std::isspace((unsigned char)s[q]) && std::string(",;()").find(s[q]) == std::string::npos) q++;
         tableOut = s.substr(qStart, q - qStart);
@@ -406,8 +430,8 @@ void rsUpdate(const std::shared_ptr<RsData>& rs) {
         throwErr(5, "Recordset is read-only (source is not a simple single-table SELECT)");
     DbConn& c = *rs->conn;
     if (rs->adding) {
-        std::string sql = "INSERT INTO \"" + rs->table + "\" (";
-        for (size_t i = 0; i < rs->cols.size(); i++) { if (i) sql += ", "; sql += "\"" + rs->cols[i] + "\""; }
+        std::string sql = "INSERT INTO " + quoteIdent(rs->table) + " (";
+        for (size_t i = 0; i < rs->cols.size(); i++) { if (i) sql += ", "; sql += quoteIdent(rs->cols[i]); }
         sql += ") VALUES (";
         for (size_t i = 0; i < rs->cols.size(); i++) { if (i) sql += ", "; sql += "?"; }
         sql += ")";
@@ -425,9 +449,9 @@ void rsUpdate(const std::shared_ptr<RsData>& rs) {
         std::string sets;
         int n = 0;
         for (size_t i = 0; i < rs->cols.size(); i++)
-            if (rs->editDirty[i]) { if (n++) sets += ", "; sets += "\"" + rs->cols[i] + "\" = ?"; }
+            if (rs->editDirty[i]) { if (n++) sets += ", "; sets += quoteIdent(rs->cols[i]) + " = ?"; }
         if (n == 0) { rs->editing = false; rs->adding = false; return; } // nothing changed
-        std::string sql = "UPDATE \"" + rs->table + "\" SET " + sets + " WHERE rowid = ?";
+        std::string sql = "UPDATE " + quoteIdent(rs->table) + " SET " + sets + " WHERE rowid = ?";
         sqlite3_stmt* st = nullptr;
         if (sqlite3_prepare_v2(c.db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) sqlErr(c.db, "SQLite error: ");
         int idx = 1;
@@ -450,7 +474,7 @@ void rsDelete(const std::shared_ptr<RsData>& rs) {
     if (!rs->valid()) throwErr(5, "No current record to delete");
     if (!rs->updateable || rs->table.empty())
         throwErr(5, "Recordset is read-only (source is not a simple single-table SELECT)");
-    std::string sql = "DELETE FROM \"" + rs->table + "\" WHERE rowid = ?";
+    std::string sql = "DELETE FROM " + quoteIdent(rs->table) + " WHERE rowid = ?";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(rs->conn->db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK)
         sqlErr(rs->conn->db, "SQLite error: ");
@@ -970,7 +994,7 @@ std::shared_ptr<VBObject> makeAdoCommand(Interp&) {
     o->methods["execute"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
         if (!data->conn || !data->conn->isOpen) throwErr(3704, "Operation is not allowed when the object is closed");
         if (data->cmdType == 4) throwErr(5, "Stored procedures are not supported by the SQLite3 provider");
-        std::string sql = data->cmdType == 2 ? "SELECT * FROM \"" + data->text + "\"" : data->text;
+        std::string sql = data->cmdType == 2 ? "SELECT * FROM " + quoteIdent(data->text) : data->text;
         // a[0] recordsAffected (not supported), a[1] parameters array, a[2] options
         const std::vector<Variant>* extra = nullptr;
         std::vector<Variant> arrCopy;

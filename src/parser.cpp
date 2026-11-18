@@ -77,6 +77,7 @@ static bool isStmtKeyword(const std::string& w) {
 }
 
 std::vector<StmtPtr> Parser::parseStatements(const std::set<std::string>& terminators) {
+    DepthGuard g(*this);
     std::vector<StmtPtr> out;
     for (;;) {
         skipSeparators();
@@ -649,6 +650,7 @@ bool Parser::canStartExpr() const {
 }
 
 ExprPtr Parser::parseExpr(int minPrec) {
+    DepthGuard g(*this);
     // prefix Not (logical, precedence 6)
     if (atIdent("not")) {
         int prec = 6;
@@ -684,6 +686,7 @@ ExprPtr Parser::parseBinRest(ExprPtr left, int minPrec) {
 }
 
 ExprPtr Parser::parseUnary() {
+    DepthGuard g(*this);
     if (atOp("-")) {
         int line = peek().line;
         advance();

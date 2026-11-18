@@ -1,0 +1,10 @@
+arr-ovf=7
+arr-neg=5
+arr-ok=7
+space-cap=14
+string-cap=14
+space-ok=[     ]
+recursion=28
+xml-deep=False|maximum element nesting depth (512) exceeded
+xml-ok=True|r
+adodb-quote=q2

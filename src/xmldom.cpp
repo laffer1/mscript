@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -735,10 +736,20 @@ struct ParseCtx {
     XmlNodePtr doc;
     std::vector<XmlNodePtr> stack;
     bool preserveWS;
+    XML_Parser parser = nullptr;
+    bool tooDeep = false;
+    static constexpr size_t MAX_DEPTH = 512; // also bounds recursive tree destruction/traversal
 };
 
 static void XMLCALL xmlStartEl(void* ud, const XML_Char* name, const XML_Char** atts) {
     auto& c = *(ParseCtx*)ud;
+    // nesting-depth cap: expat itself does not limit element depth, and our
+    // tree is shared_ptr-based (recursive destruction) — abort the parse
+    if (c.stack.size() >= ParseCtx::MAX_DEPTH) {
+        c.tooDeep = true;
+        if (c.parser) XML_StopParser(c.parser, XML_FALSE);
+        return;
+    }
     auto el = XmlNode::make(XML_ELEMENT, name);
     el->parent = c.stack.back();
     for (int i = 0; atts[i]; i += 2) {
@@ -782,7 +793,15 @@ static bool parseXml(XmlDocument& docObj, const std::string& xml) {
     ctx.stack.push_back(ctx.doc);
     ctx.preserveWS = docObj.preserveWhiteSpace;
 
+    if (xml.size() > (size_t)INT_MAX) { // XML_Parse takes int
+        docObj.parseError->props["errorcode"] = Variant::mkInt(-1);
+        docObj.parseError->props["reason"] = Variant::mkStr("document too large");
+        docObj.doc = ctx.doc;
+        return false;
+    }
+
     XML_Parser p = XML_ParserCreate(nullptr);
+    ctx.parser = p;
     XML_SetUserData(p, &ctx);
     XML_SetElementHandler(p, xmlStartEl, xmlEndEl);
     XML_SetCharacterDataHandler(p, xmlCharData);
@@ -791,7 +810,8 @@ static bool parseXml(XmlDocument& docObj, const std::string& xml) {
     if (st == XML_STATUS_ERROR) {
         enum XML_Error ec = XML_GetErrorCode(p);
         docObj.parseError->props["errorcode"] = Variant::mkInt(-(int)ec);
-        docObj.parseError->props["reason"] = Variant::mkStr(XML_ErrorString(ec));
+        docObj.parseError->props["reason"] = Variant::mkStr(
+            ctx.tooDeep ? "maximum element nesting depth (512) exceeded" : XML_ErrorString(ec));
         docObj.parseError->props["line"] = Variant::mkLong((long long)XML_GetCurrentLineNumber64(p));
         docObj.parseError->props["linepos"] = Variant::mkLong((long long)XML_GetCurrentColumnNumber64(p));
         docObj.parseError->props["column"] = Variant::mkLong((long long)XML_GetCurrentColumnNumber64(p));

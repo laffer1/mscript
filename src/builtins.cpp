@@ -528,11 +528,13 @@ void registerBuiltins(Interp& ip) {
     reg1("Space", 1, 1, [](std::vector<Variant>& a) -> Variant {
         long long n = toInt64(A(a, 0));
         if (n < 0) throwErr(5, errDesc(5));
+        if (n > (1LL << 28)) throwErr(14, errDesc(14)); // out of string space
         return Variant::mkStr(std::string((size_t)n, ' '));
     });
     reg1("String", 2, 2, [](std::vector<Variant>& a) -> Variant {
         long long n = toInt64(A(a, 0));
         if (n < 0) throwErr(5, errDesc(5));
+        if (n > (1LL << 28)) throwErr(14, errDesc(14)); // out of string space
         const Variant& c = A(a, 1);
         std::string one;
         if (c.isNum()) one = cpToUtf8((unsigned)(toInt64(c) & 0xFFFF));

@@ -22,6 +22,18 @@ public:
 private:
     std::vector<Token> t;
     size_t p = 0;
+    int depth = 0; // recursion guard: parseExpr/parseUnary/parseStatements nesting
+    static constexpr int MAX_DEPTH = 256;
+    struct DepthGuard {
+        Parser& self;
+        explicit DepthGuard(Parser& s) : self(s) {
+            if (++s.depth > MAX_DEPTH) {
+                s.depth--;
+                s.fail("expression or block nesting too deep (limit 256)");
+            }
+        }
+        ~DepthGuard() { self.depth--; }
+    };
 
     Token& peek(size_t off = 0);
     const Token& peek(size_t off = 0) const;

@@ -325,6 +325,34 @@ prints to stdout and returns
 reads a line from standard input.
 Case folding is ASCII-only.
 Named arguments (:=) and GetRef are not supported.
+.Pp
+Security / resource limits — hostile or buggy input raises a clean error
+rather than crashing:
+array dimensions are validated with a capped element count (error 7),
+parser nesting is capped at 256 (syntax error),
+procedure recursion at 1000 frames (error 28),
+.Dv Space / String
+at 2^28 characters (error 14),
+XML element nesting at 512
+.Pq Dv parseError.reason
+reports it; expat 2.10's billion-laughs protection is active and external
+entities are never resolved
+.Pq no XXE ) ,
+HTTP responses are capped at 64 MB,
+request methods/headers/URLs are validated against CRLF injection,
+credentials are stripped on cross-origin redirects and
+.Fn connect
+honors the configured timeout.
+.Dv VBScript.RegExp
+uses the libc backtracking regex, which can backtrack catastrophically on
+patterns like
+.Qq (a+)+$
+against long hostile strings (ReDoS) — avoid complex patterns on
+untrusted input.
+.Sq ADODB
+generated INSERT/UPDATE/DELETE quote identifiers with
+.Qq \&"
+doubling.
 .Dv WinHttpRequest
 requests are always synchronous
 .Pq Dv WaitForResponse

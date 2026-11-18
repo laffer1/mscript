@@ -18,7 +18,10 @@
 #include <sys/param.h> // MAXHOSTNAMELEN, required by fetch.h
 #include <fetch.h>
 
+#include <cerrno>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -209,8 +212,26 @@ HttpResponse httpRaw(const std::string& method, const std::string& url,
             tv.tv_usec = (timeoutMs % 1000) * 1000;
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            // non-blocking connect so a blackholed peer cannot stall us for
+            // the OS TCP timeout (~2 min); poll for writability instead
+            int fl = fcntl(fd, F_GETFL, 0);
+            fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+            int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+            if (rc != 0 && errno == EINPROGRESS) {
+                pollfd pfd { fd, POLLOUT, 0 };
+                int pr = poll(&pfd, 1, (int)timeoutMs);
+                if (pr > 0) {
+                    int soerr = 0;
+                    socklen_t sl = sizeof soerr;
+                    getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+                    rc = (soerr == 0) ? 0 : -1;
+                } else rc = -1; // timeout or poll error
+            }
+            fcntl(fd, F_SETFL, fl); // restore blocking mode for send/recv
+            if (rc == 0) break;
+        } else {
+            if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
     }

@@ -11,8 +11,10 @@
 
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
+#include <new>
 #include <sstream>
 #include <string>
 
@@ -67,6 +69,12 @@ int main(int argc, char** argv) {
     } catch (ParseError& e) {
         std::fprintf(stderr, "mscript: %s(%d): syntax error: %s\n", srcName.c_str(), e.line, e.msg.c_str());
         return 1;
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr, "mscript: %s: out of memory\n", srcName.c_str());
+        return 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "mscript: %s: internal error: %s\n", srcName.c_str(), e.what());
+        return 1;
     }
 
     Interp ip;
@@ -81,6 +89,12 @@ int main(int argc, char** argv) {
         return 1;
     } catch (ParseError& e) {
         std::fprintf(stderr, "mscript: %s(%d): syntax error: %s\n", srcName.c_str(), e.line, e.msg.c_str());
+        return 1;
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr, "mscript: %s: out of memory\n", srcName.c_str());
+        return 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "mscript: %s: internal error: %s\n", srcName.c_str(), e.what());
         return 1;
     }
     return ip.exitCode;
