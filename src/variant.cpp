@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +19,8 @@ std::string errDesc(int num) {
     switch (num) {
         case 5:   return "Invalid procedure call or argument";
         case 6:   return "Overflow";
+        case 7:   return "Out of memory";
+        case 28:  return "Out of stack space";
         case 9:   return "Subscript out of range";
         case 11:  return "Division by zero";
         case 13:  return "Type mismatch";
@@ -459,8 +463,13 @@ std::string typeNameOf(const Variant& v) {
 // ---------- VArray ----------
 
 long long VArray::totalSize() const {
+    // overflow-checked product; dims are validated in alloc()
     long long n = 1;
-    for (auto d : dims) n *= d;
+    for (auto d : dims) {
+        if (d < 0) throwErr(5, errDesc(5));
+        if (d != 0 && n > LLONG_MAX / d) throwErr(7, errDesc(7));
+        n *= d;
+    }
     return n;
 }
 
@@ -485,12 +494,26 @@ const Variant& VArray::at(const std::vector<long long>& idx) const {
 }
 
 void VArray::alloc(const std::vector<long long>& newDims, int newBase, bool preserve) {
+    // validate before mutating: cap total elements so the product cannot
+    // overflow, cannot exceed size_t (32-bit targets), and cannot OOM-kill
+    // the process before bad_alloc is reachable; huge requests raise "Out of
+    // memory" instead of corrupting the heap (previously `Dim a(2^32, 2^32)`
+    // wrapped the size product to 0 and element writes went out of bounds)
+    constexpr long long MAX_ELEMENTS = 1LL << 24; // 16,777,216 elements
+    long long n = 1;
+    for (auto d : newDims) {
+        if (d < 0) throwErr(5, errDesc(5));
+        if (d != 0 && n > MAX_ELEMENTS / d) throwErr(7, errDesc(7));
+        n *= d;
+    }
+    if ((unsigned long long)n > (unsigned long long)std::numeric_limits<size_t>::max())
+        throwErr(7, errDesc(7));
     base = newBase;
     std::vector<long long> oldDims = dims;
     std::deque<Variant> oldData = std::move(data);
     dims = newDims;
     data.clear();
-    data.resize((size_t)totalSize());
+    data.resize((size_t)n);
     allocated = true;
     if (preserve && !oldData.empty()) {
         // copy overlapping region (row-major, last dim varies fastest)

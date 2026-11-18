@@ -118,6 +118,7 @@ struct Interp {
 
     std::mt19937_64 rng;
     Frame* cur = nullptr;
+    int callDepth = 0; // recursion guard for callProc (error 28 instead of stack overflow)
 
     Interp();
     void load(Program& prog, const std::string& srcName);

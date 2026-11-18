@@ -1,0 +1,1 @@
+mscript: tests/neg_deep_expr.vbs(3): syntax error: expression or block nesting too deep (limit 256) (found '(')

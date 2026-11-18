@@ -798,6 +798,13 @@ Variant Interp::evalExpr(Expr& e, Frame& f) {
 // ---------- procedure calls ----------
 
 Variant Interp::callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self) {
+    // recursion guard: raise VBScript error 28 instead of overflowing the C++ stack
+    constexpr int MAX_CALL_DEPTH = 1000;
+    if (++callDepth > MAX_CALL_DEPTH) {
+        callDepth--;
+        throwErr(28, errDesc(28));
+    }
+    struct DepthGuard { Interp& i; ~DepthGuard() { i.callDepth--; } } guard { *this };
     Frame f;
     f.local = std::make_unique<Scope>();
     f.local->parent = self ? &self->fields : &global; // class methods see instance fields
@@ -825,18 +832,17 @@ Variant Interp::callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<Cla
 
     Frame* saved = cur;
     cur = &f;
+    // Restore cur on every exit path (normal, ExitSig, VBSError, GotoSig, ...):
+    // with On Error Resume Next the caller keeps running after we throw, and a
+    // dangling cur would crash later Eval/Execute calls.
+    struct CurGuard { Interp& i; Frame* s; ~CurGuard() { i.cur = s; } } curGuard { *this, saved };
     try {
         execStmtList(p.body, f);
     } catch (ExitSig& x) {
-        if ((p.isSub && x.kind == "sub") || (!p.isSub && p.propKind == 0 && x.kind == "function") ||
-            (p.propKind != 0 && x.kind == "property")) {
-            // normal exit
-        } else {
-            cur = saved;
+        if (!((p.isSub && x.kind == "sub") || (!p.isSub && p.propKind == 0 && x.kind == "function") ||
+              (p.propKind != 0 && x.kind == "property")))
             throw;
-        }
     }
-    cur = saved;
 
     // ByRef copy-back
     for (auto& pr : byRef) {
@@ -930,9 +936,9 @@ void Interp::executeString(const std::string& code, bool globalScope) {
     if (cur) f.resumeNext = cur->resumeNext;
     Frame* saved = cur;
     cur = &f;
+    struct CurGuard { Interp& i; Frame* s; ~CurGuard() { i.cur = s; } } curGuard { *this, saved };
     try {
         execStmtList(list, f);
     } catch (EndSig&) {
     }
-    cur = saved;
 }

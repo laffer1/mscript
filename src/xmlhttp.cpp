@@ -18,7 +18,10 @@
 #include <sys/param.h> // MAXHOSTNAMELEN, required by fetch.h
 #include <fetch.h>
 
+#include <cerrno>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -26,6 +29,7 @@
 
 #include <cctype>
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -197,25 +201,61 @@ HttpResponse httpRaw(const std::string& method, const std::string& url,
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
+    // note: getaddrinfo itself is not interruptible; the deadline below covers
+    // the connection attempts across all returned addresses
     if (getaddrinfo(connectHost.c_str(), connectPort.c_str(), &hints, &res) != 0 || !res)
         throwErr(5, "XMLHTTP: cannot resolve host '" + connectHost + "'");
+    // one deadline across all connect attempts, so trying multiple addresses
+    // cannot multiply the configured timeout
+    auto t0 = std::chrono::steady_clock::now();
+    auto elapsedMs = [&]() -> long long {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
     int fd = -1;
     for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
         if (timeoutMs > 0) {
+            long long remaining = timeoutMs - elapsedMs();
+            if (remaining <= 0) { close(fd); fd = -1; continue; } // deadline already spent
             timeval tv {};
-            tv.tv_sec = timeoutMs / 1000;
-            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            tv.tv_sec = remaining / 1000;
+            tv.tv_usec = (remaining % 1000) * 1000;
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            // non-blocking connect so a blackholed peer cannot stall us for
+            // the OS TCP timeout (~2 min); poll for writability instead
+            int fl = fcntl(fd, F_GETFL, 0);
+            fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+            int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+            if (rc != 0 && errno == EINPROGRESS) {
+                pollfd pfd { fd, POLLOUT, 0 };
+                // clamp to int range: a huge timeout must not wrap negative
+                // (which poll would read as "wait forever")
+                int pollMs = (int)std::min<long long>(remaining, INT_MAX);
+                int pr = poll(&pfd, 1, pollMs);
+                if (pr > 0) {
+                    int soerr = 0;
+                    socklen_t sl = sizeof soerr;
+                    getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+                    rc = (soerr == 0) ? 0 : -1;
+                } else rc = -1; // timeout or poll error
+            }
+            fcntl(fd, F_SETFL, fl); // restore blocking mode for send/recv
+            if (rc == 0) break;
+        } else {
+            if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) throwErr(5, "XMLHTTP: cannot connect to " + connectHost + ":" + connectPort);
+    if (fd < 0) {
+        if (timeoutMs > 0 && elapsedMs() >= timeoutMs)
+            throwErr(5, "XMLHTTP: connection to " + connectHost + ":" + connectPort + " timed out");
+        throwErr(5, "XMLHTTP: cannot connect to " + connectHost + ":" + connectPort);
+    }
 
     bool defPort = (u.port == "80");
     std::string req;
@@ -551,8 +591,9 @@ static void xhrSend(const std::shared_ptr<XhrData>& data, std::vector<Variant>& 
             if (lower(h.first) == "user-agent") { h.second = data->userAgent; found = true; }
         if (!found) data->reqHeaders.emplace_back("User-Agent", data->userAgent);
     }
-    long long effTimeout = data->timeoutMs;
-    if (effTimeout <= 0) effTimeout = std::max(data->tSend, data->tReceive);
+    // effective timeout: XMLHTTP's timeout property and WinHTTP's
+    // SetTimeouts(resolve/connect/send/receive); 0/-1 = no timeout
+    long long effTimeout = std::max({data->timeoutMs, data->tConnect, data->tSend, data->tReceive});
     int redirects = data->enableRedirects
         ? (int)std::min<long long>(data->maxRedirects > 0 ? data->maxRedirects : 10, 50)
         : 0;
