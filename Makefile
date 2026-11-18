@@ -15,6 +15,11 @@ mscript: $(SRC) $(HDR)
 test: mscript
 	sh tests/run.sh
 
+# Wine VBScript conformance suite (reads the wine port's test .vbs files;
+# they are LGPL and not vendored — set WINE_VBS_DIR if the port path differs)
+test-wine: mscript
+	sh tests/wine/run.sh
+
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man

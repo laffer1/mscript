@@ -31,7 +31,9 @@ struct Variant {
     static Variant mkBool(bool x)   { Variant v; v.t = VT::Bool;   v.b = x; return v; }
     static Variant mkInt(long long x) {
         Variant v; v.ll = x;
-        v.t = (x >= -32768 && x <= 32767) ? VT::Int : VT::Long;
+        // VBScript literal subtype: int16 -> Integer, int32 -> Long, else Double
+        if (x < -2147483648LL || x > 2147483647LL) { v.t = VT::Double; v.d = (double)x; }
+        else v.t = (x >= -32768 && x <= 32767) ? VT::Int : VT::Long;
         return v;
     }
     static Variant mkLong(long long x) { Variant v; v.t = VT::Long; v.ll = x; return v; }
@@ -55,13 +57,18 @@ struct Variant {
 struct VBSError : std::runtime_error {
     int number;
     std::string source;
+    std::string helpfile;
+    int helpcontext = 0;
     int line = 0;
-    VBSError(int num, const std::string& desc, std::string src = "")
-        : std::runtime_error(desc), number(num), source(std::move(src)) {}
+    VBSError(int num, const std::string& desc, std::string src = "",
+             std::string hf = "", int hc = 0)
+        : std::runtime_error(desc), number(num), source(std::move(src)),
+          helpfile(std::move(hf)), helpcontext(hc) {}
 };
 
 [[noreturn]] void throwErr(int num, const std::string& desc);
 std::string errDesc(int num);
+int mapHRESULTToVB(uint32_t hres); // raw HRESULT -> Err.Number (VB) value
 
 struct VArray {
     int base = 0;                    // Option Base
@@ -88,6 +95,8 @@ struct VBObject {
     virtual Variant invoke(const std::vector<Variant>& args);              // obj(args)
     virtual void assignInvoke(const std::vector<Variant>& args, const Variant& v); // obj(args) = v
     virtual std::vector<Variant> enumItems();                               // For Each support
+    virtual bool hasDefault() const { return false; }                       // default property
+    virtual Variant getDefault() { throwErr(438, errDesc(438)); }
     virtual std::string objectKind() const { return "Object"; }
     virtual std::string toString();
 };

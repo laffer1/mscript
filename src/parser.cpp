@@ -100,8 +100,18 @@ std::vector<StmtPtr> Parser::parseInlineStatements() {
     DepthGuard g(*this); // nested single-line If ... Then ... recurses through here
     std::vector<StmtPtr> out;
     for (;;) {
+        if (peek().k == TK::Colon) { advance(); continue; } // empty statement: "if x then :"
+        if (peek().k == TK::Newline || peek().k == TK::End) break;
+        // single-line "if ... then ... else ... end if" on one line
+        if (atIdent("end") && peek(1).k == TK::Ident && lower(peek(1).text) == "if") {
+            advance(); advance();
+            break;
+        }
         out.push_back(parseStatement());
         if (peek().k == TK::Colon) { advance(); continue; }
+        if (atIdent("end") && peek(1).k == TK::Ident && lower(peek(1).text) == "if") {
+            advance(); advance();
+        }
         break;
     }
     return out;
@@ -152,6 +162,12 @@ StmtPtr Parser::parseStatement() {
         }
         if ((w == "public" || w == "private") && peek(1).k == TK::Ident) {
             std::string w2 = lower(peek(1).text);
+            if (w2 == "default" && peek(2).k == TK::Ident && lower(peek(2).text) == "property") {
+                advance(); advance(); // public/private default
+                StmtPtr s = parsePropDecl();
+                s->b = true; // marks the class's default property
+                return s;
+            }
             if (w2 == "sub" || w2 == "function" || w2 == "property") {
                 advance(); // public/private
                 if (w2 == "sub") return parseProcDecl(true);
@@ -199,7 +215,17 @@ StmtPtr Parser::parseStatement() {
         if (w == "with") return parseWith();
         if (w == "sub") return parseProcDecl(true);
         if (w == "function") return parseProcDecl(false);
-        if (w == "property") return parsePropDecl();
+        if (w == "default" && peek(1).k == TK::Ident && lower(peek(1).text) == "property") {
+            advance();
+            StmtPtr s = parsePropDecl();
+            s->b = true;
+            return s;
+        }
+        if (w == "property" && peek(1).k == TK::Ident) {
+            std::string w2 = lower(peek(1).text);
+            if (w2 == "get" || w2 == "let" || w2 == "set") return parsePropDecl();
+            // otherwise "Property" is used as a plain identifier (legal in VBScript)
+        }
         if (w == "class") return parseClassDecl();
         if (w == "exit") {
             advance();
@@ -652,16 +678,16 @@ bool Parser::canStartExpr() const {
 
 ExprPtr Parser::parseExpr(int minPrec) {
     DepthGuard g(*this);
-    // prefix Not (logical, precedence 6)
-    if (atIdent("not")) {
-        int prec = 6;
-        if (prec >= minPrec) {
-            advance();
-            ExprPtr operand = parseExpr(prec + 1);
-            return Expr::mkUn("not", std::move(operand), peek().line);
-        }
+    // prefix Not (logical, precedence 6); recurse at prec so "not not x" works,
+    // then continue with binary operators at minPrec so "not a and b" parses
+    // as (not a) and b
+    ExprPtr left;
+    if (atIdent("not") && 6 >= minPrec) {
+        advance();
+        left = Expr::mkUn("not", parseExpr(6), peek().line);
+    } else {
+        left = parseUnary();
     }
-    ExprPtr left = parseUnary();
     return parseBinRest(std::move(left), minPrec);
 }
 
@@ -748,6 +774,7 @@ ExprPtr Parser::parsePrimary() {
     int line = tk.line;
     if (tk.k == TK::Number) {
         advance();
+        if (tk.isDate) return Expr::mkLit(Variant::mkDate(tk.num), line);
         if (tk.isInt) {
             long long v = (long long)tk.num;
             return Expr::mkLit(Variant::mkInt(v), line);

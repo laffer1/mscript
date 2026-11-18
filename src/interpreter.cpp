@@ -34,13 +34,23 @@ bool ClassInstance::hasMember(const std::string& n) const {
     return false;
 }
 
+bool ClassInstance::hasDefault() const {
+    return cls && !cls->defaultProp.empty();
+}
+
+Variant ClassInstance::getDefault() {
+    return getMember("");
+}
+
 bool ClassInstance::hasMethod(const std::string& n) const {
     if (!cls) return false;
     for (Proc* p : cls->procs) if (p->name == n && p->propKind == 0) return true;
     return false;
 }
 
-Variant ClassInstance::getMember(const std::string& n) {
+Variant ClassInstance::getMember(const std::string& n0) {
+    std::string n = n0;
+    if (n.empty() && cls && !cls->defaultProp.empty()) n = cls->defaultProp; // default property
     auto it = fields.vars.find(n);
     if (it != fields.vars.end()) return it->second;
     if (Proc* p = findProc(n, 1)) { // Property Get
@@ -114,6 +124,8 @@ void Interp::setErr(const VBSError& e) {
     m->props["number"] = Variant::mkLong(e.number);
     m->props["description"] = Variant::mkStr(e.what());
     m->props["source"] = Variant::mkStr(e.source);
+    m->props["helpfile"] = Variant::mkStr(e.helpfile);
+    m->props["helpcontext"] = Variant::mkLong(e.helpcontext);
 }
 
 // ---------- registration ----------
@@ -143,6 +155,7 @@ void Interp::registerClass(Stmt& s) {
         if (m->k == Stmt::Dim) {
             for (auto& d : m->decls) ci.fields.push_back(&d);
         } else if (m->k == Stmt::SubDecl || m->k == Stmt::FuncDecl || m->k == Stmt::PropDecl) {
+            if (m->k == Stmt::PropDecl && m->b) ci.defaultProp = m->name; // Default Property
             ci.procs.push_back(registerProc(*m, s.name));
         }
     }
@@ -292,12 +305,30 @@ void Interp::execStmt(Stmt& s, Frame& f) {
     }
 
     case Stmt::If: {
-        if (toBool(evalExpr(*s.e, f))) {
+        // VBScript Resume Next quirk: an error in an If/ElseIf condition
+        // resumes execution in that branch's body
+        try {
+            if (toBool(evalExpr(*s.e, f))) {
+                execStmtList(ptrVec(s.body), f);
+                break;
+            }
+        } catch (VBSError& e) {
+            if (!f.resumeNext) throw;
+            if (e.line == 0) e.line = s.e->line;
+            setErr(e);
             execStmtList(ptrVec(s.body), f);
             break;
         }
         for (auto& arm : s.arms) {
-            if (toBool(evalExpr(*arm.first[0], f))) {
+            try {
+                if (toBool(evalExpr(*arm.first[0], f))) {
+                    execStmtList(ptrVec(arm.second), f);
+                    return;
+                }
+            } catch (VBSError& e) {
+                if (!f.resumeNext) throw;
+                if (e.line == 0) e.line = arm.first[0]->line;
+                setErr(e);
                 execStmtList(ptrVec(arm.second), f);
                 return;
             }
@@ -317,20 +348,29 @@ void Interp::execStmt(Stmt& s, Frame& f) {
             bool matched = false;
             for (auto& item : arm.first) {
                 bool m;
-                if (item->k == Expr::Bin && item->op == "to") {
-                    Variant lo = evalExpr(*item->a[0], f);
-                    Variant hi = evalExpr(*item->a[1], f);
-                    Variant c1 = opCompare(">=", cv, lo, compareText);
-                    Variant c2 = opCompare("<=", cv, hi, compareText);
-                    m = c1.t != VT::Null && c2.t != VT::Null && toBool(c1) && toBool(c2);
-                } else if (item->k == Expr::Bin && item->a[0]->k == Expr::Var && item->a[0]->name == "\x01" "case") {
-                    Variant r = evalExpr(*item->a[1], f);
-                    Variant c = opCompare(item->op, cv, r, compareText);
-                    m = c.t == VT::Null ? false : toBool(c);
-                } else {
-                    Variant iv = evalExpr(*item, f);
-                    Variant c = opCompare("=", cv, iv, compareText);
-                    m = c.t == VT::Null ? false : toBool(c);
+                try {
+                    if (item->k == Expr::Bin && item->op == "to") {
+                        Variant lo = evalExpr(*item->a[0], f);
+                        Variant hi = evalExpr(*item->a[1], f);
+                        Variant c1 = opCompare(">=", cv, lo, compareText);
+                        Variant c2 = opCompare("<=", cv, hi, compareText);
+                        m = c1.t != VT::Null && c2.t != VT::Null && toBool(c1) && toBool(c2);
+                    } else if (item->k == Expr::Bin && item->a[0]->k == Expr::Var && item->a[0]->name == "\x01" "case") {
+                        Variant r = evalExpr(*item->a[1], f);
+                        Variant c = opCompare(item->op, cv, r, compareText);
+                        m = c.t == VT::Null ? false : toBool(c);
+                    } else {
+                        Variant iv = evalExpr(*item, f);
+                        Variant c = opCompare("=", cv, iv, compareText);
+                        m = c.t == VT::Null ? false : toBool(c);
+                    }
+                } catch (VBSError& e) {
+                    // Resume Next: an error in a case expression runs that case
+                    if (!f.resumeNext) throw;
+                    if (e.line == 0) e.line = item->line;
+                    setErr(e);
+                    execStmtList(ptrVec(arm.second), f);
+                    return;
                 }
                 if (m) { matched = true; break; }
             }
@@ -349,12 +389,30 @@ void Interp::execStmt(Stmt& s, Frame& f) {
             if (optionExplicit) throwErr(500, errDesc(500));
             cell = &f.scope->vars[vn];
         }
-        double start = toDouble(evalExpr(*s.e2, f));
-        double end = toDouble(evalExpr(*s.exprs[0], f));
-        double step = s.e3 ? toDouble(evalExpr(*s.e3, f)) : 1.0;
-        if (step == 0) throwErr(5, errDesc(5));
-        *cell = numToVar(start);
+        // Resume Next: an error in a For header runs the body once, unchanged
+        bool headerErr = false;
+        double start = 0, end = 0, step = 1;
+        try {
+            start = toDouble(evalExpr(*s.e2, f));
+            end = toDouble(evalExpr(*s.exprs[0], f));
+            step = s.e3 ? toDouble(evalExpr(*s.e3, f)) : 1.0;
+        } catch (VBSError& e) {
+            if (!f.resumeNext) throw;
+            if (e.line == 0) e.line = s.line;
+            setErr(e);
+            headerErr = true;
+        }
+        if (step == 0 && !headerErr) throwErr(5, errDesc(5));
+        if (!headerErr) *cell = numToVar(start);
         auto body = ptrVec(s.body);
+        if (headerErr) {
+            try {
+                execStmtList(body, f);
+            } catch (ExitSig& x) {
+                if (x.kind != "for") throw;
+            }
+            break;
+        }
         while (step > 0 ? toDouble(*cell) <= end : toDouble(*cell) >= end) {
             try {
                 execStmtList(body, f);
@@ -374,18 +432,36 @@ void Interp::execStmt(Stmt& s, Frame& f) {
             if (optionExplicit) throwErr(500, errDesc(500));
             cell = &f.scope->vars[vn];
         }
-        Variant coll = evalExpr(*s.e2, f);
+        // Resume Next: an error in a For Each collection expression runs the
+        // body once with the loop variable unchanged
         std::vector<Variant> items;
-        if (coll.t == VT::Array) {
-            if (!coll.arr || !coll.arr->allocated) throwErr(9, errDesc(9));
-            items.assign(coll.arr->data.begin(), coll.arr->data.end());
-        } else if (coll.t == VT::Object) {
-            if (!coll.obj) throwErr(424, errDesc(424));
-            items = coll.obj->enumItems();
-        } else {
-            throwErr(424, errDesc(424));
+        bool headerErr = false;
+        try {
+            Variant coll = evalExpr(*s.e2, f);
+            if (coll.t == VT::Array) {
+                if (!coll.arr || !coll.arr->allocated) throwErr(9, errDesc(9));
+                items.assign(coll.arr->data.begin(), coll.arr->data.end());
+            } else if (coll.t == VT::Object) {
+                if (!coll.obj) throwErr(424, errDesc(424));
+                items = coll.obj->enumItems();
+            } else {
+                throwErr(424, errDesc(424));
+            }
+        } catch (VBSError& e) {
+            if (!f.resumeNext) throw;
+            if (e.line == 0) e.line = s.line;
+            setErr(e);
+            headerErr = true;
         }
         auto body = ptrVec(s.body);
+        if (headerErr) {
+            try {
+                execStmtList(body, f);
+            } catch (ExitSig& x) {
+                if (x.kind != "for") throw;
+            }
+            break;
+        }
         for (auto& item : items) {
             *cell = item;
             try {
@@ -401,8 +477,23 @@ void Interp::execStmt(Stmt& s, Frame& f) {
     case Stmt::DoLoop: {
         auto body = ptrVec(s.body);
         for (;;) {
-            if (s.name == "while") { if (!toBool(evalExpr(*s.e, f))) break; }
-            else if (s.name == "until") { if (toBool(evalExpr(*s.e, f))) break; }
+            if (s.name == "while" || s.name == "until") {
+                // Resume Next: an error in a pre-test condition runs the body once
+                try {
+                    bool c = toBool(evalExpr(*s.e, f));
+                    if (s.name == "while" ? !c : c) break;
+                } catch (VBSError& e) {
+                    if (!f.resumeNext) throw;
+                    if (e.line == 0) e.line = s.e->line;
+                    setErr(e);
+                    try {
+                        execStmtList(body, f);
+                    } catch (ExitSig& x) {
+                        if (x.kind != "do") throw;
+                    }
+                    break;
+                }
+            }
             try {
                 execStmtList(body, f);
             } catch (ExitSig& x) {
@@ -418,12 +509,36 @@ void Interp::execStmt(Stmt& s, Frame& f) {
 
     case Stmt::While: {
         auto body = ptrVec(s.body);
-        while (toBool(evalExpr(*s.e, f))) execStmtList(body, f);
+        for (;;) {
+            bool c;
+            try {
+                c = toBool(evalExpr(*s.e, f));
+            } catch (VBSError& e) {
+                // Resume Next: an error in a While condition runs the body once
+                if (!f.resumeNext) throw;
+                if (e.line == 0) e.line = s.e->line;
+                setErr(e);
+                execStmtList(body, f);
+                break;
+            }
+            if (!c) break;
+            execStmtList(body, f);
+        }
         break;
     }
 
     case Stmt::With: {
-        Variant v = evalExpr(*s.e, f);
+        Variant v;
+        try {
+            v = evalExpr(*s.e, f);
+        } catch (VBSError& e) {
+            // Resume Next: an error in a With expression still runs the body
+            if (!f.resumeNext) throw;
+            if (e.line == 0) e.line = s.e->line;
+            setErr(e);
+            execStmtList(ptrVec(s.body), f);
+            break;
+        }
         if (v.t != VT::Object || !v.obj) throwErr(424, errDesc(424));
         withStack.push_back(v);
         try {
@@ -607,6 +722,9 @@ void Interp::assignTarget(Expr& t, const Variant& v, bool isSet, Frame& f) {
                     return;
                 }
             }
+            // assigning to a procedure name (e.g. its return value slot at
+            // global scope) is silently ignored, matching vbscript
+            if (procs.count(t.name)) return;
             if (optionExplicit) throwErr(500, errDesc(500));
             cell = &f.scope->vars[t.name];
         }
@@ -872,6 +990,9 @@ Variant Interp::callByName(const std::string& lowerName, std::vector<ArgVal>& ar
 Variant Interp::instantiateClass(const std::string& name, std::vector<Expr*>& argExprs, Frame& f, int line) {
     auto it = classes.find(name);
     if (it == classes.end()) {
+        // not a script-defined class: try a host ProgID (e.g. New RegExp)
+        auto host = createHostObject(*this, name);
+        if (host) return Variant::mkObj(host);
         VBSError e(430, "Class not defined: " + name);
         e.line = line;
         throw e;

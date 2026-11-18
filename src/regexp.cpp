@@ -144,9 +144,12 @@ std::string translate(const std::string& pat, bool multiline, std::vector<int>& 
 
 void compile(RegexData& d) {
     if (d.compiled) { regfree(&d.re); d.compiled = false; }
-    if (d.pattern.empty()) badPattern("empty pattern");
+    // an empty pattern is legal in VBScript: it matches the empty string.
+    // POSIX regcomp rejects an empty regex, so compile "()" and report no groups.
     std::vector<int> map;
     std::string ere = translate(d.pattern, d.multiline, map);
+    bool emptyPat = d.pattern.empty();
+    if (emptyPat) { ere = "()"; map = {0}; }
     int flags = REG_EXTENDED;
     if (d.ignoreCase) flags |= REG_ICASE;
     if (d.multiline) flags |= REG_NEWLINE;
@@ -159,7 +162,7 @@ void compile(RegexData& d) {
     }
     d.re = re;
     d.vbsToPosix = std::move(map);
-    d.nsub = (int)re.re_nsub;
+    d.nsub = emptyPat ? 0 : (int)re.re_nsub;
     d.compiled = true;
 }
 
@@ -311,7 +314,10 @@ std::string expandReplacement(const std::string& repl, const std::string& s,
                     int g2 = g * 10 + (repl[j] - '0');
                     if (g2 <= (int)d.vbsToPosix.size() - 1) { g = g2; j++; }
                 }
-                out += groupText(g);
+                if (g >= 1 && (size_t)g < d.vbsToPosix.size())
+                    out += groupText(g);
+                else
+                    out += repl.substr(i, j - i); // $n with no such group stays literal
                 i = j;
                 continue;
             }
@@ -371,7 +377,8 @@ std::shared_ptr<VBObject> makeRegExp(Interp&) {
     o->methods["replace"] = [data](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.size() < 2) throwErr(450, errDesc(450));
         std::string s = toStr(a[0]);
-        std::string repl = toStr(a[1]);
+        // a Boolean replacement coerces numerically (True -> "-1"), as in vbscript
+        std::string repl = a[1].t == VT::Bool ? std::to_string(toInt64(a[1])) : toStr(a[1]);
         if (!data->compiled) compile(*data);
         std::string out;
         size_t last = 0;
