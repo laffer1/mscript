@@ -477,6 +477,38 @@ static std::shared_ptr<XmlNodeList> makeList(std::vector<XmlNodePtr> items, cons
 
 // ---------- XmlNode member access ----------
 
+// Maximum element nesting depth, enforced both while parsing and when
+// building trees through the DOM API — the tree is shared_ptr-based, so
+// recursive destruction/traversal/serialization would overflow the C++ stack.
+constexpr size_t XML_MAX_DEPTH = 512;
+
+// depth of a node via the parent chain (iterative: safe at any depth)
+static size_t xmlNodeDepth(const XmlNodePtr& n) {
+    size_t d = 0;
+    for (auto p = n->parentPtr(); p; p = p->parentPtr()) d++;
+    return d;
+}
+
+// height of a subtree, computed iteratively (recursion would overflow on deep trees)
+static size_t xmlSubtreeHeight(const XmlNodePtr& n) {
+    size_t maxH = 0;
+    std::vector<std::pair<XmlNodePtr, size_t>> st;
+    st.emplace_back(n, 1);
+    while (!st.empty()) {
+        auto [x, h] = st.back();
+        st.pop_back();
+        if (h > maxH) maxH = h;
+        for (auto& ch : x->children) st.emplace_back(ch, h + 1);
+    }
+    return maxH;
+}
+
+// reject DOM mutations that would push the tree past the nesting cap
+static void checkAttachDepth(const XmlNodePtr& parent, const XmlNodePtr& child) {
+    if (xmlNodeDepth(parent) + xmlSubtreeHeight(child) > XML_MAX_DEPTH)
+        throwErr(5, "DOM nesting limit (" + std::to_string(XML_MAX_DEPTH) + " elements) exceeded");
+}
+
 Variant XmlNode::getMember(const std::string& n) {
     auto selfPtr = self.lock();
     if (n == "nodename") return Variant::mkStr(name);
@@ -578,6 +610,7 @@ Variant XmlNode::callMember(const std::string& n, std::vector<Variant>& args) {
     }
     if (n == "appendchild") {
         auto c = asNode(args[0], 1);
+        checkAttachDepth(selfPtr, c); // DOM API must respect the same nesting cap as parsing
         // detach from old parent
         if (auto p = c->parentPtr()) {
             for (size_t i = 0; i < p->children.size(); i++)
@@ -600,6 +633,7 @@ Variant XmlNode::callMember(const std::string& n, std::vector<Variant>& args) {
     if (n == "replacechild") {
         auto nw = asNode(args[0], 1);
         auto old = asNode(args[1], 1);
+        checkAttachDepth(selfPtr, nw);
         for (size_t i = 0; i < children.size(); i++)
             if (children[i].get() == old.get()) {
                 if (auto p = nw->parentPtr()) {
@@ -622,6 +656,7 @@ Variant XmlNode::callMember(const std::string& n, std::vector<Variant>& args) {
             return callMember("appendchild", one);
         }
         auto ref = asNode(args[1], 1);
+        checkAttachDepth(selfPtr, nw);
         if (auto p = nw->parentPtr()) {
             for (size_t j = 0; j < p->children.size(); j++)
                 if (p->children[j].get() == nw.get()) { p->children.erase(p->children.begin() + j); break; }
@@ -738,14 +773,13 @@ struct ParseCtx {
     bool preserveWS;
     XML_Parser parser = nullptr;
     bool tooDeep = false;
-    static constexpr size_t MAX_DEPTH = 512; // also bounds recursive tree destruction/traversal
 };
 
 static void XMLCALL xmlStartEl(void* ud, const XML_Char* name, const XML_Char** atts) {
     auto& c = *(ParseCtx*)ud;
-    // nesting-depth cap: expat itself does not limit element depth, and our
-    // tree is shared_ptr-based (recursive destruction) — abort the parse
-    if (c.stack.size() >= ParseCtx::MAX_DEPTH) {
+    // nesting-depth cap: expat itself does not limit element depth. stack[0]
+    // is the document node, so elements 1..XML_MAX_DEPTH are allowed.
+    if (c.stack.size() > XML_MAX_DEPTH) {
         c.tooDeep = true;
         if (c.parser) XML_StopParser(c.parser, XML_FALSE);
         return;
@@ -792,6 +826,14 @@ static bool parseXml(XmlDocument& docObj, const std::string& xml) {
     ctx.doc = XmlNode::make(XML_DOCUMENT, "#document");
     ctx.stack.push_back(ctx.doc);
     ctx.preserveWS = docObj.preserveWhiteSpace;
+
+    // reset all parse-error fields up front so a failed/oversized parse never
+    // reports stale location info from an earlier document
+    docObj.parseError->props["errorcode"] = Variant::mkInt(0);
+    docObj.parseError->props["reason"] = Variant::mkStr("");
+    docObj.parseError->props["line"] = Variant::mkLong(0);
+    docObj.parseError->props["linepos"] = Variant::mkLong(0);
+    docObj.parseError->props["column"] = Variant::mkLong(0);
 
     if (xml.size() > (size_t)INT_MAX) { // XML_Parse takes int
         docObj.parseError->props["errorcode"] = Variant::mkInt(-1);

@@ -5,6 +5,10 @@ space-cap=14
 string-cap=14
 space-ok=[     ]
 recursion=28
-xml-deep=False|maximum element nesting depth (512) exceeded
+arr-cap=7
+recursion2=28 eval-after=3
+xml-512=True
+xml-513=False|maximum element nesting depth (512) exceeded
 xml-ok=True|r
+dom-deep=5
 adodb-quote=q2

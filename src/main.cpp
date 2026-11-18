@@ -53,19 +53,37 @@ int main(int argc, char** argv) {
     } else {
         srcName = args[0];
         scriptArgs.assign(args.begin() + 1, args.end());
-        std::ifstream in(srcName == "-" ? "/dev/stdin" : srcName, std::ios::binary);
-        if (!in) {
-            std::fprintf(stderr, "mscript: cannot open '%s'\n", srcName.c_str());
-            return 2;
+    }
+
+    // Everything from here on (file read, lex/parse, interpreter setup, run)
+    // is inside the guarded region so allocation failures anywhere report a
+    // clean error instead of terminating the process.
+    try {
+        if (srcName != "-e") {
+            std::ifstream in(srcName == "-" ? "/dev/stdin" : srcName, std::ios::binary);
+            if (!in) {
+                std::fprintf(stderr, "mscript: cannot open '%s'\n", srcName.c_str());
+                return 2;
+            }
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            code = ss.str();
         }
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        code = ss.str();
-    }
 
-    Program prog;
-    try {
-        prog = Parser(lex(code)).parseProgram();
+        Program prog = Parser(lex(code)).parseProgram();
+
+        Interp ip;
+        initWScript(ip, srcName, srcName, scriptArgs);
+        ip.load(prog, srcName);
+        try {
+            ip.run();
+        } catch (VBSError& e) {
+            unsigned hex = (unsigned)(e.number | 0x800A0000);
+            std::fprintf(stderr, "mscript: %s(%d): Microsoft VBScript runtime error '%08x': %s\n",
+                         srcName.c_str(), e.line, hex, e.what());
+            return 1;
+        }
+        return ip.exitCode;
     } catch (ParseError& e) {
         std::fprintf(stderr, "mscript: %s(%d): syntax error: %s\n", srcName.c_str(), e.line, e.msg.c_str());
         return 1;
@@ -76,26 +94,4 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mscript: %s: internal error: %s\n", srcName.c_str(), e.what());
         return 1;
     }
-
-    Interp ip;
-    initWScript(ip, srcName, srcName, scriptArgs);
-    ip.load(prog, srcName);
-    try {
-        ip.run();
-    } catch (VBSError& e) {
-        unsigned hex = (unsigned)(e.number | 0x800A0000);
-        std::fprintf(stderr, "mscript: %s(%d): Microsoft VBScript runtime error '%08x': %s\n",
-                     srcName.c_str(), e.line, hex, e.what());
-        return 1;
-    } catch (ParseError& e) {
-        std::fprintf(stderr, "mscript: %s(%d): syntax error: %s\n", srcName.c_str(), e.line, e.msg.c_str());
-        return 1;
-    } catch (const std::bad_alloc&) {
-        std::fprintf(stderr, "mscript: %s: out of memory\n", srcName.c_str());
-        return 1;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "mscript: %s: internal error: %s\n", srcName.c_str(), e.what());
-        return 1;
-    }
-    return ip.exitCode;
 }

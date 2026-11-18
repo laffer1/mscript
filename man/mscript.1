@@ -328,12 +328,16 @@ Named arguments (:=) and GetRef are not supported.
 .Pp
 Security / resource limits — hostile or buggy input raises a clean error
 rather than crashing:
-array dimensions are validated with a capped element count (error 7),
+array dimensions are validated with a capped element count
+(2^24 elements, never beyond what
+.Vt size_t
+can represent; error 7),
 parser nesting is capped at 256 (syntax error),
 procedure recursion at 1000 frames (error 28),
 .Dv Space / String
 at 2^28 characters (error 14),
-XML element nesting at 512
+XML element nesting at 512 elements — enforced for parsed XML and DOM API
+mutations alike
 .Pq Dv parseError.reason
 reports it; expat 2.10's billion-laughs protection is active and external
 entities are never resolved

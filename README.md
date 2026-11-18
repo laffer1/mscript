@@ -152,7 +152,8 @@ WScript.Echo "sum = " & total        ' sum = 5050
 ## Security notes / resource limits
 
 Malicious or buggy input fails with a clean VBScript error, not a crash:
-- Array dimensions are validated and the element count is capped (2^32);
+- Array dimensions are validated and the element count is capped (2^24 =
+  16,777,216 elements, and never beyond what `size_t` can represent);
   overflow/negative/oversized `Dim`/`ReDim` raises error 7 ("Out of memory") —
   previously a dimension product overflow could corrupt the heap.
 - Parser expression/block nesting is capped at 256 (syntax error), and
@@ -160,7 +161,9 @@ Malicious or buggy input fails with a clean VBScript error, not a crash:
   of overflowing the C++ stack.
 - `Space`/`String` are capped at 2^28 characters (error 14 "Out of string
   space"); `std::bad_alloc` anywhere is caught and reported as out of memory.
-- XML parsing caps element nesting at 512 (`parseError.reason` reports it);
+- XML parsing caps element nesting at 512 elements — enforced for parsed XML
+  and DOM API mutations (`appendChild` etc.) alike, since recursive tree
+  operations would overflow the stack (`parseError.reason` reports it);
   expat 2.10's billion-laughs protection is active and external entities are
   not resolved (no XXE). Documents over 2 GB are rejected.
 - HTTP responses are capped at 64 MB; request methods/headers/URLs are

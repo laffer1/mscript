@@ -97,6 +97,7 @@ std::vector<StmtPtr> Parser::parseStatements(const std::set<std::string>& termin
 }
 
 std::vector<StmtPtr> Parser::parseInlineStatements() {
+    DepthGuard g(*this); // nested single-line If ... Then ... recurses through here
     std::vector<StmtPtr> out;
     for (;;) {
         out.push_back(parseStatement());
