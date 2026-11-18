@@ -7,6 +7,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,66 @@ std::string errDesc(int num) {
 
 [[noreturn]] void throwErr(int num, const std::string& desc) {
     throw VBSError(num, desc.empty() ? errDesc(num) : desc);
+}
+
+// Map a raw HRESULT to the VBScript Err.Number value, following the vbscript
+// runtime: facility FACILITY_VBS (0xA) yields the low word; known OLE/STG/etc.
+// codes map to their VBSE_* equivalents; anything else is returned as-is.
+int mapHRESULTToVB(uint32_t hres) {
+    if (((hres >> 16) & 0x1FFF) == 0xA) return (int)(hres & 0xFFFFu); // FACILITY_VBS
+    switch (hres) {
+        case 0x80004001u: return 445; // E_NOTIMPL
+        case 0x80004002u: return 430; // E_NOINTERFACE
+        case 0x80020001u: return 438; // DISP_E_UNKNOWNINTERFACE
+        case 0x80020003u: return 438; // DISP_E_MEMBERNOTFOUND
+        case 0x80020004u: return 448; // DISP_E_PARAMNOTFOUND
+        case 0x80020005u: return 13;  // DISP_E_TYPEMISMATCH
+        case 0x80020006u: return 438; // DISP_E_UNKNOWNNAME
+        case 0x80020007u: return 446; // DISP_E_NONAMEDARGS
+        case 0x80020008u: return 458; // DISP_E_BADVARTYPE
+        case 0x8002000Au: return 6;   // DISP_E_OVERFLOW
+        case 0x8002000Bu: return 9;   // DISP_E_BADINDEX
+        case 0x8002000Cu: return 447; // DISP_E_UNKNOWNLCID
+        case 0x8002000Du: return 10;  // DISP_E_ARRAYISLOCKED
+        case 0x8002000Eu: return 450; // DISP_E_BADPARAMCOUNT
+        case 0x8002000Fu: return 449; // DISP_E_PARAMNOTOPTIONAL
+        case 0x80020011u: return 451; // DISP_E_NOTACOLLECTION
+        case 0x8002802Fu: return 453; // TYPE_E_DLLFUNCTIONNOTFOUND
+        case 0x80028CA0u: return 13;  // TYPE_E_TYPEMISMATCH
+        case 0x80028CA1u: return 9;   // TYPE_E_OUTOFBOUNDS
+        case 0x80028CA2u: return 57;  // TYPE_E_IOERROR
+        case 0x80028CA3u: return 322; // TYPE_E_CANTCREATETMPFILE
+        case 0x80030002u: return 432; // STG_E_FILENOTFOUND
+        case 0x80030003u: return 76;  // STG_E_PATHNOTFOUND
+        case 0x80030004u: return 67;  // STG_E_TOOMANYOPENFILES
+        case 0x80030005u: return 70;  // STG_E_ACCESSDENIED
+        case 0x80030008u: return 7;   // STG_E_INSUFFICIENTMEMORY
+        case 0x80030012u: return 67;  // STG_E_NOMOREFILES
+        case 0x80030013u: return 70;  // STG_E_DISKISWRITEPROTECTED
+        case 0x8003001Du: return 57;  // STG_E_WRITEFAULT
+        case 0x8003001Eu: return 57;  // STG_E_READFAULT
+        case 0x80030020u: return 75;  // STG_E_SHAREVIOLATION
+        case 0x80030021u: return 70;  // STG_E_LOCKVIOLATION
+        case 0x80030050u: return 58;  // STG_E_FILEALREADYEXISTS
+        case 0x80030070u: return 61;  // STG_E_MEDIUMFULL
+        case 0x800300FCu: return 53;  // STG_E_INVALIDNAME
+        case 0x80030100u: return 70;  // STG_E_INUSE
+        case 0x80030101u: return 70;  // STG_E_NOTCURRENT
+        case 0x80030103u: return 57;  // STG_E_CANTSAVE
+        case 0x80040154u: return 429; // REGDB_E_CLASSNOTREG
+        case 0x800401E3u: return 429; // MK_E_UNAVAILABLE
+        case 0x800401E6u: return 432; // MK_E_INVALIDEXTENSION
+        case 0x800401EAu: return 432; // MK_E_CANTOPENFILE
+        case 0x800401F3u: return 429; // CO_E_CLASSSTRING
+        case 0x800401F5u: return 429; // CO_E_APPNOTFOUND
+        case 0x800401FEu: return 429; // O_E_APPDIDNTREG
+        case 0x80070005u: return 70;  // E_ACCESSDENIED
+        case 0x8007000Eu: return 7;   // E_OUTOFMEMORY
+        case 0x80070057u: return 5;   // E_INVALIDARG
+        case 0x800706BAu: return 462; // RPC_E_SERVER_UNAVAILABLE
+        case 0x80080005u: return 429; // CO_E_SERVER_EXEC_FAILURE
+        default: return (int)hres;
+    }
 }
 
 // ---------- VBObject ----------
@@ -306,19 +367,23 @@ std::string formatDateTimeV(double serial) {
 bool parseNumericString(const std::string& sin, double& out) {
     std::string s = trim(sin);
     if (s.empty()) { out = 0; return true; }
-    // hex / octal literals as strings: &H1A, &O17
-    if (s.size() > 2 && s[0] == '&' && (s[1] == 'h' || s[1] == 'H')) {
+    // hex / octal literals as strings: &H1A, &O17, &HFFFF&, ...
+    // trailing '&' => Long (32-bit wrap); no suffix => Integer (16-bit wrap)
+    auto basedStr = [&](int base) -> bool {
+        std::string d = s.substr(2);
+        bool suffix = !d.empty() && d.back() == '&';
+        if (suffix) d.pop_back();
+        if (d.empty()) return false;
         char* end = nullptr;
-        long long v = std::strtoll(s.c_str() + 2, &end, 16);
-        if (end && *end == 0 && end != s.c_str() + 2) { out = (double)v; return true; }
-        return false;
-    }
-    if (s.size() > 2 && s[0] == '&' && (s[1] == 'o' || s[1] == 'O')) {
-        char* end = nullptr;
-        long long v = std::strtoll(s.c_str() + 2, &end, 8);
-        if (end && *end == 0 && end != s.c_str() + 2) { out = (double)v; return true; }
-        return false;
-    }
+        unsigned long long v = std::strtoull(d.c_str(), &end, base);
+        if (!end || *end != 0) return false;
+        if (!suffix && v <= 0xFFFFULL) out = (double)(int16_t)(uint16_t)v;
+        else if (v <= 0xFFFFFFFFULL) out = (double)(int32_t)(uint32_t)v;
+        else out = (double)v;
+        return true;
+    };
+    if (s.size() > 2 && s[0] == '&' && (s[1] == 'h' || s[1] == 'H')) return basedStr(16);
+    if (s.size() > 2 && s[0] == '&' && (s[1] == 'o' || s[1] == 'O')) return basedStr(8);
     char* end = nullptr;
     double v = std::strtod(s.c_str(), &end);
     if (end == s.c_str()) return false;
@@ -351,7 +416,7 @@ long long toInt64(const Variant& v) { return (long long)toDouble(v); }
 bool toBool(const Variant& v) {
     switch (v.t) {
         case VT::Empty: return false;
-        case VT::Null:  throwErr(94, errDesc(94));
+        case VT::Null:  return false; // VariantChangeType(Null -> Bool) is False
         case VT::Bool:  return v.b;
         case VT::Int:
         case VT::Long:  return v.ll != 0;
@@ -361,8 +426,16 @@ bool toBool(const Variant& v) {
             std::string s = lower(trim(v.s));
             if (s == "true") return true;
             if (s == "false") return false;
+            // OLE VarBoolFromStr also accepts the literal strings #TRUE#/#FALSE#
+            if (trim(v.s) == "#TRUE#") return true;
+            if (trim(v.s) == "#FALSE#") return false;
             double d;
             if (parseNumericString(v.s, d)) return d != 0;
+            throwErr(13, errDesc(13));
+        }
+        case VT::Object: {
+            // an object with a default property coerces through it
+            if (v.obj && v.obj->hasDefault()) return toBool(v.obj->getDefault());
             throwErr(13, errDesc(13));
         }
         default: throwErr(13, errDesc(13));
@@ -651,7 +724,16 @@ Variant opNot(const Variant& a) {
 }
 
 Variant opLogic(const std::string& op, const Variant& a, const Variant& b) {
-    if (a.isNull() || b.isNull()) return Variant::mkNull();
+    if (a.isNull() || b.isNull()) {
+        // VBScript Null propagation: Or with a True operand is True,
+        // And with a False operand is False, otherwise Null
+        bool xn = a.isNull(), yn = b.isNull();
+        bool x = xn ? false : toBool(a), y = yn ? false : toBool(b);
+        if (op == "or" && ((!xn && x) || (!yn && y))) return Variant::mkBool(true);
+        if (op == "and" && ((!xn && !x) || (!yn && !y))) return Variant::mkBool(false);
+        if (op == "imp" && !xn && !x) return Variant::mkBool(true); // False Imp _ = True
+        if (xn || yn) return Variant::mkNull();
+    }
     bool bothBool = a.t == VT::Bool && b.t == VT::Bool;
     bool bothInt = (a.isIntegral() || a.t == VT::Bool) && (b.isIntegral() || b.t == VT::Bool);
     if (bothBool || !bothInt) {
@@ -682,6 +764,13 @@ static int cmpNumStr(const Variant& a, const Variant& b, bool compareText) {
             return x < y ? -1 : (x > y ? 1 : 0);
         }
         return a.s < b.s ? -1 : (a.s > b.s ? 1 : 0);
+    }
+    if (aStr != bStr && (a.t == VT::Bool || b.t == VT::Bool)) {
+        // string vs boolean compares as text (True/False), as in VBScript
+        std::string x = aStr ? a.s : std::string(toBool(a) ? "True" : "False");
+        std::string y = bStr ? b.s : std::string(toBool(b) ? "True" : "False");
+        if (compareText) { x = lower(x); y = lower(y); }
+        return x < y ? -1 : (x > y ? 1 : 0);
     }
     double x = toDouble(a), y = toDouble(b);
     return x < y ? -1 : (x > y ? 1 : 0);

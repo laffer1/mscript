@@ -3,7 +3,10 @@
 
 #include "lexer.h"
 
+#include "variant.h"
+
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 
 static std::string joinContinuations(const std::string& src) {
@@ -15,12 +18,13 @@ static std::string joinContinuations(const std::string& src) {
         if (c == '\n') { out += '\n'; i++; continue; }
         if (c == '\r') { i++; continue; }
         // detect " _" at end of line (underscore preceded by whitespace, then EOL)
-        if (c == ' ' || c == '\t') {
-            size_t j = i;
+        // line continuation: a '_' followed only by whitespace and a newline,
+        // regardless of what precedes it (VBScript allows "x =_")
+        if (c == '_') {
+            size_t j = i + 1;
             while (j < n && (src[j] == ' ' || src[j] == '\t')) j++;
-            if (j < n && src[j] == '_' && j + 1 < n && (src[j + 1] == '\n' || (src[j + 1] == '\r' && j + 2 < n && src[j + 2] == '\n'))) {
-                // skip whitespace, underscore, and the newline
-                i = j + 1;
+            if (j >= n || src[j] == '\n' || src[j] == '\r') {
+                i = j;
                 while (i < n && (src[i] == '\r' || src[i] == '\n')) i++;
                 out += ' ';
                 continue;
@@ -39,11 +43,13 @@ std::vector<Token> lex(const std::string& srcIn) {
     int line = 1;
 
     bool sawSpace = false;
-    auto push = [&](TK k, const std::string& t, double num = 0, bool isInt = false) {
-        Token tk; tk.k = k; tk.text = t; tk.num = num; tk.isInt = isInt; tk.line = line;
+    bool afterDot = false; // previous token was '.', so keywords are member names
+    auto push = [&](TK k, const std::string& t, double num = 0, bool isInt = false, bool isDate = false) {
+        Token tk; tk.k = k; tk.text = t; tk.num = num; tk.isInt = isInt; tk.isDate = isDate; tk.line = line;
         tk.spaceBefore = sawSpace;
         toks.push_back(std::move(tk));
         sawSpace = false;
+        afterDot = (k == TK::Op && t == ".");
     };
 
     while (i < n) {
@@ -75,23 +81,45 @@ std::vector<Token> lex(const std::string& srcIn) {
             continue;
         }
 
-        // hex / octal literal: &H.. &O..
+        // hex / octal literal: &H.. / &H..& / &O.. / &O..&
+        // With the trailing '&' the value is a Long (wraps at 32 bits, so
+        // &HFFFFFFFF& = -1); without it it is an Integer (wraps at 16 bits,
+        // so &HFFFF = -1 but &HFFFF& = 65535). Larger values are Double.
+        auto pushBased = [&](const std::string& digits, int base, const std::string& tag) {
+            size_t j = i + 2;
+            auto okDigit = [&](char ch) {
+                return base == 16 ? std::isxdigit((unsigned char)ch)
+                                  : (ch >= '0' && ch <= '7');
+            };
+            while (j < n && okDigit(src[j])) j++;
+            std::string d = src.substr(i + 2, j - i - 2);
+            bool suffix = (j < n && src[j] == '&');
+            if (suffix) j++;
+            unsigned long long v = std::strtoull(d.c_str(), nullptr, base);
+            double num;
+            bool isInt;
+            if (!suffix && v <= 0xFFFFULL) { num = (double)(int16_t)(uint16_t)v; isInt = true; }
+            else if (v <= 0xFFFFFFFFULL) { num = (double)(int32_t)(uint32_t)v; isInt = true; }
+            else { num = (double)v; isInt = false; }
+            push(TK::Number, tag + d + (suffix ? "&" : ""), num, isInt);
+            i = j;
+        };
         if (c == '&' && i + 2 < n && (src[i + 1] == 'H' || src[i + 1] == 'h') &&
-            std::isxdigit((unsigned char)src[i + 2])) {
-            size_t j = i + 2;
-            while (j < n && std::isxdigit((unsigned char)src[j])) j++;
-            std::string hex = src.substr(i + 2, j - i - 2);
-            push(TK::Number, "&H" + hex, (double)std::strtoll(hex.c_str(), nullptr, 16), true);
-            i = j;
-            continue;
-        }
+            std::isxdigit((unsigned char)src[i + 2])) { pushBased("", 16, "&H"); continue; }
         if (c == '&' && i + 2 < n && (src[i + 1] == 'O' || src[i + 1] == 'o') &&
-            src[i + 2] >= '0' && src[i + 2] <= '7') {
-            size_t j = i + 2;
-            while (j < n && src[j] >= '0' && src[j] <= '7') j++;
-            std::string oct = src.substr(i + 2, j - i - 2);
-            push(TK::Number, "&O" + oct, (double)std::strtoll(oct.c_str(), nullptr, 8), true);
-            i = j;
+            src[i + 2] >= '0' && src[i + 2] <= '7') { pushBased("", 8, "&O"); continue; }
+
+        // date literal: #...#  (contents parsed as a date/time)
+        if (c == '#') {
+            size_t j = i + 1;
+            while (j < n && src[j] != '#' && src[j] != '\n') j++;
+            if (j >= n || src[j] != '#') throw ParseError{line, "unterminated date literal"};
+            std::string inner = src.substr(i + 1, j - i - 1);
+            double serial = 0;
+            if (!parseDateString(inner, serial))
+                throw ParseError{line, "invalid date literal #" + inner + "#"};
+            push(TK::Number, "#" + inner + "#", serial, false, true);
+            i = j + 1;
             continue;
         }
 
@@ -129,7 +157,7 @@ std::vector<Token> lex(const std::string& srcIn) {
             i = j;
             std::string lw = word;
             for (auto& ch : lw) ch = (char)std::tolower((unsigned char)ch);
-            if (lw == "rem" && (i >= n || src[i] == ' ' || src[i] == '\t' || src[i] == '\n')) {
+            if (lw == "rem" && !afterDot && (i >= n || src[i] == ' ' || src[i] == '\t' || src[i] == '\n')) {
                 while (i < n && src[i] != '\n') i++;
                 continue;
             }
@@ -155,6 +183,9 @@ std::vector<Token> lex(const std::string& srcIn) {
             if (i + 1 < n && src[i + 1] == '=') { push(TK::Op, ":="); i += 2; continue; }
             push(TK::Colon, ":"); i++; continue;
         }
+        // VBScript lexer quirks: "=>" is ">=", "=<" is "<=", "><" is "<>"
+        if (c == '=' && i + 1 < n && src[i + 1] == '>') { push(TK::Op, ">="); i += 2; continue; }
+        if (c == '=' && i + 1 < n && src[i + 1] == '<') { push(TK::Op, "<="); i += 2; continue; }
         if (c == '<') {
             if (i + 1 < n && src[i + 1] == '>') { push(TK::Op, "<>"); i += 2; continue; }
             if (i + 1 < n && src[i + 1] == '=') { push(TK::Op, "<="); i += 2; continue; }
@@ -162,6 +193,7 @@ std::vector<Token> lex(const std::string& srcIn) {
         }
         if (c == '>') {
             if (i + 1 < n && src[i + 1] == '=') { push(TK::Op, ">="); i += 2; continue; }
+            if (i + 1 < n && src[i + 1] == '<') { push(TK::Op, "<>"); i += 2; continue; }
             push(TK::Op, ">"); i++; continue;
         }
         if (c == '+' || c == '-' || c == '*' || c == '/' || c == '\\' || c == '^' ||

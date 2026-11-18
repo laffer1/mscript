@@ -14,6 +14,7 @@ struct Token {
     std::string text;       // raw text (Ident: original case; Op: the operator)
     double num = 0;         // Number value
     bool isInt = false;     // Number is an integer literal
+    bool isDate = false;    // Number is a #date# literal (num = VB serial)
     bool spaceBefore = false; // whitespace preceded this token on the line
     int line = 0;
 };

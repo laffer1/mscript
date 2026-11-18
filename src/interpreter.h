@@ -55,6 +55,7 @@ struct ClassInfo {
     std::string name;
     std::vector<Decl*> fields;        // owned by the AST
     std::vector<Proc*> procs;
+    std::string defaultProp;          // name of the Default Property Get, if any
 };
 
 struct ClassInstance : VBObject {
@@ -66,6 +67,8 @@ struct ClassInstance : VBObject {
     Proc* findProc(const std::string& name, int kind) const;
     bool hasMember(const std::string& n) const override;
     bool hasMethod(const std::string& n) const override;
+    bool hasDefault() const override;
+    Variant getDefault() override;
     Variant getMember(const std::string& n) override;
     void setMember(const std::string& n, const Variant& v) override;
     Variant callMember(const std::string& n, std::vector<Variant>& args) override;

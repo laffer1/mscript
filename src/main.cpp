@@ -78,7 +78,11 @@ int main(int argc, char** argv) {
         try {
             ip.run();
         } catch (VBSError& e) {
-            unsigned hex = (unsigned)(e.number | 0x800A0000);
+            // small positive codes are VB errors shown as &H800Axxxx; a full
+            // HRESULT (negative int32) is displayed as-is
+            unsigned hex = (e.number >= 0 && e.number <= 0xFFFF)
+                               ? (unsigned)(e.number | 0x800A0000)
+                               : (unsigned)e.number;
             std::fprintf(stderr, "mscript: %s(%d): Microsoft VBScript runtime error '%08x': %s\n",
                          srcName.c_str(), e.line, hex, e.what());
             return 1;

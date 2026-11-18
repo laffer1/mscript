@@ -25,22 +25,33 @@ namespace fs = std::filesystem;
 static std::shared_ptr<MapObject> makeErr(Interp& ip) {
     auto err = std::make_shared<MapObject>();
     err->kind = "Err";
-    err->props["number"] = Variant::mkInt(0);
+    // Err.Number / Err.HelpContext are VT_I4 (Long) in VBScript, even when 0
+    err->props["number"] = Variant::mkLong(0);
     err->props["description"] = Variant::mkStr("");
     err->props["source"] = Variant::mkStr("");
     err->props["helpfile"] = Variant::mkStr("");
-    err->props["helpcontext"] = Variant::mkInt(0);
+    err->props["helpcontext"] = Variant::mkLong(0);
     err->methods["clear"] = [](MapObject* m, std::vector<Variant>&) -> Variant {
-        m->props["number"] = Variant::mkInt(0);
+        m->props["number"] = Variant::mkLong(0);
         m->props["description"] = Variant::mkStr("");
         m->props["source"] = Variant::mkStr("");
+        m->props["helpfile"] = Variant::mkStr("");
+        m->props["helpcontext"] = Variant::mkLong(0);
         return Variant();
     };
     err->methods["raise"] = [](MapObject* m, std::vector<Variant>& a) -> Variant {
-        int num = (int)toInt64(a.size() > 0 ? a[0] : Variant::mkInt(0));
+        int code = (int)toInt64(a.size() > 0 ? a[0] : Variant::mkInt(0));
+        // vbscript runtime: Err.Raise accepts 1..65535 or a full HRESULT
+        if (code == 0 || code > 0xFFFF) throwErr(5, errDesc(5));
         std::string src = a.size() > 1 ? toStr(a[1]) : "";
-        std::string desc = a.size() > 2 ? toStr(a[2]) : errDesc(num);
-        throw VBSError(num, desc, src);
+        std::string desc = a.size() > 2 ? toStr(a[2]) : "";
+        std::string hf = a.size() > 3 ? toStr(a[3]) : "";
+        int hc = a.size() > 4 ? (int)toInt64(a[4]) : 0;
+        // Err.Number shows the VB-mapped value (FACILITY_VBS -> low word,
+        // known OLE HRESULTs -> VBSE code, anything else -> full 32-bit)
+        int num = mapHRESULTToVB((uint32_t)code);
+        if (desc.empty()) desc = errDesc(num);
+        throw VBSError(num, desc, src, hf, hc);
     };
     return err;
 }
@@ -980,7 +991,7 @@ std::shared_ptr<VBObject> createHostObject(Interp& ip, const std::string& progId
     // WinHTTP: WinHttp.WinHttpRequest[.5.1]
     if (progId.find("winhttprequest") != std::string::npos && progId.rfind("winhttp", 0) == 0)
         return makeWinHttpRequest(ip);
-    // VBScript.RegExp
-    if (progId == "vbscript.regexp") return makeRegExp(ip);
+    // VBScript.RegExp (also usable as the intrinsic class "RegExp" via New)
+    if (progId == "vbscript.regexp" || progId == "regexp") return makeRegExp(ip);
     return nullptr;
 }
