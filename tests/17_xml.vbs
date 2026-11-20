@@ -1,3 +1,6 @@
+' SPDX-License-Identifier: BSD-2-Clause
+' Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 ' MSXML2.DOMDocument
 Dim doc
 Set doc = CreateObject("MSXML2.DOMDocument.6.0")
