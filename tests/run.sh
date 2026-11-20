@@ -37,8 +37,15 @@ for t in tests/*.vbs; do
     case "$name" in
     18_*|20_*) [ -n "$SRV_PID" ] || continue ;; # need the local test server
     esac
-    "$BIN" "$t" hello 42 >"$tmp" 2>&1
+    # tests/<name>.args, if present, replaces the default arguments
+    # (whitespace-separated, no quoting or globbing)
+    args="hello 42"
+    [ -f "tests/$name.args" ] && args=$(cat "tests/$name.args")
+    set -f
+    # shellcheck disable=SC2086
+    "$BIN" "$t" $args >"$tmp" 2>&1
     rc=$?
+    set +f
     case "$name" in
     neg_*)
         if [ "$rc" -ne 0 ] && cmp -s "$tmp" "$exp"; then

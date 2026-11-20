@@ -107,6 +107,96 @@ static std::shared_ptr<MapObject> makeStream(FILE* f, bool input) {
     return s;
 }
 
+// ---------- WScript.Arguments (WshArguments / WshNamed / WshUnnamed) ----------
+
+// Index into a 0-based list of strings: non-numeric -> 13, out of range -> 9.
+static Variant argAt(const std::vector<std::string>& v, std::vector<Variant>& a) {
+    if (a.empty()) throwErr(450, errDesc(450));
+    long long i = toInt64(a[0]);
+    if (i < 0 || i >= (long long)v.size()) throwErr(9, errDesc(9));
+    return Variant::mkStr(v[(size_t)i]);
+}
+
+// Positional collection: WScript.Arguments itself and WScript.Arguments.Unnamed.
+// Count() and Length both give the size, Item(i) is the default member, and
+// For Each yields the argument strings.
+static std::shared_ptr<MapObject> makeArgList(std::shared_ptr<std::vector<std::string>> items) {
+    auto o = std::make_shared<MapObject>();
+    o->methods["count"] = [items](MapObject*, std::vector<Variant>&) -> Variant {
+        return Variant::mkLong((long long)items->size());
+    };
+    o->props["length"] = Variant::mkLong((long long)items->size());
+    o->methods["item"] = [items](MapObject*, std::vector<Variant>& a) -> Variant { return argAt(*items, a); };
+    o->onInvoke = [items](MapObject*, std::vector<Variant>& a) -> Variant { return argAt(*items, a); };
+    o->onEnum = [items](MapObject*) -> std::vector<Variant> {
+        std::vector<Variant> out;
+        for (auto& s : *items) out.push_back(Variant::mkStr(s));
+        return out;
+    };
+    return o;
+}
+
+// WScript.Arguments.Named: switches of the form /name:value or /name.
+// Names compare case-insensitively; the first occurrence of a name wins.
+// Item(name) is the default member and gives the value (Empty for a bare
+// /name or a missing name); Exists(name) tests presence; For Each yields
+// the names as typed.
+static std::shared_ptr<MapObject> makeNamedArgs(const std::vector<std::string>& args) {
+    struct Named {
+        std::vector<std::string> names;
+        std::vector<Variant> vals;
+        long long find(const std::string& n) const {
+            std::string k = lower(n);
+            for (size_t i = 0; i < names.size(); i++)
+                if (lower(names[i]) == k) return (long long)i;
+            return -1;
+        }
+    };
+    auto d = std::make_shared<Named>();
+    for (auto& s : args) {
+        if (s.size() < 2 || s[0] != '/') continue;
+        std::string body = s.substr(1);
+        size_t colon = body.find(':');
+        std::string name = colon == std::string::npos ? body : body.substr(0, colon);
+        if (name.empty() || d->find(name) >= 0) continue;
+        d->names.push_back(name);
+        d->vals.push_back(colon == std::string::npos ? Variant() : Variant::mkStr(body.substr(colon + 1)));
+    }
+    auto o = std::make_shared<MapObject>();
+    auto item = [d](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.empty()) throwErr(450, errDesc(450));
+        long long i = d->find(toStr(a[0]));
+        return i < 0 ? Variant() : d->vals[(size_t)i];
+    };
+    o->methods["count"] = [d](MapObject*, std::vector<Variant>&) -> Variant {
+        return Variant::mkLong((long long)d->names.size());
+    };
+    o->props["length"] = Variant::mkLong((long long)d->names.size());
+    o->methods["item"] = item;
+    o->onInvoke = item;
+    o->methods["exists"] = [d](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.empty()) throwErr(450, errDesc(450));
+        return Variant::mkBool(d->find(toStr(a[0])) >= 0);
+    };
+    o->onEnum = [d](MapObject*) -> std::vector<Variant> {
+        std::vector<Variant> out;
+        for (auto& n : d->names) out.push_back(Variant::mkStr(n));
+        return out;
+    };
+    return o;
+}
+
+static std::shared_ptr<MapObject> makeArguments(const std::vector<std::string>& args) {
+    auto all = std::make_shared<std::vector<std::string>>(args);
+    auto unnamed = std::make_shared<std::vector<std::string>>();
+    for (auto& s : args)
+        if (s.empty() || s[0] != '/') unnamed->push_back(s);
+    auto o = makeArgList(all);
+    o->props["named"] = Variant::mkObj(makeNamedArgs(args));
+    o->props["unnamed"] = Variant::mkObj(makeArgList(unnamed));
+    return o;
+}
+
 // ---------- WScript ----------
 
 void initWScript(Interp& ip, const std::string& scriptName, const std::string& fullName,
@@ -122,14 +212,7 @@ void initWScript(Interp& ip, const std::string& scriptName, const std::string& f
     ws->props["scriptname"] = Variant::mkStr(scriptName);
     ws->props["scriptfullname"] = Variant::mkStr(fullName.empty() ? scriptName : fullName);
     ws->props["version"] = Variant::mkStr("5.8");
-    {
-        auto arr = std::make_shared<VArray>();
-        arr->base = 0;
-        arr->dims = {(long long)args.size()};
-        for (auto& s : args) arr->data.push_back(Variant::mkStr(s));
-        arr->allocated = true;
-        ws->props["arguments"] = Variant::mkArr(arr);
-    }
+    ws->props["arguments"] = Variant::mkObj(makeArguments(args));
     ws->props["stdout"] = Variant::mkObj(makeStream(stdout, false));
     ws->props["stderr"] = Variant::mkObj(makeStream(stderr, false));
     ws->props["stdin"] = Variant::mkObj(makeStream(stdin, true));

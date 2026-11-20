@@ -554,8 +554,10 @@ Variant opAdd(const Variant& a, const Variant& b) {
 }
 
 Variant opConcat(const Variant& a, const Variant& b) {
-    if (a.isNull() || b.isNull()) return Variant::mkNull();
-    return Variant::mkStr(toStr(a) + toStr(b));
+    // Only Null & Null is Null; a single Null operand counts as "" (like Empty)
+    if (a.isNull() && b.isNull()) return Variant::mkNull();
+    return Variant::mkStr((a.isNull() ? std::string() : toStr(a)) +
+                          (b.isNull() ? std::string() : toStr(b)));
 }
 
 Variant opSub(const Variant& a, const Variant& b) {

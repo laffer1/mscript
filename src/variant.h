@@ -158,7 +158,7 @@ std::string formatDateTimeV(double serial); // M/D/YYYY h:mm:ss AM/PM
 
 // ---- operators (Variant semantics) ----
 Variant opAdd(const Variant& a, const Variant& b);     // + : numeric, or concat if both strings
-Variant opConcat(const Variant& a, const Variant& b);  // & : always concat, Null propagates
+Variant opConcat(const Variant& a, const Variant& b);  // & : always concat; Null only if both are Null
 Variant opSub(const Variant& a, const Variant& b);
 Variant opMul(const Variant& a, const Variant& b);
 Variant opDiv(const Variant& a, const Variant& b);     // / : float division
