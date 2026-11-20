@@ -57,8 +57,10 @@ WScript.Echo "sum = " & total        ' sum = 5050
 ## Supported VBScript features
 
 - **Types & coercion** — Variant semantics: `Empty`, `Null`, `Boolean` (True = -1),
-  `Integer`/`Long`/`Double`, `Date`, `String`, arrays, objects; string↔number
-  coercion, `Null` propagation, banker's rounding (`CInt(2.5) = 2`)
+  `Byte`/`Integer`/`Long`, `Single`/`Double`, `Currency` (64-bit, scaled by 10,000),
+  `Date`, `String`, arrays, objects; string↔number coercion, `Null` propagation,
+  banker's rounding (`CInt(2.5) = 2`), and VBScript's result types for arithmetic
+  (`CByte(200) + CByte(56)` is an `Integer`, `CCur(1.5) * 2.5` a `Double`)
 - **Operators** — full VBScript precedence (`-2^2 = 4`, `&` below `+`), `\`, `Mod`,
   `^`, comparisons, `Is`, and logical `And/Or/Xor/Eqv/Imp/Not` (bitwise on integers,
   logical on Booleans)

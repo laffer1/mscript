@@ -501,7 +501,7 @@ struct XmlHttpRequest : MapObject {
             arr->dims = { (long long)d->resp.body.size() };
             arr->data.resize(d->resp.body.size());
             for (size_t i = 0; i < d->resp.body.size(); i++)
-                arr->data[i] = Variant::mkInt((unsigned char)d->resp.body[i]);
+                arr->data[i] = Variant::mkByte((unsigned char)d->resp.body[i]);
             return Variant::mkArr(arr);
         }
         if (n == "responsexml") {
