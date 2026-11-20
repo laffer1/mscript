@@ -281,6 +281,12 @@ void registerConstants(Interp& ip) {
     add("vbFirstJan1", Variant::mkInt(1));
     add("vbFirstFourDays", Variant::mkInt(2));
     add("vbFirstFullWeek", Variant::mkInt(3));
+    // FormatDateTime formats
+    add("vbGeneralDate", Variant::mkInt(0));
+    add("vbLongDate", Variant::mkInt(1));
+    add("vbShortDate", Variant::mkInt(2));
+    add("vbLongTime", Variant::mkInt(3));
+    add("vbShortTime", Variant::mkInt(4));
     // MsgBox results
     add("vbOK", Variant::mkInt(1));
     add("vbCancel", Variant::mkInt(2));
@@ -965,26 +971,36 @@ void registerBuiltins(Interp& ip) {
         long long idx = ((w + (int)first - 2) % 7 + 7) % 7 + 1;
         return Variant::mkStr(abbrev ? ab[idx] : full[idx]);
     });
+    // FormatDateTime(date[, format]). Formats are the en-US Windows defaults,
+    // like the rest of mscript's date output (CStr, MonthName, ...):
+    //   vbGeneralDate 0  date and/or time, whichever parts are non-zero
+    //   vbLongDate    1  "dddd, MMMM d, yyyy"   e.g. Friday, January 5, 2024
+    //   vbShortDate   2  "M/d/yyyy"             e.g. 1/5/2024
+    //   vbLongTime    3  "h:mm:ss tt"           e.g. 1:04:09 PM
+    //   vbShortTime   4  24-hour "HH:mm"        e.g. 13:04
+    // Any other format raises error 5; a Null date raises 94.
     reg("FormatDateTime", 1, 2, [](Interp&, std::vector<Variant>& a) -> Variant {
+        if (A(a, 0).isNull()) throwErr(94, errDesc(94));
+        long long fmt = a.size() >= 2 && !A(a, 1).isEmpty() ? toInt64(A(a, 1)) : 0;
+        if (fmt < 0 || fmt > 4) throwErr(5, errDesc(5));
         double d = dateArg(a, 0);
-        long long fmt = a.size() >= 2 ? toInt64(A(a, 1)) : 0;
         long long y; unsigned m, dd; int hh, mm, ss;
         splitSerial(d, y, m, dd, hh, mm, ss);
         static const char* months[] = {"", "January","February","March","April","May","June","July","August","September","October","November","December"};
         static const char* days[] = {"", "Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
         switch (fmt) {
-            case 1: { // Long Date
+            case 1: { // vbLongDate
                 int wd = weekdayOf(d);
                 return Variant::mkStr(std::string(days[wd]) + ", " + months[m] + " " + std::to_string(dd) + ", " + std::to_string(y));
             }
-            case 2: return Variant::mkStr(formatDate(d)); // Short Date
-            case 3: return Variant::mkStr(formatTimeOfDay(d)); // Long Time
-            case 4: { // Short Time h:mm
-                int h12 = hh % 12; if (h12 == 0) h12 = 12;
-                char buf[32]; std::snprintf(buf, sizeof buf, "%d:%02d %s", h12, mm, hh < 12 ? "AM" : "PM");
+            case 2: return Variant::mkStr(formatDate(d));       // vbShortDate
+            case 3: return Variant::mkStr(formatTimeOfDay(d));  // vbLongTime
+            case 4: {                                           // vbShortTime
+                char buf[16];
+                std::snprintf(buf, sizeof buf, "%02d:%02d", hh, mm);
                 return Variant::mkStr(buf);
             }
-            default: return Variant::mkStr(formatDateTimeV(d));
+            default: return Variant::mkStr(formatDateTimeV(d)); // vbGeneralDate
         }
     });
     reg("Format", 1, 2, [](Interp&, std::vector<Variant>& a) -> Variant {

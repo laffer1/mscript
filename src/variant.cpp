@@ -267,8 +267,11 @@ std::string formatTimeOfDay(double serial) {
 std::string formatDateTimeV(double serial) {
     double fl = std::floor(serial);
     double frac = serial - fl;
-    if (frac == 0) return formatDate(serial);        // pure date: "2/29/2024"
+    // VB's general date format: the date part is left out when it is zero
+    // (12/30/1899), so CDate(0) shows "12:00:00 AM"; otherwise the time part is
+    // left out when it is zero (midnight).
     if (fl == 0) return formatTimeOfDay(serial);      // pure time: "1:30:15 PM"
+    if (frac == 0) return formatDate(serial);        // pure date: "2/29/2024"
     return formatDate(serial) + " " + formatTimeOfDay(serial);
 }
 

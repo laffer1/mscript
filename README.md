@@ -15,8 +15,8 @@ that's the system `libbsdxml` (`-lbsdxml`); HTTPS fetching (`MSXML2.XMLHTTP`) us
 $ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml -lfetch -lsqlite3
 $ ./mscript hello.vbs
 Hello, World!
-$ make test           # runs the test suite (24 scripts)
-passed: 24  failed: 0
+$ make test           # runs the test suite (every tests/*.vbs)
+passed: N  failed: 0
 ```
 
 Install the binary and its manual page system-wide (default prefix `/usr/local`):
@@ -61,7 +61,7 @@ WScript.Echo "sum = " & total        ' sum = 5050
   coercion, `Null` propagation, banker's rounding (`CInt(2.5) = 2`)
 - **Operators** — full VBScript precedence (`-2^2 = 4`, `&` below `+`), `\`, `Mod`,
   `^`, comparisons, `Is`, and logical `And/Or/Xor/Eqv/Imp/Not` (bitwise on integers,
-  logical on Booleans), `Option Compare Binary/Text`
+  logical on Booleans)
 - **Control flow** — `If/Then/ElseIf/Else/End If` (block and single-line),
   `Select Case` (incl. `Case Is`, `Case x To y`, `Case Else`), `For/To/Step/Next`,
   `For Each/Next`, `Do While/Until ... Loop` (pre/post), `While/Wend`,
@@ -69,7 +69,9 @@ WScript.Echo "sum = " & total        ' sum = 5050
 - **Procedures** — `Sub`/`Function`, `ByVal`/`ByRef`, `Optional` default parameters,
   recursion, `Call`, `Static` locals, function-name return value
 - **Classes** — `Class ... End Class`, `New`, `Me`, `Property Get/Let/Set`,
-  `Class_Initialize`, `With ... End With` (incl. `.member` shorthand)
+  `Class_Initialize`, `Class_Terminate` (runs when the last reference is released;
+  objects in a reference cycle are never terminated, as in VBScript),
+  `With ... End With` (incl. `.member` shorthand)
 - **Arrays** — fixed and dynamic (`Dim x()`), multi-dimensional, `ReDim [Preserve]`,
   `Option Base`, `Erase`, `Array()`, `UBound`/`LBound`, `For Each`
 - **Error handling** — `On Error Resume Next`, `On Error Goto 0`, `On Error Goto <label>`,
@@ -126,6 +128,13 @@ WScript.Echo "sum = " & total        ' sum = 5050
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
   CRLF line endings
 
+### mscript extensions
+
+Not part of VBScript; scripts that use them will not run under WSH.
+
+- `Option Compare Binary/Text` (VB6/VBA syntax): with `Text`, the comparison operators
+  and `Select Case` compare strings case-insensitively
+
 ## Project layout
 
 ```
@@ -143,7 +152,7 @@ WScript.Echo "sum = " & total        ' sum = 5050
 ├── src/xmlhttp.{h,cpp} MSXML2.XMLHTTP + WinHttp.WinHttpRequest.5.1 client (raw HTTP/1.1 + libfetch)
 ├── src/regexp.{h,cpp}  VBScript.RegExp on the libc POSIX regex
 ├── src/adodb.{h,cpp}   ADODB Connection/Recordset/Command on SQLite3
-├── tests/              24 .vbs tests + .expected outputs + run.sh (make test);
+├── tests/              .vbs tests + .expected outputs + run.sh (make test);
 │                       18_xmlhttp.vbs / 20_winhttp.vbs run against tests/httpserver.py
 │                       (python3, 127.0.0.1:18099)
 ├── man/mscript.1       mdoc manual page (installed by make install)
@@ -210,7 +219,7 @@ Malicious or buggy input fails with a clean VBScript error, not a crash:
   unsupported; `Errors` is empty.
 - `MsgBox` prints to stdout and returns `vbOK` (no GUI); `InputBox` reads stdin.
 - Case folding (`UCase`/`LCase`/text compare) is ASCII-only; strings are UTF-8.
-- No named arguments (`:=`), no `GetRef`.
+- No `GetRef`.
 - `Option Explicit` is enforced at statement-execution time (mscript interprets
   rather than compiles), so the error surfaces when the statement runs — same
   error number, message, and line as WSH.

@@ -1,0 +1,27 @@
+terminate nothing
+after Set Nothing
+terminate first
+after reassign
+still alive: second
+terminate second
+in sub
+terminate sub local
+terminate function local
+function result
+terminate element 0
+terminate element 1
+after Erase
+terminate dictionary item
+after Remove
+terminate temporary
+after temporary
+terminate explicit call
+terminate release
+after cycle
+Err.Number after failing terminator: 11
+keeper terminate
+kept: True
+after keeper
+chain terminated: 5000
+last statement
+terminate script end

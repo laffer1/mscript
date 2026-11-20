@@ -7,6 +7,7 @@
 #include "objects.h"
 #include "parser.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -55,7 +56,7 @@ Variant ClassInstance::getMember(const std::string& n0) {
     if (it != fields.vars.end()) return it->second;
     if (Proc* p = findProc(n, 1)) { // Property Get
         std::vector<ArgVal> noargs;
-        return interp->callProc(*p, noargs, self);
+        return interp->callProc(*p, noargs, self.lock());
     }
     throwErr(438, errDesc(438));
 }
@@ -67,14 +68,14 @@ void ClassInstance::setMember(const std::string& n, const Variant& v) {
         std::vector<ArgVal> args(p->params->size());
         for (size_t i = 0; i + 1 < p->params->size(); i++) args[i].val = Variant();
         args.back().val = v;
-        interp->callProc(*p, args, self);
+        interp->callProc(*p, args, self.lock());
         return;
     }
     if (Proc* p = findProc(n, 3)) { // Property Set
         std::vector<ArgVal> args(p->params->size());
         for (size_t i = 0; i + 1 < p->params->size(); i++) args[i].val = Variant();
         args.back().val = v;
-        interp->callProc(*p, args, self);
+        interp->callProc(*p, args, self.lock());
         return;
     }
     throwErr(438, errDesc(438));
@@ -86,14 +87,171 @@ Variant ClassInstance::callMember(const std::string& n, std::vector<Variant>& ar
         if (p->name == n && p->propKind == 0) {
             std::vector<ArgVal> av;
             for (auto& a : args) { ArgVal x; x.val = a; av.push_back(x); }
-            return interp->callProc(*p, av, self);
+            return interp->callProc(*p, av, self.lock());
         }
     }
     // property get used as call? no.
     throwErr(438, errDesc(438));
 }
 
+// ---------- Class_Terminate ----------
+//
+// VBScript objects are reference counted, and Class_Terminate runs once, when
+// the last reference goes: Set x = Nothing, reassignment, a local going out of
+// scope at End Sub/Function, an array element or Dictionary item being
+// dropped, or the end of the script. Instances are owned by shared_ptrs whose
+// deleter is releaseClassInstance(). When the count reaches zero it does not
+// free the instance but hands it, under a fresh shared_ptr, to the Interp's
+// queue; the interpreter runs the queue at the next statement boundary or
+// procedure return, where running script code is safe. Once Class_Terminate
+// has run, the queue's reference is dropped and the instance is freed (or
+// kept, if Class_Terminate stored Me somewhere; it is not terminated again).
+
+// Freeing an instance frees its fields, which can free the next instance in a
+// linked list, and so on; doing that recursively overflows the C++ stack on
+// long lists. Instances released while one is being freed are collected here
+// and freed one after another instead.
+static std::vector<ClassInstance*>* g_freeing = nullptr;
+
+static void freeClassInstance(ClassInstance* p) {
+    if (g_freeing) {
+        try { g_freeing->push_back(p); return; } catch (...) {}
+        delete p; // out of memory: fall back to freeing it right away
+        return;
+    }
+    std::vector<ClassInstance*> list;
+    g_freeing = &list;
+    struct Reset { ~Reset() { g_freeing = nullptr; } } reset;
+    delete p;
+    while (!list.empty()) {
+        ClassInstance* x = list.back();
+        list.pop_back();
+        delete x;
+    }
+}
+
+static void releaseClassInstance(ClassInstance* p) {
+    try {
+        const auto& q = p->termQueue;
+        if (!p->terminated && q && q->enabled && p->findProc("class_terminate", 0)) {
+            p->terminated = true;
+            std::shared_ptr<ClassInstance> again(p, freeClassInstance); // frees p if this throws
+            p->self = again;
+            q->pending.push_back(std::move(again));
+            return;
+        }
+    } catch (...) {
+        return; // out of memory while queuing: p is already freed, skip Class_Terminate
+    }
+    freeClassInstance(p);
+}
+
+std::shared_ptr<ClassInstance> ClassInstance::create(Interp& ip, ClassInfo& ci) {
+    std::shared_ptr<ClassInstance> inst(new ClassInstance, releaseClassInstance);
+    inst->interp = &ip;
+    inst->cls = &ci;
+    inst->fields.parent = &ip.global;
+    inst->self = inst;
+    inst->termQueue = ip.termQueue;
+    return inst;
+}
+
+void Interp::drainTerminators() {
+    // Terminators may release more objects; nesting runs them in the same
+    // order VBScript would, but deep chains are left to the outermost loop.
+    constexpr int MAX_NESTED_DRAIN = 32;
+    if (termDrainDepth >= MAX_NESTED_DRAIN) return;
+    ++termDrainDepth;
+    struct Guard { Interp& i; ~Guard() { i.termDrainDepth--; } } guard { *this };
+    auto& pending = termQueue->pending;
+    while (!pending.empty()) {
+        std::shared_ptr<ClassInstance> inst = std::move(pending.front());
+        pending.pop_front();
+        runTerminator(*inst, inst);
+        // inst goes out of scope here: its fields are released and may queue more
+    }
+}
+
+void Interp::runTerminator(ClassInstance& inst, const std::shared_ptr<ClassInstance>& ref) {
+    Proc* p = inst.findProc("class_terminate", 0);
+    if (!p) return;
+    // Errors raised in Class_Terminate are discarded, and the implicit call
+    // leaves the Err object as the interrupted code had it.
+    auto* err = static_cast<MapObject*>(errObj.get());
+    std::map<std::string, Variant> savedErr;
+    if (err) savedErr = err->props;
+    struct ErrRestore {
+        MapObject* e; std::map<std::string, Variant>& saved;
+        ~ErrRestore() { if (e) e->props = std::move(saved); }
+    } restore { err, savedErr };
+    try {
+        std::vector<ArgVal> noargs;
+        callProc(*p, noargs, ref);
+    } catch (VBSError&) {
+    } catch (ExitSig&) {
+    } catch (GotoSig&) {
+    }
+    // EndSig (WScript.Quit inside Class_Terminate) propagates and ends the script.
+}
+
+void Interp::shutdown() {
+    // Script-level variables are released in declaration order, then any
+    // others (implicitly declared) by name; VBScript does not document an
+    // order. Each variable is set to Empty, not removed, so a Class_Terminate
+    // that reads or writes globals still finds them. A terminator may store a
+    // new object in a global, so this repeats a few times before giving up.
+    std::vector<std::string> order;
+    for (Stmt* st : topLevel)
+        if (st->k == Stmt::Dim)
+            for (auto& d : st->decls) order.push_back(d.name);
+    auto releaseAll = [&]() -> bool {
+        bool any = false;
+        auto clearVar = [&](Variant& v) {
+            if (v.t == VT::Object || v.t == VT::Array) {
+                Variant old = std::move(v);
+                v = Variant();
+                any = true;
+                // old released here
+            }
+        };
+        std::vector<std::string> names = order;
+        std::vector<std::string> rest;
+        for (auto& kv : global.vars) rest.push_back(kv.first);
+        std::sort(rest.begin(), rest.end());
+        names.insert(names.end(), rest.begin(), rest.end());
+        for (auto& n : names) {
+            auto it = global.vars.find(n);
+            if (it == global.vars.end()) continue;
+            clearVar(it->second);
+            runPendingTerminators();
+        }
+        for (auto& ps : procStore) {
+            for (auto& kv : ps->statics) clearVar(kv.second);
+            runPendingTerminators();
+        }
+        while (!withStack.empty()) { withStack.pop_back(); any = true; }
+        runPendingTerminators();
+        return any;
+    };
+    for (int pass = 0; pass < 4; pass++) {
+        try {
+            if (!releaseAll()) break;
+        } catch (EndSig&) {
+            // WScript.Quit inside a Class_Terminate: keep releasing
+        }
+    }
+    // Anything released from here on (cycles broken while the Interp is torn
+    // down) is freed without running script code.
+    termQueue->enabled = false;
+    termQueue->pending.clear();
+}
+
 // ---------- Interp ----------
+
+Interp::~Interp() {
+    termQueue->enabled = false;
+    termQueue->pending.clear();
+}
 
 Interp::Interp() {
     global.parent = nullptr;
@@ -219,6 +377,7 @@ static void buildLabels(const std::vector<Stmt*>& list, std::map<std::string, si
 void Interp::execStmtList(const std::vector<Stmt*>& list, Frame& f) {
     size_t i = 0;
     while (i < list.size()) {
+        runPendingTerminators(); // objects released by the previous statement
         Stmt& s = *list[i];
         try {
             execStmt(s, f);
@@ -253,6 +412,7 @@ void Interp::execStmtList(const std::vector<Stmt*>& list, Frame& f) {
             throw;
         }
     }
+    runPendingTerminators();
 }
 
 static Variant numToVar(double d) {
@@ -920,6 +1080,13 @@ Variant Interp::evalExpr(Expr& e, Frame& f) {
 // ---------- procedure calls ----------
 
 Variant Interp::callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self) {
+    Variant r = callProcBody(p, args, std::move(self));
+    // the frame is gone: run Class_Terminate for locals that held the last reference
+    runPendingTerminators();
+    return r;
+}
+
+Variant Interp::callProcBody(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self) {
     // recursion guard: raise VBScript error 28 instead of overflowing the C++ stack
     constexpr int MAX_CALL_DEPTH = 1000;
     if (++callDepth > MAX_CALL_DEPTH) {
@@ -1006,11 +1173,7 @@ Variant Interp::instantiateClass(const std::string& name, std::vector<Expr*>& ar
         throw e;
     }
     ClassInfo& ci = it->second;
-    auto inst = std::make_shared<ClassInstance>();
-    inst->interp = this;
-    inst->cls = &ci;
-    inst->fields.parent = &global;
-    inst->self = inst;
+    auto inst = ClassInstance::create(*this, ci);
     // initialize fields
     for (auto* dp : ci.fields) {
         Decl& d = *dp;
