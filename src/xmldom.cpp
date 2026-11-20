@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// Copyright (c) 2026 Lucas Holt. All rights reserved.
+
 // xmldom.cpp — MSXML2.DOMDocument-compatible DOM, parsed with bsdxml (expat 2).
 //
 // Supported surface (the subset commonly used from VBScript):
