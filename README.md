@@ -217,3 +217,5 @@ Malicious or buggy input fails with a clean VBScript error, not a crash:
 ## License
 
 BSD 2-Clause — see [LICENSE](LICENSE). Copyright (c) 2026 Lucas Holt.
+
+VBScript, Windows Script Host, MSXML, ADODB and WinHTTP are trademarks of Microsoft Corporation; mscript is not affiliated with or endorsed by Microsoft.

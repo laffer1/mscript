@@ -211,8 +211,7 @@ A usage error exits with 2.
 A syntax error or an unhandled VBScript runtime error exits with 1 and prints
 a diagnostic of the form:
 .Bd -literal -offset indent
-mscript: script.vbs(12): Microsoft VBScript runtime error
-    '800a0009': Subscript out of range
+mscript: script.vbs(12): mscript runtime error '800a0009': Subscript out of range
 .Ed
 .Sh EXAMPLES
 Run a script file:
@@ -375,3 +374,5 @@ See the
 .Pa LICENSE
 file in the source distribution.
 Copyright (c) 2026 Lucas Holt.
+.Pp
+VBScript, Windows Script Host, MSXML, ADODB and WinHTTP are trademarks of Microsoft Corporation; mscript is not affiliated with or endorsed by Microsoft.
