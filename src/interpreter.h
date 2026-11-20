@@ -89,7 +89,18 @@ struct ClassInstance : VBObject {
     Variant getMember(const std::string& n) override;
     void setMember(const std::string& n, const Variant& v) override;
     Variant callMember(const std::string& n, std::vector<Variant>& args) override;
+    Variant invoke(const std::vector<Variant>& args) override;                       // obj(args): default member
+    void assignInvoke(const std::vector<Variant>& args, const Variant& v) override; // obj(args) = v
     std::string objectKind() const override { return cls ? cls->name : "Object"; }
+
+    // Members with arguments: obj.Name(args) reads a field (indexing it), calls
+    // Property Get Name(args) or a Sub/Function; obj.Name(args) = v writes a
+    // field element or calls Property Let/Set Name(args, v). An empty name
+    // means the class's default member.
+    bool hasProc(const std::string& n, bool forWrite) const;
+    Variant getProp(const std::string& n, std::vector<ArgVal>& args);
+    void letProp(const std::string& n, std::vector<Variant>& args, const Variant& v, bool isSet,
+                 bool strict = true);
 };
 
 struct Frame {

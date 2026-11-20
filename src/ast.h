@@ -91,6 +91,8 @@ struct Stmt {
     std::vector<ExprPtr> exprs;                      // case items, erase targets handled via decls
     std::vector<StmtPtr> body, body2, body3;         // if/else; loop body; with body
     std::vector<std::pair<std::vector<ExprPtr>, std::vector<StmtPtr>>> arms; // select case
+    std::vector<int> armLines;                       // source line of each ElseIf / Case clause
+    int line2 = 0;                                   // line of a Do loop's closing Loop
     std::vector<Param> params;
     std::vector<Decl> decls;
     std::vector<StmtPtr> members;                    // class body

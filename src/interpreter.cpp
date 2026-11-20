@@ -49,49 +49,142 @@ bool ClassInstance::hasMethod(const std::string& n) const {
     return false;
 }
 
-Variant ClassInstance::getMember(const std::string& n0) {
-    std::string n = n0;
-    if (n.empty() && cls && !cls->defaultProp.empty()) n = cls->defaultProp; // default property
-    auto it = fields.vars.find(n);
-    if (it != fields.vars.end()) return it->second;
-    if (Proc* p = findProc(n, 1)) { // Property Get
-        std::vector<ArgVal> noargs;
-        return interp->callProc(*p, noargs, self.lock());
+// arr(i, j) or obj(args) applied to a member's value; no arguments = the value itself
+static Variant indexValue(const Variant& v, const std::vector<Variant>& vals) {
+    if (vals.empty()) return v;
+    if (v.t == VT::Array && v.arr) {
+        std::vector<long long> idx;
+        for (auto& x : vals) idx.push_back(toInt64(x));
+        return v.arr->at(idx);
     }
+    if (v.t == VT::Object && v.obj) return v.obj->invoke(vals);
+    throwErr(450, errDesc(450));
+}
+
+static std::vector<Variant> argValues(const std::vector<ArgVal>& args) {
+    std::vector<Variant> vals;
+    for (auto& a : args) vals.push_back(a.val);
+    return vals;
+}
+
+// Parameters a call must supply: all of them, less trailing Optional ones.
+static size_t requiredParams(const Proc& p) {
+    size_t n = p.params->size();
+    while (n > 0 && ((*p.params)[n - 1].optional || (*p.params)[n - 1].hasDefault)) n--;
+    return n;
+}
+
+bool ClassInstance::hasProc(const std::string& n, bool forWrite) const {
+    if (!cls) return false;
+    for (Proc* p : cls->procs) {
+        if (p->name != n) continue;
+        if (forWrite ? (p->propKind == 2 || p->propKind == 3) : (p->propKind == 0 || p->propKind == 1))
+            return true;
+    }
+    return false;
+}
+
+Variant ClassInstance::getProp(const std::string& n0, std::vector<ArgVal>& args) {
+    std::string n = n0;
+    if (n.empty()) {
+        if (!cls || cls->defaultProp.empty()) throwErr(438, errDesc(438));
+        n = cls->defaultProp;
+    }
+    auto it = fields.vars.find(n);
+    if (it != fields.vars.end()) return indexValue(it->second, argValues(args));
+    Proc* p = findProc(n, 1); // Property Get
+    if (!p) p = findProc(n, 0); // Sub / Function
+    if (!p) throwErr(438, errDesc(438));
+    std::shared_ptr<ClassInstance> me = self.lock();
+    if (!args.empty() && p->params->empty() && p->propKind == 1) {
+        // Property Get Items() returning an array or a collection: index the result
+        std::vector<ArgVal> noargs;
+        Variant v = interp->callProc(*p, noargs, me);
+        return indexValue(v, argValues(args));
+    }
+    if (args.size() > p->params->size() || args.size() < requiredParams(*p)) throwErr(450, errDesc(450));
+    return interp->callProc(*p, args, me);
+}
+
+void ClassInstance::letProp(const std::string& n0, std::vector<Variant>& args, const Variant& v, bool isSet,
+                            bool strict) {
+    std::string n = n0;
+    if (n.empty()) {
+        if (!cls || cls->defaultProp.empty()) throwErr(438, errDesc(438));
+        n = cls->defaultProp;
+    }
+    auto it = fields.vars.find(n);
+    if (it != fields.vars.end()) {
+        Variant& cell = it->second;
+        if (args.empty()) { cell = v; ownArrays(cell); return; }
+        if (cell.t == VT::Array && cell.arr) {
+            std::vector<long long> idx;
+            for (auto& x : args) idx.push_back(toInt64(x));
+            Variant& slot = cell.arr->at(idx);
+            slot = v;
+            ownArrays(slot);
+            return;
+        }
+        if (cell.t == VT::Object && cell.obj) { cell.obj->assignInvoke(args, v); return; }
+        throwErr(450, errDesc(450));
+    }
+    // Set uses Property Set and Let uses Property Let (no fallback: Set on a
+    // Let-only property is 438, as in VBScript). Host-side callers that don't
+    // know which statement it was (strict == false) take Let, then Set.
+    Proc* p = findProc(n, isSet ? 3 : 2);
+    if (!p && !strict) p = findProc(n, isSet ? 2 : 3);
+    std::shared_ptr<ClassInstance> me = self.lock();
+    if (p && p->params->size() == args.size() + 1) {
+        // the last parameter receives the value; the others are the indexes
+        std::vector<ArgVal> av(p->params->size());
+        for (size_t i = 0; i < args.size(); i++) av[i].val = args[i];
+        av.back().val = v;
+        interp->callProc(*p, av, me);
+        return;
+    }
+    if (!args.empty()) {
+        // obj.Items(k) = v where Property Get Items() returns a collection
+        if (Proc* g = findProc(n, 1); g && g->params->empty()) {
+            std::vector<ArgVal> noargs;
+            Variant base = interp->callProc(*g, noargs, me);
+            if (base.t == VT::Object && base.obj) { base.obj->assignInvoke(args, v); return; }
+            if (base.t == VT::Array && base.arr) {
+                std::vector<long long> idx;
+                for (auto& x : args) idx.push_back(toInt64(x));
+                base.arr->at(idx) = v; // a copy of the array, as in VBScript
+                return;
+            }
+        }
+    }
+    if (p) throwErr(450, errDesc(450));
     throwErr(438, errDesc(438));
+}
+
+Variant ClassInstance::getMember(const std::string& n) {
+    std::vector<ArgVal> noargs;
+    return getProp(n, noargs);
 }
 
 void ClassInstance::setMember(const std::string& n, const Variant& v) {
-    auto it = fields.vars.find(n);
-    if (it != fields.vars.end()) { it->second = v; ownArrays(it->second); return; }
-    if (Proc* p = findProc(n, 2)) { // Property Let
-        std::vector<ArgVal> args(p->params->size());
-        for (size_t i = 0; i + 1 < p->params->size(); i++) args[i].val = Variant();
-        args.back().val = v;
-        interp->callProc(*p, args, self.lock());
-        return;
-    }
-    if (Proc* p = findProc(n, 3)) { // Property Set
-        std::vector<ArgVal> args(p->params->size());
-        for (size_t i = 0; i + 1 < p->params->size(); i++) args[i].val = Variant();
-        args.back().val = v;
-        interp->callProc(*p, args, self.lock());
-        return;
-    }
-    throwErr(438, errDesc(438));
+    std::vector<Variant> noargs;
+    letProp(n, noargs, v, false, false);
 }
 
 Variant ClassInstance::callMember(const std::string& n, std::vector<Variant>& args) {
-    if (!cls) throwErr(438, errDesc(438));
-    for (Proc* p : cls->procs) {
-        if (p->name == n && p->propKind == 0) {
-            std::vector<ArgVal> av;
-            for (auto& a : args) { ArgVal x; x.val = a; av.push_back(x); }
-            return interp->callProc(*p, av, self.lock());
-        }
-    }
-    // property get used as call? no.
-    throwErr(438, errDesc(438));
+    std::vector<ArgVal> av;
+    for (auto& a : args) { ArgVal x; x.val = a; av.push_back(x); }
+    return getProp(n, av);
+}
+
+Variant ClassInstance::invoke(const std::vector<Variant>& args) {
+    std::vector<ArgVal> av;
+    for (auto& a : args) { ArgVal x; x.val = a; av.push_back(x); }
+    return getProp("", av);
+}
+
+void ClassInstance::assignInvoke(const std::vector<Variant>& args, const Variant& v) {
+    std::vector<Variant> a = args;
+    letProp("", a, v, false, false);
 }
 
 // ---------- Class_Terminate ----------
@@ -313,7 +406,8 @@ void Interp::registerClass(Stmt& s) {
         if (m->k == Stmt::Dim) {
             for (auto& d : m->decls) ci.fields.push_back(&d);
         } else if (m->k == Stmt::SubDecl || m->k == Stmt::FuncDecl || m->k == Stmt::PropDecl) {
-            if (m->k == Stmt::PropDecl && m->b) ci.defaultProp = m->name; // Default Property
+            if ((m->k == Stmt::PropDecl || m->k == Stmt::FuncDecl) && m->b)
+                ci.defaultProp = m->name; // Default Property / Default Function
             ci.procs.push_back(registerProc(*m, s.name));
         }
     }
@@ -365,6 +459,20 @@ Variant* Interp::findVar(Frame& f, const std::string& name) {
         }
     }
     return nullptr;
+}
+
+// Inside a class's procedure, an unqualified name that is not a local or a
+// field refers to the class's own Sub, Function or Property before anything
+// at script level. Returns the instance to call it on, or null.
+static ClassInstance* classMemberFor(Frame& f, const std::string& n, bool forWrite) {
+    ClassInstance* me = f.self.get();
+    if (!me || !me->hasProc(n, forWrite)) return nullptr;
+    if (f.scope->vars.count(n) || me->fields.vars.count(n)) return nullptr; // locals, return slot, fields
+    if (f.proc) {
+        auto it = f.proc->statics.find(n);
+        if (it != f.proc->statics.end()) return nullptr;
+    }
+    return me;
 }
 
 // ---------- statements ----------
@@ -429,6 +537,11 @@ void Interp::execStmt(Stmt& s, Frame& f) {
     case Stmt::ExprStmt: {
         if (s.e->k == Expr::Var) {
             const std::string& n = s.e->name;
+            if (ClassInstance* me = classMemberFor(f, n, false)) {
+                std::vector<ArgVal> noargs;
+                me->getProp(n, noargs);
+                break;
+            }
             if (!findVar(f, n)) {
                 if (procs.count(n)) {
                     std::vector<ArgVal> noargs;
@@ -474,20 +587,21 @@ void Interp::execStmt(Stmt& s, Frame& f) {
             }
         } catch (VBSError& e) {
             if (!f.resumeNext) throw;
-            if (e.line == 0) e.line = s.e->line;
             setErr(e);
             execStmtList(ptrVec(s.body), f);
             break;
         }
-        for (auto& arm : s.arms) {
+        for (size_t ai = 0; ai < s.arms.size(); ai++) {
+            auto& arm = s.arms[ai];
             try {
                 if (toBool(evalExpr(*arm.first[0], f))) {
                     execStmtList(ptrVec(arm.second), f);
                     return;
                 }
             } catch (VBSError& e) {
+                // an error in an ElseIf condition belongs to the ElseIf line
+                if (e.line == 0 && ai < s.armLines.size()) e.line = s.armLines[ai];
                 if (!f.resumeNext) throw;
-                if (e.line == 0) e.line = arm.first[0]->line;
                 setErr(e);
                 execStmtList(ptrVec(arm.second), f);
                 return;
@@ -499,7 +613,8 @@ void Interp::execStmt(Stmt& s, Frame& f) {
 
     case Stmt::Select: {
         Variant cv = evalExpr(*s.e, f);
-        for (auto& arm : s.arms) {
+        for (size_t ai = 0; ai < s.arms.size(); ai++) {
+            auto& arm = s.arms[ai];
             if (arm.first.empty()) { // Case Else
                 std::vector<Stmt*> v; for (auto& x : arm.second) v.push_back(x.get());
                 execStmtList(v, f);
@@ -525,9 +640,10 @@ void Interp::execStmt(Stmt& s, Frame& f) {
                         m = c.t == VT::Null ? false : toBool(c);
                     }
                 } catch (VBSError& e) {
-                    // Resume Next: an error in a case expression runs that case
+                    // an error in a Case expression belongs to the Case line;
+                    // under Resume Next it runs that case
+                    if (e.line == 0 && ai < s.armLines.size()) e.line = s.armLines[ai];
                     if (!f.resumeNext) throw;
-                    if (e.line == 0) e.line = item->line;
                     setErr(e);
                     execStmtList(ptrVec(arm.second), f);
                     return;
@@ -645,7 +761,6 @@ void Interp::execStmt(Stmt& s, Frame& f) {
                     if (s.name == "while" ? !c : c) break;
                 } catch (VBSError& e) {
                     if (!f.resumeNext) throw;
-                    if (e.line == 0) e.line = s.e->line;
                     setErr(e);
                     try {
                         execStmtList(body, f);
@@ -661,8 +776,17 @@ void Interp::execStmt(Stmt& s, Frame& f) {
                 if (x.kind == "do") break;
                 throw;
             }
-            if (s.name2 == "while") { if (!toBool(evalExpr(*s.e2, f))) break; }
-            else if (s.name2 == "until") { if (toBool(evalExpr(*s.e2, f))) break; }
+            if (s.e2) {
+                // Loop While / Loop Until: an error belongs to the Loop line
+                bool c;
+                try {
+                    c = toBool(evalExpr(*s.e2, f));
+                } catch (VBSError& e) {
+                    if (e.line == 0) e.line = s.line2;
+                    throw;
+                }
+                if (s.name2 == "while" ? !c : c) break;
+            }
             // no conditions at all: Do ... Loop is an infinite loop in VBScript
         }
         break;
@@ -677,7 +801,6 @@ void Interp::execStmt(Stmt& s, Frame& f) {
             } catch (VBSError& e) {
                 // Resume Next: an error in a While condition runs the body once
                 if (!f.resumeNext) throw;
-                if (e.line == 0) e.line = s.e->line;
                 setErr(e);
                 execStmtList(body, f);
                 break;
@@ -764,15 +887,38 @@ void Interp::execStmt(Stmt& s, Frame& f) {
 
     case Stmt::ReDim: {
         for (auto& d : s.decls) {
+            // ReDim also declares: an unknown name becomes a new variable in
+            // the current scope, and a variable holding a non-array value
+            // (Empty after a plain Dim, a number, ...) is replaced by the array.
             Variant* cell = f.scope ? f.scope->find(d.name) : global.find(d.name);
-            if (!cell || cell->t != VT::Array || !cell->arr) throwErr(13, errDesc(13));
-            VArray* arr = cell->arr.get();
-            if (arr->fixed) throwErr(10, "This array is fixed or temporarily locked");
+            if (!cell) cell = &(f.scope ? *f.scope : global)[d.name];
+            // a fixed array is error 10; plain ReDim reports it before evaluating
+            // the bounds, ReDim Preserve after (so a bad bound there is 13), as
+            // Wine's conformance tests record for Windows
+            bool fixedArr = cell->t == VT::Array && cell->arr && cell->arr->fixed;
+            if (fixedArr && !s.b) throwErr(10, "This array is fixed or temporarily locked");
             std::vector<long long> dims;
             for (auto& de : d.dims) {
                 long long n = toInt64(evalExpr(*de, f));
-                if (n < 0) throwErr(5, errDesc(5));
+                if (n < -1) throwErr(5, errDesc(5)); // ReDim x(-1) is an empty array
                 dims.push_back(n + 1);
+            }
+            if (cell->t != VT::Array || !cell->arr) {
+                auto fresh = std::make_shared<VArray>();
+                fresh->allocated = false;
+                fresh->alloc(dims, optionBase, false);
+                *cell = Variant::mkArr(fresh);
+                continue;
+            }
+            VArray* arr = cell->arr.get();
+            if (fixedArr) throwErr(10, "This array is fixed or temporarily locked");
+            // ReDim Preserve may change only the upper bound of the last
+            // dimension; a different dimension count or any other bound is
+            // "Subscript out of range", as in VBScript.
+            if (s.b && arr->allocated) {
+                if (dims.size() != arr->dims.size()) throwErr(9, errDesc(9));
+                for (size_t i = 0; i + 1 < dims.size(); i++)
+                    if (dims[i] != arr->dims[i]) throwErr(9, errDesc(9));
             }
             arr->alloc(dims, optionBase, s.b);
         }
@@ -874,6 +1020,11 @@ void Interp::assignTarget(Expr& t, Variant v, bool isSet, Frame& f) {
     if (isSet && v.t != VT::Object) throwErr(424, errDesc(424));
     switch (t.k) {
     case Expr::Var: {
+        if (ClassInstance* me = classMemberFor(f, t.name, true)) {
+            std::vector<Variant> noargs;
+            me->letProp(t.name, noargs, v, isSet);
+            return;
+        }
         Variant* cell = findVar(f, t.name);
         if (!cell) {
             // With member?
@@ -897,11 +1048,37 @@ void Interp::assignTarget(Expr& t, Variant v, bool isSet, Frame& f) {
     case Expr::Member: {
         Variant base = evalMemberBase(*t.a[0], f);
         if (base.t != VT::Object || !base.obj) throwErr(424, errDesc(424));
+        if (auto* ci = dynamic_cast<ClassInstance*>(base.obj.get())) {
+            std::vector<Variant> noargs;
+            ci->letProp(t.name, noargs, v, isSet);
+            return;
+        }
         base.obj->setMember(t.name, v);
         return;
     }
     case Expr::Call: {
-        Variant base = evalExpr(*t.a[0], f);
+        Expr& callee = *t.a[0];
+        // obj.Prop(args) = v / Me.Prop(args) = v / Prop(args) = v inside the class
+        ClassInstance* target = nullptr;
+        std::string member;
+        Variant holder; // keeps the object alive while its property runs
+        if (callee.k == Expr::Member) {
+            holder = evalMemberBase(*callee.a[0], f);
+            if (holder.t != VT::Object || !holder.obj) throwErr(424, errDesc(424));
+            target = dynamic_cast<ClassInstance*>(holder.obj.get());
+            member = callee.name;
+        } else if (callee.k == Expr::Var) {
+            target = classMemberFor(f, callee.name, true);
+            if (!target) target = classMemberFor(f, callee.name, false);
+            member = callee.name;
+        }
+        if (target) {
+            std::vector<Variant> args;
+            for (size_t i = 1; i < t.a.size(); i++) args.push_back(evalExpr(*t.a[i], f));
+            target->letProp(member, args, v, isSet);
+            return;
+        }
+        Variant base = callee.k == Expr::Member ? holder.obj->getMember(member) : evalExpr(callee, f);
         std::vector<Variant> args;
         for (size_t i = 1; i < t.a.size(); i++) args.push_back(evalExpr(*t.a[i], f));
         if (base.t == VT::Array) {
@@ -912,6 +1089,10 @@ void Interp::assignTarget(Expr& t, Variant v, bool isSet, Frame& f) {
             return;
         }
         if (base.t == VT::Object && base.obj) {
+            if (auto* ci = dynamic_cast<ClassInstance*>(base.obj.get())) {
+                ci->letProp("", args, v, isSet); // default property: obj(args) = v
+                return;
+            }
             base.obj->assignInvoke(args, v);
             return;
         }
@@ -965,6 +1146,10 @@ Variant Interp::evalCall(Expr& call, Frame& f) {
 
     if (callee.k == Expr::Var) {
         const std::string& name = callee.name;
+        if (ClassInstance* me = classMemberFor(f, name, false)) {
+            std::shared_ptr<ClassInstance> keep = f.self;
+            return me->getProp(name, args);
+        }
         if (Variant* cell = f.scope->find(name)) {
             if (cell->t == VT::Array && cell->arr) {
                 std::vector<long long> idx;
@@ -977,6 +1162,8 @@ Variant Interp::evalCall(Expr& call, Frame& f) {
             }
             // a scalar variable shadows nothing callable; fall through to procs/builtins
             // (e.g. the function return-value slot inside a recursive call)
+            if (f.self && f.self->hasProc(name, false) && f.scope->vars.count(name))
+                return f.self->getProp(name, args); // recursion inside a class member
         }
         if (auto it = procs.find(name); it != procs.end()) return callProc(*it->second, args, f.self);
         if (auto it = builtins.find(name); it != builtins.end()) {
@@ -991,6 +1178,8 @@ Variant Interp::evalCall(Expr& call, Frame& f) {
     if (callee.k == Expr::Member) {
         Variant base = evalMemberBase(*callee.a[0], f);
         if (base.t != VT::Object || !base.obj) throwErr(424, errDesc(424));
+        if (auto* ci = dynamic_cast<ClassInstance*>(base.obj.get()))
+            return ci->getProp(callee.name, args); // keeps ByRef arguments
         if (base.obj->hasMethod(callee.name)) return base.obj->callMember(callee.name, vals);
         // property that is itself callable/indexable (e.g. WScript.Arguments(i), dict.Item(k))
         Variant v = base.obj->getMember(callee.name);
@@ -1019,6 +1208,10 @@ Variant Interp::evalExpr(Expr& e, Frame& f) {
     case Expr::Lit:
         return e.lit;
     case Expr::Var: {
+        if (ClassInstance* me = classMemberFor(f, e.name, false)) {
+            std::vector<ArgVal> noargs;
+            return me->getProp(e.name, noargs);
+        }
         if (Variant* cell = findVar(f, e.name)) return *cell;
         // constants (vbCrLf, vbOK, ...)
         if (auto it = constants.find(e.name); it != constants.end()) return it->second;

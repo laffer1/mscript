@@ -68,7 +68,9 @@ WScript.Echo "sum = " & total        ' sum = 5050
   `Exit Do/For/Sub/Function/Property`, line labels and `GoTo`
 - **Procedures** — `Sub`/`Function`, `ByVal`/`ByRef`, `Optional` default parameters,
   recursion, `Call`, `Static` locals, function-name return value
-- **Classes** — `Class ... End Class`, `New`, `Me`, `Property Get/Let/Set`,
+- **Classes** — `Class ... End Class`, `New`, `Me`, `Property Get/Let/Set` (with or
+  without parameters, e.g. `obj.Item(i) = v`), `Default Property`/`Default Function`
+  (incl. arguments: `obj(i)`), unqualified calls to a class's own members,
   `Class_Initialize`, `Class_Terminate` (runs when the last reference is released;
   objects in a reference cycle are never terminated, as in VBScript),
   `With ... End With` (incl. `.member` shorthand)

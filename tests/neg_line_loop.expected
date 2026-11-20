@@ -1,0 +1,1 @@
+mscript: tests/neg_line_loop.vbs(9): mscript runtime error '800a000b': Division by zero
