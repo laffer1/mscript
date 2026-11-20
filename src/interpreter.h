@@ -135,7 +135,7 @@ struct Interp {
     Variant* evalLValue(Expr& e, Frame& f);
     Variant evalCall(Expr& call, Frame& f);
     ArgVal evalArg(Expr& e, Frame& f);
-    void assignTarget(Expr& t, const Variant& v, bool isSet, Frame& f);
+    void assignTarget(Expr& t, Variant v, bool isSet, Frame& f);
     Variant callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self);
     Variant callByName(const std::string& lowerName, std::vector<ArgVal>& args);
     Variant instantiateClass(const std::string& name, std::vector<Expr*>& argExprs, Frame& f, int line);

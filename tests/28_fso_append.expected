@@ -1,0 +1,12 @@
+append, no create: 53 exists=False
+write, no create: 53 exists=False
+read, no create: 53
+size after appends: 19
+[one]
+[two]
+[three]
+[]
+[four]
+after release: one|two|three||four|five
+after ForWriting: fresh|
+read, create: True exists=True
