@@ -175,6 +175,22 @@ StmtPtr Parser::parseStatement() {
                 if (w2 == "function") return parseProcDecl(false);
                 return parsePropDecl();
             }
+            if (w2 == "const") {
+                advance(); advance(); // public/private const
+                auto s = std::make_unique<Stmt>();
+                s->k = Stmt::ConstDecl; s->line = line;
+                for (;;) {
+                    if (peek().k != TK::Ident) fail("expected identifier");
+                    Decl d; d.name = lower(advance().text);
+                    expectOp("=");
+                    d.dynamic = false;
+                    s->decls.push_back(std::move(d));
+                    s->exprs.push_back(parseExpr());
+                    if (atOp(",")) { advance(); continue; }
+                    break;
+                }
+                return s;
+            }
         }
         if (w == "dim" || w == "public" || w == "private" || w == "static") {
             advance();
@@ -245,9 +261,10 @@ StmtPtr Parser::parseStatement() {
             return s;
         }
         if (w == "stop") {
+            // Stop only breaks into a debugger; with none attached it is a no-op
             advance();
             auto s = std::make_unique<Stmt>();
-            s->k = Stmt::EndStmt; s->line = line;
+            s->k = Stmt::Nop; s->line = line;
             return s;
         }
         if (w == "call") { advance(); return parseCallStmt(); }

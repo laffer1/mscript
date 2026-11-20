@@ -44,13 +44,13 @@ static std::shared_ptr<MapObject> makeErr(Interp& ip) {
         // vbscript runtime: Err.Raise accepts 1..65535 or a full HRESULT
         if (code == 0 || code > 0xFFFF) throwErr(5, errDesc(5));
         std::string src = a.size() > 1 ? toStr(a[1]) : "";
-        std::string desc = a.size() > 2 ? toStr(a[2]) : "";
+        // only substitute the standard description when the argument is omitted
+        std::string desc = a.size() > 2 ? toStr(a[2]) : errDesc(mapHRESULTToVB((uint32_t)code));
         std::string hf = a.size() > 3 ? toStr(a[3]) : "";
         int hc = a.size() > 4 ? (int)toInt64(a[4]) : 0;
         // Err.Number shows the VB-mapped value (FACILITY_VBS -> low word,
         // known OLE HRESULTs -> VBSE code, anything else -> full 32-bit)
         int num = mapHRESULTToVB((uint32_t)code);
-        if (desc.empty()) desc = errDesc(num);
         throw VBSError(num, desc, src, hf, hc);
     };
     return err;
@@ -1054,6 +1054,10 @@ static std::shared_ptr<MapObject> makeNetwork() {
 void registerHostObjects(Interp& ip) {
     ip.errObj = makeErr(ip);
     ip.global.vars["err"] = Variant::mkObj(ip.errObj);
+    // Me at global scope is the script's global object
+    auto gt = std::make_shared<MapObject>();
+    gt->kind = "Global";
+    ip.globalThis = gt;
     // WScript created by initWScript (called from main)
 }
 

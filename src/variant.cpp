@@ -306,7 +306,16 @@ bool parseNumericString(const std::string& sin, double& out) {
     return true;
 }
 
-double toDouble(const Variant& v) {
+// Objects with a default property coerce through it (CBool, CStr, CInt, ...).
+static Variant unwrapDefault(const Variant& v, int depth = 0) {
+    if (depth > 8) return v;
+    if (v.t == VT::Object && v.obj && v.obj->hasDefault())
+        return unwrapDefault(v.obj->getDefault(), depth + 1);
+    return v;
+}
+
+double toDouble(const Variant& v0) {
+    Variant v = unwrapDefault(v0);
     switch (v.t) {
         case VT::Empty: return 0;
         case VT::Null:  throwErr(94, errDesc(94));
@@ -329,7 +338,8 @@ double toDouble(const Variant& v) {
 
 long long toInt64(const Variant& v) { return (long long)toDouble(v); }
 
-bool toBool(const Variant& v) {
+bool toBool(const Variant& v0) {
+    Variant v = unwrapDefault(v0);
     switch (v.t) {
         case VT::Empty: return false;
         case VT::Null:  return false; // VariantChangeType(Null -> Bool) is False
@@ -350,11 +360,6 @@ bool toBool(const Variant& v) {
             if (trim(v.s) == "#FALSE#") return false;
             double d;
             if (parseNumericString(v.s, d)) return d != 0;
-            throwErr(13, errDesc(13));
-        }
-        case VT::Object: {
-            // an object with a default property coerces through it
-            if (v.obj && v.obj->hasDefault()) return toBool(v.obj->getDefault());
             throwErr(13, errDesc(13));
         }
         default: throwErr(13, errDesc(13));
@@ -531,7 +536,8 @@ long long toLongValue(const Variant& v) {
     return r;
 }
 
-std::string toStr(const Variant& v) {
+std::string toStr(const Variant& v0) {
+    Variant v = unwrapDefault(v0);
     switch (v.t) {
         case VT::Empty: return "";
         case VT::Null:  throwErr(94, errDesc(94));
@@ -1022,10 +1028,18 @@ static int cmpNumStr(const Variant& a, const Variant& b, bool compareText) {
         }
         return a.s < b.s ? -1 : (a.s > b.s ? 1 : 0);
     }
-    if (aStr != bStr && (a.t == VT::Bool || b.t == VT::Bool)) {
-        // string vs boolean compares as text (True/False), as in VBScript
-        std::string x = aStr ? a.s : std::string(toBool(a) ? "True" : "False");
-        std::string y = bStr ? b.s : std::string(toBool(b) ? "True" : "False");
+    if (aStr != bStr) {
+        // mixed string/non-string: numeric if the string parses as a number,
+        // otherwise compare as text (VBScript never errors here, e.g. in
+        // Select Case: `case 3` vs `"test"`)
+        const Variant& sv = aStr ? a : b;
+        const Variant& nv = aStr ? b : a;
+        double d;
+        if (!trim(sv.s).empty() && parseNumericString(sv.s, d)) {
+            double x = toDouble(nv);
+            return d < x ? -1 : (d > x ? 1 : 0);
+        }
+        std::string x = sv.s, y = toStr(nv);
         if (compareText) { x = lower(x); y = lower(y); }
         return x < y ? -1 : (x > y ? 1 : 0);
     }
@@ -1047,7 +1061,8 @@ static int cmpNumStr(const Variant& a, const Variant& b, bool compareText) {
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
-Variant opCompare(const std::string& op, const Variant& a, const Variant& b, bool compareText) {
+Variant opCompare(const std::string& op, const Variant& a0, const Variant& b0, bool compareText) {
+    Variant a = unwrapDefault(a0), b = unwrapDefault(b0);
     if (a.isNull() || b.isNull()) return Variant::mkNull();
     if (a.t == VT::Object || b.t == VT::Object) {
         if (a.t == VT::Object && b.t == VT::Object) {

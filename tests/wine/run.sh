@@ -11,8 +11,9 @@
 # object and is skipped by default; pass --all to include it).
 #
 # Usage: sh tests/wine/run.sh [--all]
-# Prints per-file ok/not-ok counts and the failing assertions; exit 0 always
-# (this is a report, not a gate) unless mscript crashes on a file.
+# Prints per-file ok/not-ok counts and the failing assertions. Exit status:
+# 2 if the wine test dir is missing, 1 if mscript crashes on a file, else 0
+# (a report, not a gate).
 
 cd "$(dirname "$0")/../.." || exit 1
 BIN=./mscript
@@ -29,7 +30,7 @@ rc=0
 for f in $FILES; do
     src="$DIR/$f"
     [ -f "$src" ] || { echo "skip $f (not found)"; continue; }
-    tmp=$(mktemp /tmp/mscript-wine-XXXXXX.vbs)
+    tmp=$(mktemp /tmp/mscript-wine-XXXXXX)
     # mscript registers Dim at execution time, so the shim (which declares the
     # harness globals) must run before the wine file's top-level statements.
     # Hoist "Option Explicit" to line 1 and strip it from the wine file so the
