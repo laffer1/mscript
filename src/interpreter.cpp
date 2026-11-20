@@ -62,7 +62,7 @@ Variant ClassInstance::getMember(const std::string& n0) {
 
 void ClassInstance::setMember(const std::string& n, const Variant& v) {
     auto it = fields.vars.find(n);
-    if (it != fields.vars.end()) { it->second = v; return; }
+    if (it != fields.vars.end()) { it->second = v; ownArrays(it->second); return; }
     if (Proc* p = findProc(n, 2)) { // Property Let
         std::vector<ArgVal> args(p->params->size());
         for (size_t i = 0; i + 1 < p->params->size(); i++) args[i].val = Variant();
@@ -300,7 +300,7 @@ void Interp::execStmt(Stmt& s, Frame& f) {
 
     case Stmt::Assign: {
         Variant v = evalExpr(*s.e2, f);
-        assignTarget(*s.e, v, s.b, f);
+        assignTarget(*s.e, std::move(v), s.b, f); // moved so a temporary array isn't copied
         break;
     }
 
@@ -464,6 +464,7 @@ void Interp::execStmt(Stmt& s, Frame& f) {
         }
         for (auto& item : items) {
             *cell = item;
+            ownArrays(*cell); // the loop variable gets a copy of a nested array
             try {
                 execStmtList(body, f);
             } catch (ExitSig& x) {
@@ -709,7 +710,7 @@ Variant Interp::evalMemberBase(Expr& e, Frame& f) {
 
 // ---------- assignment ----------
 
-void Interp::assignTarget(Expr& t, const Variant& v, bool isSet, Frame& f) {
+void Interp::assignTarget(Expr& t, Variant v, bool isSet, Frame& f) {
     if (isSet && v.t != VT::Object) throwErr(424, errDesc(424));
     switch (t.k) {
     case Expr::Var: {
@@ -728,7 +729,8 @@ void Interp::assignTarget(Expr& t, const Variant& v, bool isSet, Frame& f) {
             if (optionExplicit) throwErr(500, errDesc(500));
             cell = &f.scope->vars[t.name];
         }
-        *cell = v;
+        ownArrays(v); // b = a copies the array
+        *cell = std::move(v);
         return;
     }
     // (Static vars are found via findVar, which checks f.proc->statics)
@@ -745,7 +747,8 @@ void Interp::assignTarget(Expr& t, const Variant& v, bool isSet, Frame& f) {
         if (base.t == VT::Array) {
             std::vector<long long> idx;
             for (auto& av : args) idx.push_back(toInt64(av));
-            base.arr->at(idx) = v;
+            ownArrays(v);
+            base.arr->at(idx) = std::move(v);
             return;
         }
         if (base.t == VT::Object && base.obj) {
@@ -770,6 +773,7 @@ ArgVal Interp::evalArg(Expr& e, Frame& f) {
 }
 
 Variant* Interp::evalLValue(Expr& e, Frame& f) {
+    if (e.paren) return nullptr; // (x) passes a copy even to a ByRef parameter
     if (e.k == Expr::Var) {
         // with-members are not stable lvalues; skip them
         if (Variant* v = f.scope->find(e.name)) return v;
@@ -940,9 +944,13 @@ Variant Interp::callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<Cla
         if (i < args.size()) v = args[i].val;
         else if (pm.hasDefault) v = evalExpr(*pm.def, f);
         else v = Variant();
-        (*f.scope)[pm.name] = v;
-        if (pm.byRef && i < args.size() && args[i].ref)
-            byRef.push_back({pm.name, args[i].ref});
+        // ByRef with an lvalue argument shares the caller's array (writes to its
+        // elements, ReDim and Erase reach the caller); everything else, ByVal or
+        // a ByRef argument that is an expression such as (arr), gets a copy.
+        bool aliased = pm.byRef && i < args.size() && args[i].ref;
+        if (!aliased) ownArrays(v);
+        (*f.scope)[pm.name] = std::move(v);
+        if (aliased) byRef.push_back({pm.name, args[i].ref});
     }
 
     f.bodyList = &p.body;

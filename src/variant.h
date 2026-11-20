@@ -84,6 +84,14 @@ struct VArray {
     void alloc(const std::vector<long long>& newDims, int newBase, bool preserve);
 };
 
+// VBScript arrays are values: storing one into a variable, an array element, a
+// ByVal parameter, a class field or a collection stores a copy. Variants share
+// their VArray through a shared_ptr, so ownArrays() gives v its own storage
+// wherever another Variant still points at it, recursing into nested arrays.
+// An array nothing else references (a function result, Array(), Split(), ...)
+// is kept as it is, so temporaries are stored without being copied.
+void ownArrays(Variant& v);
+
 struct VBObject {
     virtual ~VBObject() = default;
     // All names arrive lowercased.

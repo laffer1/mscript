@@ -1,0 +1,21 @@
+assign: 1 99
+byval: 2
+byref: byref
+default byref: default
+parenthesized arg: 3
+call with (a): 3
+function result: 1 copy
+fresh result: f1 changed
+nested: 1 100
+stored element: 5 50
+element assign: 6 60
+nested byval: 2
+redim copy: f 2 g 4
+erase copy: 2 1
+byref redim: 5 grown
+byval erase: kept
+byref erase: True 1
+for each: 1 2
+class field: 1
+dictionary: after after
+paren scalar: 3

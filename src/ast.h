@@ -20,6 +20,7 @@ struct Expr {
     std::string name;            // Var, Member, NewExpr (lowercased)
     std::string op;              // Unary/Bin operator
     std::vector<ExprPtr> a;      // children / call args
+    bool paren = false;          // written in parentheses: (x) is a value, never a ByRef lvalue
 
     static ExprPtr mkLit(Variant v, int line = 0) {
         auto e = std::make_unique<Expr>(); e->k = Lit; e->lit = std::move(v); e->line = line; return e;

@@ -325,7 +325,12 @@ StmtPtr Parser::parseExprOrAssign() {
         s->e = Expr::mkCall(std::move(head), std::move(args), line);
         return s;
     }
+    Expr* bare = head.get();
     ExprPtr full = parseBinRest(std::move(head), 0);
+    // "Proc(x)" as a statement (no Call keyword): the parentheses enclose the
+    // argument, not an argument list, so x is passed by value as in VBScript
+    if (full.get() == bare && bare->k == Expr::Call && bare->a.size() == 2)
+        bare->a[1]->paren = true;
     auto s = std::make_unique<Stmt>();
     s->k = Stmt::ExprStmt; s->line = line; s->e = std::move(full);
     return s;
@@ -789,6 +794,7 @@ ExprPtr Parser::parsePrimary() {
         advance();
         ExprPtr e = parseExpr();
         expectOp(")");
+        e->paren = true;
         return e;
     }
     if (tk.k == TK::Op && tk.text == ".") {

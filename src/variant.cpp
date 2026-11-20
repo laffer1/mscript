@@ -50,7 +50,9 @@ Variant MapObject::getMember(const std::string& n) {
     throwErr(438, errDesc(438));
 }
 void MapObject::setMember(const std::string& n, const Variant& v) {
-    props[n] = v;
+    Variant& slot = props[n];
+    slot = v;
+    ownArrays(slot);
 }
 Variant MapObject::callMember(const std::string& n, std::vector<Variant>& args) {
     auto it = methods.find(n);
@@ -442,6 +444,16 @@ std::string typeNameOf(const Variant& v) {
 }
 
 // ---------- VArray ----------
+
+void ownArrays(Variant& v) {
+    if (v.t != VT::Array || !v.arr) return;
+    if (v.arr.use_count() > 1) {
+        v.arr = std::make_shared<VArray>(*v.arr);
+        v.arr->fixed = false; // a copy of a fixed-size array can be ReDim'd
+    }
+    for (auto& e : v.arr->data)
+        if (e.t == VT::Array) ownArrays(e);
+}
 
 long long VArray::totalSize() const {
     // overflow-checked product; dims are validated in alloc()

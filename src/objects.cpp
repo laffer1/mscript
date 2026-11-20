@@ -285,6 +285,7 @@ static std::shared_ptr<MapObject> makeDictionary() {
         data->index[data->mapKey(k)] = data->keys.size();
         data->keys.push_back(k);
         data->vals.push_back(a[1]);
+        ownArrays(data->vals.back()); // the dictionary keeps its own copy of an array
         refresh();
         return Variant();
     };
@@ -343,10 +344,15 @@ static std::shared_ptr<MapObject> makeDictionary() {
     d->onAssignInvoke = [data, refresh](MapObject*, std::vector<Variant>& a, const Variant& v) -> void {
         std::string k = toStr(a[0]);
         auto it = data->index.find(data->mapKey(k));
-        if (it != data->index.end()) { data->vals[it->second] = v; return; }
+        if (it != data->index.end()) {
+            data->vals[it->second] = v;
+            ownArrays(data->vals[it->second]);
+            return;
+        }
         data->index[data->mapKey(k)] = data->keys.size();
         data->keys.push_back(k);
         data->vals.push_back(v);
+        ownArrays(data->vals.back());
         refresh();
     };
     d->onEnum = [data](MapObject*) -> std::vector<Variant> {
@@ -362,12 +368,22 @@ static std::shared_ptr<MapObject> makeDictionary() {
 // ---------- TextStream (file) ----------
 
 struct TsData {
-    std::string content;   // for reading: whole file; for writing: buffer
+    std::string content;   // reading: the whole file; writing: the text written
+                           // through this stream (kept for Line / Column)
     size_t pos = 0;
     bool writable = false;
-    std::fstream fs;
+    std::fstream fs;       // writing: opened truncating (ForWriting) or appending
+                           // (ForAppending); every Write goes straight to it
     std::string path;
     bool open = false;
+
+    void put(const std::string& s) {
+        content += s;
+        pos = content.size();
+        if (!open) return;
+        fs.write(s.data(), (std::streamsize)s.size());
+        if (!fs) throwErr(61, "Disk full");
+    }
 };
 
 // TextStream with live AtEndOfStream / AtEndOfLine / Line / Column properties.
@@ -400,6 +416,9 @@ static std::shared_ptr<VBObject> makeTextStream(const std::string& path, int iom
     else if (iomode == 2) mode |= std::ios::out | std::ios::trunc;
     else if (iomode == 8) mode |= std::ios::out | std::ios::app;
     else throwErr(5, errDesc(5));
+    // OpenTextFile's create flag defaults to False: ForWriting / ForAppending on
+    // a missing file is "File not found" unless it was passed as True
+    if (iomode != 1 && !create && !fs::exists(path)) throwErr(53, "File not found");
     if (iomode == 1) {
         if (!fs::exists(path)) throwErr(53, "File not found");
         std::ifstream in(path, std::ios::binary);
@@ -407,13 +426,9 @@ static std::shared_ptr<VBObject> makeTextStream(const std::string& path, int iom
         ss << in.rdbuf();
         d->content = ss.str();
     } else {
+        // ForAppending opens with std::ios::app and never reads the old contents:
+        // writes only add to the end of the file
         d->writable = true;
-        if (iomode == 8) {
-            std::ifstream in(path, std::ios::binary);
-            std::ostringstream ss; ss << in.rdbuf();
-            d->content = ss.str();
-            d->pos = d->content.size();
-        }
         d->fs.open(path, mode);
         if (!d->fs) throwErr(70, "Permission denied");
         d->open = true;
@@ -441,28 +456,19 @@ static std::shared_ptr<VBObject> makeTextStream(const std::string& path, int iom
     };
     t->methods["write"] = [d](MapObject*, std::vector<Variant>& a) -> Variant {
         if (!d->writable) throwErr(70, "Permission denied");
-        for (auto& v : a) {
-            std::string s = toStr(v);
-            d->content.insert(d->pos, s);
-            d->pos += s.size();
-        }
+        for (auto& v : a) d->put(toStr(v));
         return Variant();
     };
     t->methods["writeline"] = [d](MapObject*, std::vector<Variant>& a) -> Variant {
         if (!d->writable) throwErr(70, "Permission denied");
-        for (auto& v : a) {
-            std::string s = toStr(v);
-            d->content.insert(d->pos, s + "\n");
-            d->pos += s.size() + 1;
-        }
+        if (a.empty()) d->put("\n"); // WriteLine with no argument writes a blank line
+        for (auto& v : a) d->put(toStr(v) + "\n");
         return Variant();
     };
     t->methods["writeblanklines"] = [d](MapObject*, std::vector<Variant>& a) -> Variant {
         if (!d->writable) throwErr(70, "Permission denied");
         long long n = a.empty() ? 1 : toInt64(a[0]);
-        std::string s((size_t)n, '\n');
-        d->content.insert(d->pos, s);
-        d->pos += s.size();
+        if (n > 0) d->put(std::string((size_t)n, '\n'));
         return Variant();
     };
     t->methods["skip"] = [d](MapObject*, std::vector<Variant>& a) -> Variant {
@@ -477,8 +483,7 @@ static std::shared_ptr<VBObject> makeTextStream(const std::string& path, int iom
     };
     t->methods["close"] = [d](MapObject*, std::vector<Variant>&) -> Variant {
         if (d->writable && d->open) {
-            d->fs.write(d->content.data(), (std::streamsize)d->content.size());
-            d->fs.close();
+            d->fs.close(); // writes already went to the file; this flushes it
             d->open = false;
         }
         return Variant();
