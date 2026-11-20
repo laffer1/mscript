@@ -531,6 +531,7 @@ void Interp::execStmtList(const std::vector<Stmt*>& list, Frame& f) {
     while (i < list.size()) {
         runPendingTerminators(); // objects released by the previous statement
         Stmt& s = *list[i];
+        f.curLine = s.line;
         try {
             execStmt(s, f);
             i++;
