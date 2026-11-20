@@ -1,0 +1,27 @@
+5: Invalid procedure call or argument
+6: Overflow
+9: Subscript out of range
+11: Division by zero
+13: Type mismatch
+53: File not found
+70: Permission denied
+76: Path not found
+424: Object required
+429: ActiveX component can't create object
+438: Object doesn't support this property or method
+445: Object doesn't support this action
+450: Wrong number of arguments or invalid property assignment
+500: Variable is undefined
+5017: Syntax error in regular expression
+999: Runtime error 999
+800A000D -> 13: Type mismatch
+800A01B6 -> 438: Object doesn't support this property or method
+80004001 -> 445: Object doesn't support this action
+80020005 -> 13: Type mismatch
+8002000B -> 9: Subscript out of range
+8002000E -> 450: Wrong number of arguments or invalid property assignment
+80030002 -> 53: File not found
+80040154 -> 429: ActiveX component can't create object
+80070005 -> 70: Permission denied
+80070057 -> 5: Invalid procedure call or argument
+80004005 -> -2147467259: Runtime error -2147467259
