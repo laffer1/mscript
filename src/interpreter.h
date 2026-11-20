@@ -106,6 +106,7 @@ struct Frame {
     bool hasErrLabel = false;
     const std::vector<Stmt*>* bodyList = nullptr;
     std::map<std::string, size_t> labelMap;
+    int curLine = 0;                                // for Erl
     std::vector<std::unique_ptr<Variant>> scratch; // temps for with-member lvalues
 };
 
