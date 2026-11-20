@@ -312,8 +312,11 @@ double toDouble(const Variant& v) {
         case VT::Null:  throwErr(94, errDesc(94));
         case VT::Bool:  return v.b ? -1.0 : 0.0;
         case VT::Int:
-        case VT::Long:  return (double)v.ll;
+        case VT::Long:
+        case VT::Byte:  return (double)v.ll;
+        case VT::Currency: return (double)v.ll / (double)CY_SCALE;
         case VT::Double:
+        case VT::Single:
         case VT::Date:  return v.d;
         case VT::String: {
             double d;
@@ -332,8 +335,11 @@ bool toBool(const Variant& v) {
         case VT::Null:  return false; // VariantChangeType(Null -> Bool) is False
         case VT::Bool:  return v.b;
         case VT::Int:
-        case VT::Long:  return v.ll != 0;
+        case VT::Long:
+        case VT::Byte:
+        case VT::Currency: return v.ll != 0;
         case VT::Double:
+        case VT::Single:
         case VT::Date:  return v.d != 0;
         case VT::String: {
             std::string s = lower(trim(v.s));
@@ -355,14 +361,17 @@ bool toBool(const Variant& v) {
     }
 }
 
-std::string formatDouble(double d) {
+// VB prints a Double with up to 15 significant digits and a Single with up to
+// 7 (the "%.15G" / "%.7G" shapes of VarBstrFromR8 / VarBstrFromR4).
+static std::string formatSig(double d, int digits) {
     if (std::isnan(d)) return "NaN";
     if (std::isinf(d)) return d > 0 ? "Infinity" : "-Infinity";
     if (d == 0) return "0";
-    if (d == std::floor(d) && std::fabs(d) < 1e15) {
+    double lim = digits == 7 ? 1e7 : 1e15;
+    if (d == std::floor(d) && std::fabs(d) < lim) {
         return std::format("{}", (long long)d);
     }
-    std::string s = std::format("{:.15g}", d);
+    std::string s = std::format("{:.{}g}", d, digits);
     // normalize exponent style to VB: 1e+20 -> 1E+20
     auto e = s.find('e');
     if (e != std::string::npos) {
@@ -375,14 +384,164 @@ std::string formatDouble(double d) {
     return s;
 }
 
+std::string formatDouble(double d) { return formatSig(d, 15); }
+std::string formatSingle(double d) { return formatSig(d, 7); }
+
+std::string formatCurrency(long long scaled) {
+    // magnitude as unsigned so the most negative value has no overflow
+    unsigned long long m = scaled < 0 ? 0ULL - (unsigned long long)scaled : (unsigned long long)scaled;
+    std::string s = scaled < 0 ? "-" : "";
+    s += std::format("{}", m / (unsigned long long)CY_SCALE);
+    unsigned long long frac = m % (unsigned long long)CY_SCALE;
+    if (frac) {
+        std::string f = std::format("{:04}", frac);
+        while (f.back() == '0') f.pop_back();
+        s += "." + f;
+    }
+    return s;
+}
+
+// ---------- Byte / Single / Currency coercions ----------
+
+// banker's rounding of an exact integer quotient p / q (q > 0)
+static __int128 roundDivEven(__int128 p, __int128 q) {
+    bool neg = p < 0;
+    __int128 a = neg ? -p : p;
+    __int128 quo = a / q, rem = a % q;
+    if (rem * 2 > q || (rem * 2 == q && (quo & 1))) quo++;
+    return neg ? -quo : quo;
+}
+
+static bool fitsCurrency(__int128 x) { return x >= (__int128)LLONG_MIN && x <= (__int128)LLONG_MAX; }
+
+long long curScaledFromDouble(double d) {
+    // VarCyFromR8: scale by 10,000, then banker's rounding to an integer
+    if (std::isnan(d)) throwErr(6, errDesc(6));
+    double s = d * (double)CY_SCALE;
+    if (!(s >= -9223372036854775808.0 && s < 9223372036854775808.0)) throwErr(6, errDesc(6));
+    double f = std::floor(s);
+    double diff = s - f;
+    long long base = (long long)f;
+    if (diff > 0.5) return base + 1;
+    if (diff < 0.5) return base;
+    return (base % 2 == 0) ? base : base + 1;
+}
+
+// Plain decimal strings ("123.45678", "-0.5") are converted exactly, so the
+// full Currency range survives CCur("922337203685477.5807"); anything else
+// (exponents, &H literals) goes through the Double parser.
+static bool curScaledFromDecimalString(const std::string& in, long long& out) {
+    std::string s = trim(in);
+    size_t i = 0;
+    bool neg = false;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; i++; }
+    __int128 ip = 0;
+    bool any = false;
+    while (i < s.size() && std::isdigit((unsigned char)s[i])) {
+        ip = ip * 10 + (s[i] - '0');
+        if (ip > (__int128)LLONG_MAX) return false;   // let the Double path raise 6
+        any = true; i++;
+    }
+    __int128 frac = 0;     // first four fraction digits
+    int nfrac = 0;
+    int roundDigit = -1;   // fifth fraction digit
+    bool restNonZero = false;
+    if (i < s.size() && s[i] == '.') {
+        i++;
+        while (i < s.size() && std::isdigit((unsigned char)s[i])) {
+            int dg = s[i] - '0';
+            if (nfrac < 4) { frac = frac * 10 + dg; nfrac++; }
+            else if (roundDigit < 0) roundDigit = dg;
+            else if (dg) restNonZero = true;
+            any = true; i++;
+        }
+    }
+    if (!any || i != s.size()) return false;
+    while (nfrac < 4) { frac *= 10; nfrac++; }
+    __int128 v = ip * CY_SCALE + frac;
+    if (roundDigit > 5 || (roundDigit == 5 && (restNonZero || (v & 1)))) v++;
+    if (neg) v = -v;
+    if (!fitsCurrency(v)) throwErr(6, errDesc(6));
+    out = (long long)v;
+    return true;
+}
+
+long long toCurrencyScaled(const Variant& v) {
+    switch (v.t) {
+        case VT::Empty: return 0;
+        case VT::Null:  throwErr(94, errDesc(94));
+        case VT::Bool:  return v.b ? -CY_SCALE : 0;
+        case VT::Int:
+        case VT::Long:
+        case VT::Byte:  return v.ll * CY_SCALE; // |ll| < 2^31, cannot overflow
+        case VT::Currency: return v.ll;
+        case VT::Double:
+        case VT::Single:
+        case VT::Date:  return curScaledFromDouble(v.d);
+        case VT::String: {
+            long long r;
+            if (curScaledFromDecimalString(v.s, r)) return r;
+            return curScaledFromDouble(toDouble(v));
+        }
+        case VT::Object:
+            if (v.obj && v.obj->hasDefault()) return toCurrencyScaled(v.obj->getDefault());
+            throwErr(13, errDesc(13));
+        default: throwErr(13, errDesc(13));
+    }
+}
+
+double singleFromDouble(double d) {
+    if (std::isnan(d)) return d;
+    // values that round to a finite float are kept; the rest overflow
+    // (FLT_MAX plus half a unit in the last place rounds to infinity)
+    if (std::fabs(d) >= 3.4028235677973366e38) throwErr(6, errDesc(6));
+    return (double)(float)d;
+}
+
+double toSingleValue(const Variant& v) {
+    if (v.t == VT::Single) return v.d;
+    return singleFromDouble(toDouble(v));
+}
+
+long long toByteValue(const Variant& v) {
+    if (v.t == VT::Byte) return v.ll;
+    double d = toDouble(v);
+    if (!(d >= -0.5 && d <= 255.5)) throwErr(6, errDesc(6));
+    long long r = bankerRound(d);
+    if (r < 0 || r > 255) throwErr(6, errDesc(6));
+    return r;
+}
+
+long long toLongValue(const Variant& v) {
+    switch (v.t) {
+        case VT::Int: case VT::Long: case VT::Byte: return v.ll;
+        case VT::Bool: return v.b ? -1 : 0;
+        case VT::Empty: return 0;
+        case VT::Currency: {
+            __int128 r = roundDivEven(v.ll, CY_SCALE);
+            if (r < INT32_MIN || r > INT32_MAX) throwErr(6, errDesc(6));
+            return (long long)r;
+        }
+        default: break;
+    }
+    double d = toDouble(v);
+    if (!(d > -2147483649.0 && d < 2147483648.0)) throwErr(6, errDesc(6));
+    long long r = bankerRound(d);
+    if (r < INT32_MIN || r > INT32_MAX) throwErr(6, errDesc(6));
+    return r;
+}
+
 std::string toStr(const Variant& v) {
     switch (v.t) {
         case VT::Empty: return "";
         case VT::Null:  throwErr(94, errDesc(94));
         case VT::Bool:  return v.b ? "True" : "False";
         case VT::Int:
-        case VT::Long:  return std::format("{}", v.ll);
+        case VT::Long:
+        case VT::Byte:  return std::format("{}", v.ll);
         case VT::Double: return formatDouble(v.d);
+        case VT::Single: return formatSingle(v.d);
+        case VT::Currency: return formatCurrency(v.ll);
         case VT::Date:  return formatDateTimeV(v.d);
         case VT::String: return v.s;
         case VT::Object:
@@ -418,6 +577,9 @@ int varTypeOf(const Variant& v) {
         case VT::String: return 8;
         case VT::Object: return v.obj ? 9 : 9;
         case VT::Bool:   return 11;
+        case VT::Single: return 4;
+        case VT::Currency: return 6;
+        case VT::Byte:   return 17;
         case VT::Array: {
             if (!v.arr || !v.arr->allocated || v.arr->data.empty()) return 8192 + 12;
             return 8192 + varTypeOf(v.arr->data[0]);
@@ -436,6 +598,9 @@ std::string typeNameOf(const Variant& v) {
         case VT::Date:   return "Date";
         case VT::String: return "String";
         case VT::Bool:   return "Boolean";
+        case VT::Byte:   return "Byte";
+        case VT::Single: return "Single";
+        case VT::Currency: return "Currency";
         case VT::Object: return v.obj ? v.obj->objectKind() : "Nothing";
         case VT::Array: {
             if (v.arr && v.arr->allocated && !v.arr->data.empty())
@@ -541,31 +706,172 @@ void VArray::alloc(const std::vector<long long>& newDims, int newBase, bool pres
 }
 
 // ---------- operators ----------
+//
+// Result subtypes follow the Variant rules of OLE Automation (VarAdd, VarMul,
+// ...) that VBScript uses, as written down in MS-VBAL 5.6.9.3 and the VBA
+// operator reference:
+//   * the result takes the most precise operand type; for + and - the order
+//     is Byte < Integer < Long < Single < Double < Currency (Boolean and
+//     Empty count as Integer, a String as Double), and Date wins over all;
+//   * * puts Currency below Double: Currency * Single/Double/String is Double;
+//   * a Single combined with a Long is a Double;
+//   * a Byte, Integer, Long or Single result that leaves its range moves to
+//     the narrowest of Integer, Long or Double that holds it, while Currency
+//     and Double overflow raise error 6;
+//   * / is Double unless a Single meets Byte/Integer/Boolean/Single (Single);
+//   * \ and Mod are Byte for two Bytes, Integer while only Byte, Integer and
+//     Boolean are involved, Long otherwise;
+//   * ^ is always Double.
 
 static bool isStringy(const Variant& v) { return v.t == VT::String; }
 
-static Variant numResult(double d) {
-    if (d == std::floor(d) && std::fabs(d) < 9.0e18) {
-        long long ll = (long long)d;
-        if (ll >= -2147483648LL && ll <= 2147483647LL) return Variant::mkInt(ll);
-        return Variant::mkDouble(d);
-    }
-    return Variant::mkDouble(d);
+static bool isIntFamily(VT t) {
+    return t == VT::Byte || t == VT::Bool || t == VT::Int || t == VT::Long || t == VT::Empty;
 }
 
-static Variant checkedIntAdd(long long a, long long b) {
-    long long r = a + b;
-    if ((b > 0 && r < a) || (b < 0 && r > a)) throwErr(6, errDesc(6));
-    return Variant::mkInt(r);
+// Operand subtype for arithmetic; objects with a default property take the
+// subtype of that value. Arrays and plain objects raise 13 later, through toDouble.
+static Variant arithOperand(const Variant& v) {
+    if (v.t == VT::Object && v.obj && v.obj->hasDefault()) return arithOperand(v.obj->getDefault());
+    return v;
+}
+
+enum class ArOp { Add, Sub, Mul, Div, IDiv };
+
+static VT effectiveType(VT a, VT b, ArOp op) {
+    auto has = [&](VT t) { return a == t || b == t; };
+    if (op == ArOp::Div) {
+        if (isIntFamily(a) && isIntFamily(b)) return VT::Double;
+        if (has(VT::Double) || has(VT::String) || has(VT::Currency) || has(VT::Date)) return VT::Double;
+        return has(VT::Long) ? VT::Double : VT::Single; // a Single is involved
+    }
+    if (op == ArOp::IDiv) {
+        if (a == VT::Byte && b == VT::Byte) return VT::Byte;
+        if (has(VT::Long) || has(VT::Single) || has(VT::Double) || has(VT::String) ||
+            has(VT::Currency) || has(VT::Date)) return VT::Long;
+        return VT::Int;
+    }
+    if (has(VT::Date)) return op == ArOp::Mul ? VT::Double : VT::Date;
+    if (has(VT::Currency)) {
+        if (op == ArOp::Mul && (has(VT::Single) || has(VT::Double) || has(VT::String))) return VT::Double;
+        return VT::Currency;
+    }
+    if (has(VT::Double) || has(VT::String)) return VT::Double;
+    if (has(VT::Single)) return has(VT::Long) ? VT::Double : VT::Single;
+    if (has(VT::Long)) return VT::Long;
+    if (has(VT::Int) || has(VT::Bool)) return VT::Int;
+    if (has(VT::Byte)) return VT::Byte;
+    return VT::Int; // Empty with Empty
+}
+
+// value of a Byte/Boolean/Integer/Long/Empty operand
+static long long intValue(const Variant& v) {
+    if (v.t == VT::Bool) return v.b ? -1 : 0;
+    if (v.t == VT::Empty) return 0;
+    return v.ll;
+}
+
+// an exact integer result of effective type Byte, Integer or Long: kept in that
+// type when it fits, otherwise promoted to Integer, Long or Double
+static Variant intResult(long long r, VT eff) {
+    if (eff == VT::Byte && r >= 0 && r <= 255) return Variant::mkByte(r);
+    if ((eff == VT::Byte || eff == VT::Int) && r >= -32768 && r <= 32767) return Variant::mkI2(r);
+    if (r >= INT32_MIN && r <= INT32_MAX) return Variant::mkLong(r);
+    return Variant::mkDouble((double)r);
+}
+
+static Variant doubleResult(double r) {
+    if (std::isinf(r)) throwErr(6, errDesc(6));
+    return Variant::mkDouble(r);
+}
+
+// a Single result that leaves the float range becomes a Double
+static Variant singleResult(double r) {
+    if (std::isnan(r)) return Variant::mkSingle(r);
+    if (std::fabs(r) >= 3.4028235677973366e38) return doubleResult(r);
+    return Variant::mkSingle(r);
+}
+
+static Variant curResult(__int128 scaled) {
+    if (!fitsCurrency(scaled)) throwErr(6, errDesc(6));
+    return Variant::mkCur((long long)scaled);
+}
+
+static Variant arith(const Variant& a0, const Variant& b0, ArOp op) {
+    Variant a = arithOperand(a0), b = arithOperand(b0);
+    if (a.isNull() || b.isNull()) return Variant::mkNull();
+    if (a.t == VT::Array || b.t == VT::Array || a.t == VT::Object || b.t == VT::Object)
+        throwErr(13, errDesc(13));
+    VT eff = effectiveType(a.t, b.t, op);
+    switch (eff) {
+        case VT::Byte:
+        case VT::Int:
+        case VT::Long: {
+            long long x, y;
+            if (op == ArOp::IDiv) { x = toLongValue(a); y = toLongValue(b); }
+            else { x = intValue(a); y = intValue(b); }
+            switch (op) {
+                case ArOp::Add: return intResult(x + y, eff);
+                case ArOp::Sub: return intResult(x - y, eff);
+                case ArOp::Mul: return intResult(x * y, eff);
+                default: break; // \ and Mod are done by the callers
+            }
+            break;
+        }
+        case VT::Single: {
+            double x = toSingleValue(a), y = toSingleValue(b);
+            switch (op) {
+                case ArOp::Add: return singleResult(x + y);
+                case ArOp::Sub: return singleResult(x - y);
+                case ArOp::Mul: return singleResult(x * y);
+                case ArOp::Div:
+                    if (y == 0) throwErr(11, errDesc(11));
+                    return singleResult(x / y);
+                default: break;
+            }
+            break;
+        }
+        case VT::Double: {
+            double x = toDouble(a), y = toDouble(b);
+            switch (op) {
+                case ArOp::Add: return doubleResult(x + y);
+                case ArOp::Sub: return doubleResult(x - y);
+                case ArOp::Mul: return doubleResult(x * y);
+                case ArOp::Div:
+                    if (y == 0) throwErr(11, errDesc(11));
+                    return doubleResult(x / y);
+                default: break;
+            }
+            break;
+        }
+        case VT::Currency: {
+            __int128 x = toCurrencyScaled(a), y = toCurrencyScaled(b);
+            switch (op) {
+                case ArOp::Add: return curResult(x + y);
+                case ArOp::Sub: return curResult(x - y);
+                case ArOp::Mul: return curResult(roundDivEven(x * y, CY_SCALE));
+                default: break;
+            }
+            break;
+        }
+        case VT::Date: {
+            double x = toDouble(a), y = toDouble(b);
+            if (op == ArOp::Add) return Variant::mkDate(x + y);
+            if (op == ArOp::Sub) {
+                if (a.t == VT::Date && b.t == VT::Date) return Variant::mkDouble(x - y); // Date - Date -> Double
+                return Variant::mkDate(x - y);
+            }
+            break;
+        }
+        default: break;
+    }
+    throwErr(13, errDesc(13));
 }
 
 Variant opAdd(const Variant& a, const Variant& b) {
     if (a.isNull() || b.isNull()) return Variant::mkNull();
     if (isStringy(a) && isStringy(b)) return Variant::mkStr(a.s + b.s);
-    if (a.isIntegral() && b.isIntegral()) return checkedIntAdd(a.ll, b.ll);
-    double r = toDouble(a) + toDouble(b);
-    if (a.t == VT::Date || b.t == VT::Date) return Variant::mkDate(r);
-    return numResult(r);
+    return arith(a, b, ArOp::Add);
 }
 
 Variant opConcat(const Variant& a, const Variant& b) {
@@ -575,109 +881,135 @@ Variant opConcat(const Variant& a, const Variant& b) {
                           (b.isNull() ? std::string() : toStr(b)));
 }
 
-Variant opSub(const Variant& a, const Variant& b) {
+Variant opSub(const Variant& a, const Variant& b) { return arith(a, b, ArOp::Sub); }
+Variant opMul(const Variant& a, const Variant& b) { return arith(a, b, ArOp::Mul); }
+Variant opDiv(const Variant& a, const Variant& b) { return arith(a, b, ArOp::Div); }
+
+// \ and Mod: both operands are rounded (banker's) to the effective integer type
+static Variant intDivMod(const Variant& a0, const Variant& b0, bool mod) {
+    Variant a = arithOperand(a0), b = arithOperand(b0);
     if (a.isNull() || b.isNull()) return Variant::mkNull();
-    if (a.isIntegral() && b.isIntegral()) {
-        long long r = a.ll - b.ll;
-        if ((b.ll < 0 && r < a.ll) || (b.ll > 0 && r > a.ll)) throwErr(6, errDesc(6));
-        return Variant::mkInt(r);
-    }
-    double r = toDouble(a) - toDouble(b);
-    if (a.t == VT::Date && b.t != VT::Date) return Variant::mkDate(r); // Date - number -> Date
-    if (a.t == VT::Date && b.t == VT::Date) return Variant::mkDouble(r); // Date - Date -> Double
-    return numResult(r);
+    if (a.t == VT::Array || b.t == VT::Array || a.t == VT::Object || b.t == VT::Object)
+        throwErr(13, errDesc(13));
+    VT eff = effectiveType(a.t, b.t, ArOp::IDiv);
+    long long x = toLongValue(a), y = toLongValue(b);
+    if (y == 0) throwErr(11, errDesc(11));
+    // C++ / truncates toward zero and % keeps the dividend's sign, like VB
+    return intResult(mod ? x % y : x / y, eff);
 }
 
-Variant opMul(const Variant& a, const Variant& b) {
-    if (a.isNull() || b.isNull()) return Variant::mkNull();
-    if (a.isIntegral() && b.isIntegral()) {
-        long long r = a.ll * b.ll;
-        if (b.ll != 0 && r / b.ll != a.ll) throwErr(6, errDesc(6));
-        return Variant::mkInt(r);
-    }
-    return numResult(toDouble(a) * toDouble(b));
-}
-
-Variant opDiv(const Variant& a, const Variant& b) {
-    if (a.isNull() || b.isNull()) return Variant::mkNull();
-    double db = toDouble(b);
-    if (db == 0) throwErr(11, errDesc(11));
-    return numResult(toDouble(a) / db);
-}
-
-Variant opIDiv(const Variant& a, const Variant& b) {
-    if (a.isNull() || b.isNull()) return Variant::mkNull();
-    long long ia = bankerRound(toDouble(a));
-    long long ib = bankerRound(toDouble(b));
-    if (ib == 0) throwErr(11, errDesc(11));
-    return Variant::mkLong(ia / ib);
-}
-
-Variant opMod(const Variant& a, const Variant& b) {
-    if (a.isNull() || b.isNull()) return Variant::mkNull();
-    long long ia = bankerRound(toDouble(a));
-    long long ib = bankerRound(toDouble(b));
-    if (ib == 0) throwErr(11, errDesc(11));
-    return Variant::mkLong(ia % ib); // C++ % keeps dividend's sign, like VB Mod
-}
+Variant opIDiv(const Variant& a, const Variant& b) { return intDivMod(a, b, false); }
+Variant opMod(const Variant& a, const Variant& b) { return intDivMod(a, b, true); }
 
 Variant opPow(const Variant& a, const Variant& b) {
     if (a.isNull() || b.isNull()) return Variant::mkNull();
-    double x = toDouble(a), y = toDouble(b);
+    double x = toDouble(arithOperand(a)), y = toDouble(arithOperand(b));
     if (x == 0 && y < 0) throwErr(11, errDesc(11));
-    double r = std::pow(x, y);
     if (x < 0 && y != std::floor(y)) throwErr(5, errDesc(5));
-    return numResult(r);
+    return doubleResult(std::pow(x, y)); // ^ is always a Double
 }
 
-Variant opNeg(const Variant& a) {
+Variant opNeg(const Variant& a0) {
+    Variant a = arithOperand(a0);
     if (a.isNull()) return Variant::mkNull();
-    if (a.isIntegral()) return Variant::mkLong(-a.ll);
-    return numResult(-toDouble(a));
+    switch (a.t) {
+        case VT::Byte:                              // -Byte is an Integer
+        case VT::Bool:
+        case VT::Empty:
+        case VT::Int:   return intResult(-intValue(a), VT::Int);
+        case VT::Long:  return intResult(-a.ll, VT::Long);
+        case VT::Single: return Variant::mkSingle(-a.d);
+        case VT::Currency: return curResult(-(__int128)a.ll);
+        case VT::Date:  return Variant::mkDate(-a.d);
+        case VT::Double: return Variant::mkDouble(-a.d);
+        case VT::String: return doubleResult(-toDouble(a));
+        default: throwErr(13, errDesc(13));
+    }
 }
 
-static int32_t bitOf(const Variant& v) {
-    if (v.t == VT::Bool) return v.b ? -1 : 0;
-    return (int32_t)toInt64(v);
+// ---- logical / bitwise operators (And Or Xor Eqv Imp Not) ----
+//
+// As in VBScript: Boolean with Boolean is a Boolean operation; otherwise the
+// operation is bitwise. Empty counts as a Long 0, a numeric string as a Long,
+// any other string converts to Boolean (or raises 13), and Single, Double,
+// Currency and Date are rounded to a Long. The result is a Byte for two Bytes,
+// an Integer while only Byte, Integer and Boolean are involved, else a Long.
+
+static Variant logicOperand(const Variant& v) {
+    switch (v.t) {
+        case VT::Null: case VT::Bool: case VT::Byte: case VT::Int: case VT::Long:
+            return v;
+        case VT::Empty: return Variant::mkLong(0);
+        case VT::String: {
+            double d;
+            if (parseNumericString(v.s, d)) return Variant::mkLong(toLongValue(Variant::mkDouble(d)));
+            return Variant::mkBool(toBool(v));
+        }
+        case VT::Object:
+            if (v.obj && v.obj->hasDefault()) return logicOperand(v.obj->getDefault());
+            throwErr(13, errDesc(13));
+        case VT::Array: throwErr(13, errDesc(13));
+        default: return Variant::mkLong(toLongValue(v)); // Single, Double, Currency, Date
+    }
 }
 
-Variant opNot(const Variant& a) {
+static long long bitsOf(const Variant& v) { return v.t == VT::Bool ? (v.b ? -1 : 0) : v.ll; }
+
+// pack a 32-bit bit pattern into a value of subtype t
+static Variant bitsResult(int32_t bits, VT t) {
+    if (t == VT::Bool) return Variant::mkBool(bits != 0);
+    if (t == VT::Byte) return Variant::mkByte(bits & 0xFF);
+    if (t == VT::Int) return Variant::mkI2((int16_t)bits);
+    return Variant::mkLong(bits);
+}
+
+static VT logicResultType(VT a, VT b) {
+    if (a == VT::Bool && b == VT::Bool) return VT::Bool;
+    if (a == VT::Byte && b == VT::Byte) return VT::Byte;
+    auto small = [](VT t) { return t == VT::Byte || t == VT::Int || t == VT::Bool; };
+    if (small(a) && small(b)) return VT::Int;
+    return VT::Long;
+}
+
+static int32_t allOnes(VT t) { return t == VT::Byte ? 0xFF : -1; }
+
+Variant opNot(const Variant& a0) {
+    Variant a = logicOperand(a0);
     if (a.isNull()) return Variant::mkNull();
-    if (a.t == VT::Bool) return Variant::mkBool(!a.b);
-    if (a.isIntegral()) return Variant::mkLong(~(int32_t)a.ll);
-    return Variant::mkBool(!toBool(a));
+    return bitsResult(~(int32_t)bitsOf(a), a.t);
 }
 
-Variant opLogic(const std::string& op, const Variant& a, const Variant& b) {
+Variant opLogic(const std::string& op, const Variant& a0, const Variant& b0) {
+    Variant a = logicOperand(a0), b = logicOperand(b0);
     if (a.isNull() || b.isNull()) {
-        // VBScript Null propagation: Or with a True operand is True,
-        // And with a False operand is False, otherwise Null
-        bool xn = a.isNull(), yn = b.isNull();
-        bool x = xn ? false : toBool(a), y = yn ? false : toBool(b);
-        if (op == "or" && ((!xn && x) || (!yn && y))) return Variant::mkBool(true);
-        if (op == "and" && ((!xn && !x) || (!yn && !y))) return Variant::mkBool(false);
-        if (op == "imp" && !xn && !x) return Variant::mkBool(true); // False Imp _ = True
-        if (xn || yn) return Variant::mkNull();
+        if (a.isNull() && b.isNull()) return Variant::mkNull();
+        // three-valued logic, bit by bit, against an unknown (Null) operand
+        bool leftKnown = !a.isNull();
+        const Variant& k = leftKnown ? a : b;
+        int32_t x = (int32_t)bitsOf(k);
+        int32_t ones = allOnes(k.t);
+        if (op == "and" && x == 0) return bitsResult(0, k.t);
+        if (op == "or" && (x & ones) == ones) return bitsResult(ones, k.t);
+        if (op == "imp") {
+            if (leftKnown) {
+                if (x == 0) return bitsResult(ones, k.t);           // False Imp _ = True
+                if (k.t == VT::Byte) return bitsResult(~x, VT::Byte); // VBScript keeps Byte: Not x
+            } else if ((x & ones) == ones) {
+                return bitsResult(ones, k.t);                       // _ Imp True = True
+            }
+        }
+        return Variant::mkNull();
     }
-    bool bothBool = a.t == VT::Bool && b.t == VT::Bool;
-    bool bothInt = (a.isIntegral() || a.t == VT::Bool) && (b.isIntegral() || b.t == VT::Bool);
-    if (bothBool || !bothInt) {
-        // logical
-        bool x = toBool(a), y = toBool(b);
-        if (op == "and") return Variant::mkBool(x && y);
-        if (op == "or")  return Variant::mkBool(x || y);
-        if (op == "xor") return Variant::mkBool(x != y);
-        if (op == "eqv") return Variant::mkBool(x == y);
-        if (op == "imp") return Variant::mkBool(!x || y);
-    } else {
-        int32_t x = bitOf(a), y = bitOf(b);
-        if (op == "and") return Variant::mkLong(x & y);
-        if (op == "or")  return Variant::mkLong(x | y);
-        if (op == "xor") return Variant::mkLong(x ^ y);
-        if (op == "eqv") return Variant::mkLong(~(x ^ y));
-        if (op == "imp") return Variant::mkLong(~x | y);
-    }
-    throwErr(13, errDesc(13));
+    VT rt = logicResultType(a.t, b.t);
+    int32_t x = (int32_t)bitsOf(a), y = (int32_t)bitsOf(b);
+    int32_t r;
+    if (op == "and") r = x & y;
+    else if (op == "or") r = x | y;
+    else if (op == "xor") r = x ^ y;
+    else if (op == "eqv") r = ~(x ^ y);
+    else if (op == "imp") r = ~x | y;
+    else throwErr(13, errDesc(13));
+    return bitsResult(r, rt);
 }
 
 // returns -1/0/1 for ordering; throws on type problems
@@ -697,7 +1029,21 @@ static int cmpNumStr(const Variant& a, const Variant& b, bool compareText) {
         if (compareText) { x = lower(x); y = lower(y); }
         return x < y ? -1 : (x > y ? 1 : 0);
     }
+    // Currency against Currency or a whole-number type compares exactly
+    auto cyExact = [](VT t) { return t == VT::Currency || t == VT::Int || t == VT::Long ||
+                                     t == VT::Byte || t == VT::Bool || t == VT::Empty; };
+    if ((a.t == VT::Currency || b.t == VT::Currency) && cyExact(a.t) && cyExact(b.t)) {
+        long long x = toCurrencyScaled(a), y = toCurrencyScaled(b);
+        return x < y ? -1 : (x > y ? 1 : 0);
+    }
     double x = toDouble(a), y = toDouble(b);
+    // a Single compares at Single precision, even against a Double
+    // (CSng(0.1) = 0.1 is True), unless the other value is beyond the float range
+    if ((a.t == VT::Single || b.t == VT::Single) && !aStr && !bStr &&
+        std::fabs(x) < 3.4028235677973366e38 && std::fabs(y) < 3.4028235677973366e38) {
+        float fx = (float)x, fy = (float)y;
+        return fx < fy ? -1 : (fx > fy ? 1 : 0);
+    }
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 

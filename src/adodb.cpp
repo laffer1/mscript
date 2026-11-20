@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -205,7 +206,10 @@ long long declTypeToAdo(const char* dt) {
     std::string t = lower(dt);
     if (t.find("bool") != std::string::npos) return 11; // adBoolean
     if (t.find("bigint") != std::string::npos) return 20; // adBigInt
+    if (t.find("tinyint") != std::string::npos) return 17; // adUnsignedTinyInt (Byte)
     if (t.find("int") != std::string::npos) return 3;    // adInteger
+    if (t.find("money") != std::string::npos || t.find("currency") != std::string::npos)
+        return 6;                                         // adCurrency
     if (t.find("char") != std::string::npos || t.find("text") != std::string::npos ||
         t.find("clob") != std::string::npos) return 200;  // adVarChar
     if (t.find("blob") != std::string::npos || t.find("binary") != std::string::npos) return 205; // adLongVarBinary
@@ -220,9 +224,17 @@ Variant colValue(sqlite3_stmt* st, int i, long long adoType) {
     switch (sqlite3_column_type(st, i)) {
     case SQLITE_INTEGER: {
         long long v = sqlite3_column_int64(st, i);
-        return adoType == 11 ? Variant::mkBool(v != 0) : Variant::mkLong(v);
+        if (adoType == 11) return Variant::mkBool(v != 0);
+        if (adoType == 17 && v >= 0 && v <= 255) return Variant::mkByte(v);
+        if (adoType == 6 && v >= LLONG_MIN / CY_SCALE && v <= LLONG_MAX / CY_SCALE)
+            return Variant::mkCur(v * CY_SCALE);
+        return Variant::mkLong(v);
     }
-    case SQLITE_FLOAT: return Variant::mkDouble(sqlite3_column_double(st, i));
+    case SQLITE_FLOAT: {
+        double d = sqlite3_column_double(st, i);
+        if (adoType == 6) return Variant::mkCur(curScaledFromDouble(d));
+        return Variant::mkDouble(d);
+    }
     case SQLITE_TEXT: {
         const unsigned char* p = sqlite3_column_text(st, i);
         int n = sqlite3_column_bytes(st, i);
@@ -235,7 +247,7 @@ Variant colValue(sqlite3_stmt* st, int i, long long adoType) {
         arr->base = 0;
         arr->dims = { (long long)n };
         arr->data.resize((size_t)n);
-        for (int k = 0; k < n; k++) arr->data[(size_t)k] = Variant::mkInt(((const unsigned char*)p)[k]);
+        for (int k = 0; k < n; k++) arr->data[(size_t)k] = Variant::mkByte(((const unsigned char*)p)[k]);
         return Variant::mkArr(arr);
     }
     default: return Variant::mkNull();
@@ -349,6 +361,7 @@ void rsRunQuery(const std::shared_ptr<RsData>& rs, const std::string& sql) {
                 if (rs->colTypes[c] < 0) {
                     const Variant& v = row[c];
                     rs->colTypes[c] = v.t == VT::Long || v.t == VT::Int ? 3 :
+                                       v.t == VT::Byte ? 17 : v.t == VT::Currency ? 6 : v.t == VT::Single ? 4 :
                                        v.t == VT::Double || v.t == VT::Date ? 5 :
                                        v.t == VT::String ? 200 :
                                        v.t == VT::Array ? 205 : v.t == VT::Bool ? 11 : 0;
@@ -365,8 +378,15 @@ void rsRunQuery(const std::shared_ptr<RsData>& rs, const std::string& sql) {
 void bindVariant(sqlite3_stmt* st, int idx, const Variant& v) {
     switch (v.t) {
     case VT::Int:
-    case VT::Long: sqlite3_bind_int64(st, idx, v.ll); break;
-    case VT::Double: sqlite3_bind_double(st, idx, v.d); break;
+    case VT::Long:
+    case VT::Byte: sqlite3_bind_int64(st, idx, v.ll); break;
+    case VT::Double:
+    case VT::Single: sqlite3_bind_double(st, idx, v.d); break;
+    case VT::Currency:
+        // whole amounts bind as integers; others as the nearest double
+        if (v.ll % CY_SCALE == 0) sqlite3_bind_int64(st, idx, v.ll / CY_SCALE);
+        else sqlite3_bind_double(st, idx, (double)v.ll / (double)CY_SCALE);
+        break;
     case VT::Date: sqlite3_bind_double(st, idx, v.d); break; // stored as serial double
     case VT::Bool: sqlite3_bind_int(st, idx, v.b ? 1 : 0); break;
     case VT::String: {
@@ -1061,6 +1081,7 @@ std::shared_ptr<VBObject> makeAdoCommand(Interp&) {
                     if (rs->colTypes[c] < 0) {
                         const Variant& v = row[c];
                         rs->colTypes[c] = v.t == VT::Long || v.t == VT::Int ? 3 :
+                                           v.t == VT::Byte ? 17 : v.t == VT::Currency ? 6 : v.t == VT::Single ? 4 :
                                            v.t == VT::Double || v.t == VT::Date ? 5 :
                                            v.t == VT::String ? 200 :
                                            v.t == VT::Array ? 205 : v.t == VT::Bool ? 11 : 0;

@@ -6,6 +6,7 @@
 #include "objects.h"
 
 #include <cctype>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -104,6 +105,25 @@ static std::shared_ptr<VArray> makeStrArray(std::vector<Variant>&& items) {
     arr->data.assign(items.begin(), items.end());
     arr->allocated = true;
     return arr;
+}
+
+// ---------- numeric helpers ----------
+
+// Int (mode 0) and Fix (mode 1): the result keeps the argument's subtype
+static Variant roundKeepingType(const Variant& v, double (*f)(double), int mode) {
+    switch (v.t) {
+        case VT::Null:  return Variant::mkNull();
+        case VT::Byte: case VT::Int: case VT::Long: return v;
+        case VT::Empty: return Variant::mkI2(0);
+        case VT::Bool:  return Variant::mkI2(v.b ? -1 : 0);
+        case VT::Single: return Variant::mkSingle(f(v.d));
+        case VT::Currency: {
+            long long q = v.ll / CY_SCALE;                    // truncates toward zero
+            if (mode == 0 && v.ll < 0 && v.ll % CY_SCALE != 0) q--; // Int rounds down
+            return Variant::mkCur(q * CY_SCALE);
+        }
+        default: return Variant::mkDouble(f(toDouble(v)));
+    }
 }
 
 // ---------- date helpers ----------
@@ -694,18 +714,23 @@ void registerBuiltins(Interp& ip) {
         long long n = toInt64(A(a, 0)) & 0xFFFF;
         return Variant::mkStr(cpToUtf8((unsigned)n));
     });
+    // Hex/Oct: an Integer prints its 16-bit pattern (Hex(-1) = "FFFF"); any
+    // other value is rounded to a Long first (error 6 outside the Long range)
+    // and prints its 32-bit pattern. Null gives Null.
     reg1("Hex", 1, 1, [](std::vector<Variant>& a) -> Variant {
-        long long v = bankerRound(toDouble(A(a, 0)));
+        const Variant& v = A(a, 0);
+        if (v.isNull()) return Variant::mkNull();
+        uint32_t bits = v.t == VT::Int ? (uint16_t)v.ll : (uint32_t)toLongValue(v);
         char buf[32];
-        if (v < 0) std::snprintf(buf, sizeof buf, "%X", (unsigned int)(uint32_t)v);
-        else std::snprintf(buf, sizeof buf, "%llX", (unsigned long long)v);
+        std::snprintf(buf, sizeof buf, "%X", (unsigned)bits);
         return Variant::mkStr(buf);
     });
     reg1("Oct", 1, 1, [](std::vector<Variant>& a) -> Variant {
-        long long v = bankerRound(toDouble(A(a, 0)));
+        const Variant& v = A(a, 0);
+        if (v.isNull()) return Variant::mkNull();
+        uint32_t bits = v.t == VT::Int ? (uint16_t)v.ll : (uint32_t)toLongValue(v);
         char buf[32];
-        if (v < 0) std::snprintf(buf, sizeof buf, "%llo", (unsigned long long)(uint64_t)(uint32_t)v);
-        else std::snprintf(buf, sizeof buf, "%llo", (unsigned long long)v);
+        std::snprintf(buf, sizeof buf, "%o", (unsigned)bits);
         return Variant::mkStr(buf);
     });
 
@@ -724,16 +749,14 @@ void registerBuiltins(Interp& ip) {
         return Variant::mkLong(v);
     });
     reg1("CByte", 1, 1, [](std::vector<Variant>& a) -> Variant {
-        double d = toDouble(A(a, 0));
-        long long v = bankerRound(d);
-        if (v < 0 || v > 255) throwErr(6, errDesc(6));
-        return Variant::mkInt(v);
+        return Variant::mkByte(toByteValue(A(a, 0)));     // 0..255, banker's rounding
     });
     reg1("CDbl", 1, 1, [](std::vector<Variant>& a) -> Variant { return Variant::mkDouble(toDouble(A(a, 0))); });
-    reg1("CSng", 1, 1, [](std::vector<Variant>& a) -> Variant { return Variant::mkDouble((double)(float)toDouble(A(a, 0))); });
+    reg1("CSng", 1, 1, [](std::vector<Variant>& a) -> Variant {
+        return Variant::mkSingle(toSingleValue(A(a, 0))); // error 6 beyond the float range
+    });
     reg1("CCur", 1, 1, [](std::vector<Variant>& a) -> Variant {
-        double d = toDouble(A(a, 0));
-        return Variant::mkDouble(std::round(d * 10000.0) / 10000.0);
+        return Variant::mkCur(toCurrencyScaled(A(a, 0))); // 4 places, banker's rounding
     });
     reg1("CBool", 1, 1, [](std::vector<Variant>& a) -> Variant { return Variant::mkBool(toBool(A(a, 0))); });
     reg1("CDate", 1, 1, [](std::vector<Variant>& a) -> Variant {
@@ -767,19 +790,36 @@ void registerBuiltins(Interp& ip) {
         if (!any) return Variant::mkDouble(0);
         return Variant::mkDouble(std::strtod(s.substr(start, i - start).c_str(), nullptr));
     });
+    // Int, Fix, Abs and Round keep the numeric subtype of their argument
+    // (Byte, Integer, Long, Single, Double, Currency); Boolean and Empty give an
+    // Integer, a String a Double, and Null gives Null.
     reg1("Int", 1, 1, [](std::vector<Variant>& a) -> Variant {
-        double d = toDouble(A(a, 0));
-        return Variant::mkDouble(std::floor(d));
+        return roundKeepingType(A(a, 0), [](double d) { return std::floor(d); }, 0);
     });
     reg1("Fix", 1, 1, [](std::vector<Variant>& a) -> Variant {
-        double d = toDouble(A(a, 0));
-        return Variant::mkDouble(d < 0 ? std::ceil(d) : std::floor(d));
+        return roundKeepingType(A(a, 0), [](double d) { return std::trunc(d); }, 1);
     });
     reg1("Abs", 1, 1, [](std::vector<Variant>& a) -> Variant {
         const Variant& v = A(a, 0);
-        if (v.isNull()) return Variant::mkNull();
-        if (v.isIntegral()) return Variant::mkLong(v.ll < 0 ? -v.ll : v.ll);
-        return Variant::mkDouble(std::fabs(toDouble(v)));
+        switch (v.t) {
+            case VT::Null:  return Variant::mkNull();
+            case VT::Byte:  return v;
+            case VT::Empty: return Variant::mkI2(0);
+            case VT::Bool:  return Variant::mkI2(v.b ? 1 : 0);
+            case VT::Int: {
+                long long r = v.ll < 0 ? -v.ll : v.ll;   // Abs(-32768) is a Long
+                return r > 32767 ? Variant::mkLong(r) : Variant::mkI2(r);
+            }
+            case VT::Long: {
+                long long r = v.ll < 0 ? -v.ll : v.ll;   // Abs(-2147483648) is a Double
+                return r > 2147483647LL ? Variant::mkDouble((double)r) : Variant::mkLong(r);
+            }
+            case VT::Single: return Variant::mkSingle(std::fabs(v.d));
+            case VT::Currency:
+                if (v.ll == LLONG_MIN) throwErr(6, errDesc(6));
+                return Variant::mkCur(v.ll < 0 ? -v.ll : v.ll);
+            default: return Variant::mkDouble(std::fabs(toDouble(v)));
+        }
     });
     reg1("Sgn", 1, 1, [](std::vector<Variant>& a) -> Variant {
         double d = toDouble(A(a, 0));
@@ -801,8 +841,33 @@ void registerBuiltins(Interp& ip) {
     reg1("Tan", 1, 1, [](std::vector<Variant>& a) -> Variant { return Variant::mkDouble(std::tan(toDouble(A(a, 0)))); });
     reg1("Atn", 1, 1, [](std::vector<Variant>& a) -> Variant { return Variant::mkDouble(std::atan(toDouble(A(a, 0)))); });
     reg("Round", 1, 2, [](Interp&, std::vector<Variant>& a) -> Variant {
-        double d = toDouble(A(a, 0));
+        const Variant& v = A(a, 0);
         long long digits = a.size() >= 2 ? toInt64(A(a, 1)) : 0;
+        switch (v.t) {
+            case VT::Null:  return Variant::mkNull();
+            case VT::Byte: case VT::Int: case VT::Long: return v;
+            case VT::Empty: return Variant::mkI2(0);
+            case VT::Bool:  return Variant::mkI2(v.b ? -1 : 0);
+            case VT::Currency: {
+                if (digits >= 4) return v;
+                long long q = 1;
+                for (long long i = digits < 0 ? 0 : digits; i < 4; i++) q *= 10;
+                // banker's rounding of the scaled value to a multiple of q
+                long long m = v.ll < 0 ? -(v.ll / q) : v.ll / q, rem = v.ll % q;
+                if (rem < 0) rem = -rem;
+                if (rem * 2 > q || (rem * 2 == q && (m & 1))) m++;
+                __int128 r = (__int128)(v.ll < 0 ? -m : m) * q;
+                if (r > LLONG_MAX || r < LLONG_MIN) throwErr(6, errDesc(6));
+                return Variant::mkCur((long long)r);
+            }
+            case VT::Single: {
+                double scale = std::pow(10.0, (double)digits);
+                double r = bankerRound(v.d * scale) / scale;
+                return Variant::mkSingle(r == 0 ? 0 : r);
+            }
+            default: break;
+        }
+        double d = toDouble(v);
         double scale = std::pow(10.0, (double)digits);
         double r = bankerRound(d * scale) / scale;
         // normalize -0
@@ -823,7 +888,7 @@ void registerBuiltins(Interp& ip) {
             double d;
             return Variant::mkBool(parseNumericString(v.s, d));
         }
-        if (v.t == VT::Int || v.t == VT::Long || v.t == VT::Double) return Variant::mkBool(true);
+        if (v.isNumericSubtype()) return Variant::mkBool(true);
         return Variant::mkBool(false);
     });
     reg1("IsDate", 1, 1, [](std::vector<Variant>& a) -> Variant {

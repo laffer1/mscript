@@ -13,7 +13,16 @@
 #include <string>
 #include <vector>
 
-enum class VT { Empty, Null, Bool, Int, Long, Double, Date, String, Object, Array };
+// Byte, Single and Currency are VBScript's vbByte (17), vbSingle (4) and
+// vbCurrency (6) subtypes. They are listed last so the older names keep their
+// values.
+enum class VT { Empty, Null, Bool, Int, Long, Double, Date, String, Object, Array,
+                Byte, Single, Currency };
+
+// Currency is a 64-bit integer scaled by 10,000 (four decimal places), the
+// same layout as the OLE CY type: -922,337,203,685,477.5808 to
+// 922,337,203,685,477.5807.
+inline constexpr long long CY_SCALE = 10000;
 
 struct VBObject;
 struct VArray;
@@ -21,8 +30,8 @@ struct VArray;
 struct Variant {
     VT t = VT::Empty;
     bool b = false;                 // Bool
-    long long ll = 0;               // Int / Long
-    double d = 0.0;                 // Double / Date (days since 1899-12-30)
+    long long ll = 0;               // Int / Long / Byte; Currency scaled by CY_SCALE
+    double d = 0.0;                 // Double / Single (float value) / Date (days since 1899-12-30)
     std::string s;                  // String
     std::shared_ptr<VBObject> obj;  // Object (null obj == Nothing)
     std::shared_ptr<VArray> arr;    // Array
@@ -39,6 +48,10 @@ struct Variant {
     static Variant mkLong(long long x) { Variant v; v.t = VT::Long; v.ll = x; return v; }
     static Variant mkDouble(double x)  { Variant v; v.t = VT::Double; v.d = x; return v; }
     static Variant mkDate(double x)    { Variant v; v.t = VT::Date;   v.d = x; return v; }
+    static Variant mkI2(long long x)   { Variant v; v.t = VT::Int;    v.ll = x; return v; } // caller checks range
+    static Variant mkByte(long long x) { Variant v; v.t = VT::Byte;   v.ll = x; return v; } // caller checks 0..255
+    static Variant mkSingle(double x)  { Variant v; v.t = VT::Single; v.d = (double)(float)x; return v; } // caller checks range
+    static Variant mkCur(long long scaled) { Variant v; v.t = VT::Currency; v.ll = scaled; return v; }
     static Variant mkStr(std::string x){ Variant v; v.t = VT::String; v.s = std::move(x); return v; }
     static Variant mkObj(std::shared_ptr<VBObject> o) { Variant v; v.t = VT::Object; v.obj = std::move(o); return v; }
     static Variant mkArr(std::shared_ptr<VArray> a)    { Variant v; v.t = VT::Array;  v.arr = std::move(a); return v; }
@@ -48,9 +61,15 @@ struct Variant {
     bool isEmpty() const { return t == VT::Empty; }
     bool isNum() const {
         return t == VT::Int || t == VT::Long || t == VT::Double ||
-               t == VT::Bool || t == VT::Date || t == VT::Empty;
+               t == VT::Bool || t == VT::Date || t == VT::Empty ||
+               t == VT::Byte || t == VT::Single || t == VT::Currency;
     }
     bool isIntegral() const { return t == VT::Int || t == VT::Long; }
+    // the numeric subtypes IsNumeric reports True for
+    bool isNumericSubtype() const {
+        return t == VT::Int || t == VT::Long || t == VT::Double || t == VT::Byte ||
+               t == VT::Single || t == VT::Currency;
+    }
 };
 
 // Runtime error carrying a VBScript error number (e.g. 13 = Type mismatch).
@@ -145,7 +164,18 @@ bool toBool(const Variant& v);
 bool parseNumericString(const std::string& s, double& out); // "&H.."/"&O.."/decimal; "" -> 0
 
 long long bankerRound(double d);            // VB banker's rounding
-std::string formatDouble(double d);         // VB-style number -> string
+std::string formatDouble(double d);         // VB-style number -> string (15 significant digits)
+std::string formatSingle(double d);         // Single -> string (7 significant digits)
+std::string formatCurrency(long long scaled); // Currency -> string ("1.5", "-0.0001")
+
+// Conversions with VBScript's range checks (error 6 Overflow, 13 Type mismatch,
+// 94 Invalid use of Null), as used by CCur, CSng, CByte and the operators.
+long long toCurrencyScaled(const Variant& v);  // banker's rounding to 4 places
+long long curScaledFromDouble(double d);
+double toSingleValue(const Variant& v);        // float value, held in a double
+double singleFromDouble(double d);
+long long toByteValue(const Variant& v);       // banker's rounding, 0..255
+long long toLongValue(const Variant& v);       // banker's rounding, Long range (CLng)
 
 int varTypeOf(const Variant& v);            // vb* constants
 std::string typeNameOf(const Variant& v);

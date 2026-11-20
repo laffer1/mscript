@@ -895,7 +895,7 @@ static std::shared_ptr<MapObject> makeAdoStream() {
         auto arr = std::make_shared<VArray>();
         arr->base = 0;
         arr->dims = {(long long)take};
-        for (size_t i = 0; i < take; i++) arr->data.push_back(Variant::mkInt((unsigned char)data->buf[data->pos + i]));
+        for (size_t i = 0; i < take; i++) arr->data.push_back(Variant::mkByte((unsigned char)data->buf[data->pos + i]));
         arr->allocated = true;
         data->pos += take;
         return Variant::mkArr(arr);
