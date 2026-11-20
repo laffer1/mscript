@@ -85,8 +85,11 @@ int main(int argc, char** argv) {
                                : (unsigned)e.number;
             std::fprintf(stderr, "mscript: %s(%d): mscript runtime error '%08x': %s\n",
                          srcName.c_str(), e.line, hex, e.what());
+            std::fflush(stderr);
+            ip.shutdown(); // objects still alive get Class_Terminate after the error
             return 1;
         }
+        ip.shutdown(); // Class_Terminate for objects still alive at script end
         return ip.exitCode;
     } catch (ParseError& e) {
         std::fprintf(stderr, "mscript: %s(%d): syntax error: %s\n", srcName.c_str(), e.line, e.msg.c_str());

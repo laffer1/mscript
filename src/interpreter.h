@@ -7,6 +7,7 @@
 #include "ast.h"
 #include "variant.h"
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -58,11 +59,27 @@ struct ClassInfo {
     std::string defaultProp;          // name of the Default Property Get, if any
 };
 
+struct ClassInstance;
+
+// Class_Terminate bookkeeping shared by an Interp and every instance it
+// creates, so an instance released after the Interp is gone still finds it.
+struct TerminateQueue {
+    bool enabled = true;                            // false once the script has shut down
+    std::deque<std::shared_ptr<ClassInstance>> pending; // released, Class_Terminate not yet run
+};
+
 struct ClassInstance : VBObject {
     Interp* interp = nullptr;
     ClassInfo* cls = nullptr;
     Scope fields;                                   // parent = interp->global
-    std::shared_ptr<ClassInstance> self;
+    // Weak: a strong self reference would keep every instance alive forever.
+    // Me and method calls take a strong reference for as long as they run.
+    std::weak_ptr<ClassInstance> self;
+    std::shared_ptr<TerminateQueue> termQueue;
+    bool terminated = false;                        // automatic Class_Terminate has been queued
+
+    // Creates an instance whose release queues Class_Terminate (see interpreter.cpp).
+    static std::shared_ptr<ClassInstance> create(Interp& ip, ClassInfo& ci);
 
     Proc* findProc(const std::string& name, int kind) const;
     bool hasMember(const std::string& n) const override;
@@ -94,6 +111,11 @@ struct GotoSig { std::string label; };
 struct EndSig {};
 
 struct Interp {
+    // First member, so it is destroyed last: instances released while the
+    // rest of the Interp is torn down check it before queuing anything.
+    std::shared_ptr<TerminateQueue> termQueue = std::make_shared<TerminateQueue>();
+    int termDrainDepth = 0;
+
     Program* prog = nullptr;
     std::string sourceName;
     Scope global;
@@ -124,8 +146,23 @@ struct Interp {
     int callDepth = 0; // recursion guard for callProc (error 28 instead of stack overflow)
 
     Interp();
+    ~Interp();
+    Interp(const Interp&) = delete;
+    Interp& operator=(const Interp&) = delete;
     void load(Program& prog, const std::string& srcName);
     void run();
+    // End of script: release script-level variables, Static locals and the
+    // With stack, running Class_Terminate for each object that goes away.
+    // Objects kept alive only by a reference cycle are leaked, as in VBScript.
+    void shutdown();
+
+    // Class_Terminate: released instances are queued and run here, at the
+    // next statement boundary or procedure return.
+    void runPendingTerminators() {
+        if (!termQueue->pending.empty()) drainTerminators();
+    }
+    void drainTerminators();
+    void runTerminator(ClassInstance& inst, const std::shared_ptr<ClassInstance>& ref);
 
     // execution
     void execStmtList(const std::vector<Stmt*>& list, Frame& f);
@@ -137,6 +174,7 @@ struct Interp {
     ArgVal evalArg(Expr& e, Frame& f);
     void assignTarget(Expr& t, Variant v, bool isSet, Frame& f);
     Variant callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self);
+    Variant callProcBody(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self);
     Variant callByName(const std::string& lowerName, std::vector<ArgVal>& args);
     Variant instantiateClass(const std::string& name, std::vector<Expr*>& argExprs, Frame& f, int line);
     Variant* findVar(Frame& f, const std::string& name);
