@@ -9,13 +9,19 @@
 #include <cstdint>
 #include <cstdlib>
 
-static std::string joinContinuations(const std::string& src) {
+// Joins continued lines into one. lineOf[k] is the source line that
+// character k of the result came from, so tokens after a continuation keep
+// their real line numbers.
+static std::string joinContinuations(const std::string& src, std::vector<int>& lineOf) {
     std::string out;
     out.reserve(src.size());
+    lineOf.clear();
+    lineOf.reserve(src.size() + 1);
     size_t i = 0, n = src.size();
+    int line = 1;
     while (i < n) {
         char c = src[i];
-        if (c == '\n') { out += '\n'; i++; continue; }
+        if (c == '\n') { out += '\n'; lineOf.push_back(line); line++; i++; continue; }
         if (c == '\r') { i++; continue; }
         // detect " _" at end of line (underscore preceded by whitespace, then EOL)
         // line continuation: a '_' followed only by whitespace and a newline,
@@ -25,22 +31,29 @@ static std::string joinContinuations(const std::string& src) {
             while (j < n && (src[j] == ' ' || src[j] == '\t')) j++;
             if (j >= n || src[j] == '\n' || src[j] == '\r') {
                 i = j;
-                while (i < n && (src[i] == '\r' || src[i] == '\n')) i++;
                 out += ' ';
+                lineOf.push_back(line);
+                while (i < n && (src[i] == '\r' || src[i] == '\n')) {
+                    if (src[i] == '\n') line++;
+                    i++;
+                }
                 continue;
             }
         }
         out += c;
+        lineOf.push_back(line);
         i++;
     }
+    lineOf.push_back(line); // end of input
     return out;
 }
 
 std::vector<Token> lex(const std::string& srcIn) {
-    std::string src = joinContinuations(srcIn);
+    std::vector<int> lineOf;
+    std::string src = joinContinuations(srcIn, lineOf);
     std::vector<Token> toks;
     size_t i = 0, n = src.size();
-    int line = 1;
+    int line = 1; // source line of the token being scanned (from lineOf)
 
     bool sawSpace = false;
     bool afterDot = false; // previous token was '.', so keywords are member names
@@ -53,8 +66,9 @@ std::vector<Token> lex(const std::string& srcIn) {
     };
 
     while (i < n) {
+        line = lineOf[i];
         char c = src[i];
-        if (c == '\n') { push(TK::Newline, "\n"); line++; i++; continue; }
+        if (c == '\n') { push(TK::Newline, "\n"); i++; continue; }
         if (c == ' ' || c == '\t' || c == '\r') { sawSpace = true; i++; continue; }
 
         // comment: ' ...
@@ -207,7 +221,7 @@ std::vector<Token> lex(const std::string& srcIn) {
         throw ParseError{line, std::string("invalid character '") + c + "'"};
     }
 
-    Token end; end.k = TK::End; end.line = line;
+    Token end; end.k = TK::End; end.line = lineOf[n];
     toks.push_back(end);
     return toks;
 }

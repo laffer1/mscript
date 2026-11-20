@@ -865,14 +865,16 @@ void registerBuiltins(Interp& ip) {
     });
     reg1("UBound", 1, 2, [](std::vector<Variant>& a) -> Variant {
         const Variant& v = A(a, 0);
-        if (v.t != VT::Array || !v.arr || !v.arr->allocated) throwErr(9, errDesc(9));
-        long long dim = a.size() >= 2 ? toInt64(A(a, 1)) : (long long)v.arr->dims.size();
+        if (v.t != VT::Array || !v.arr) throwErr(13, errDesc(13));
+        if (!v.arr->allocated) throwErr(9, errDesc(9));
+        long long dim = a.size() >= 2 ? toInt64(A(a, 1)) : 1; // no dimension = the first
         if (dim < 1 || (size_t)dim > v.arr->dims.size()) throwErr(9, errDesc(9));
         return Variant::mkLong(v.arr->base + v.arr->dims[(size_t)dim - 1] - 1);
     });
     reg1("LBound", 1, 2, [](std::vector<Variant>& a) -> Variant {
         const Variant& v = A(a, 0);
-        if (v.t != VT::Array || !v.arr || !v.arr->allocated) throwErr(9, errDesc(9));
+        if (v.t != VT::Array || !v.arr) throwErr(13, errDesc(13));
+        if (!v.arr->allocated) throwErr(9, errDesc(9));
         long long dim = a.size() >= 2 ? toInt64(A(a, 1)) : 1;
         if (dim < 1 || (size_t)dim > v.arr->dims.size()) throwErr(9, errDesc(9));
         return Variant::mkLong(v.arr->base);

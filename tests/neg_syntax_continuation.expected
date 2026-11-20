@@ -1,0 +1,2 @@
+mscript: tests/neg_syntax_continuation.vbs(8): syntax error: expected expression (found '
+')

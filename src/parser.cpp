@@ -162,10 +162,11 @@ StmtPtr Parser::parseStatement() {
         }
         if ((w == "public" || w == "private") && peek(1).k == TK::Ident) {
             std::string w2 = lower(peek(1).text);
-            if (w2 == "default" && peek(2).k == TK::Ident && lower(peek(2).text) == "property") {
+            if (w2 == "default" && peek(2).k == TK::Ident &&
+                (lower(peek(2).text) == "property" || lower(peek(2).text) == "function")) {
                 advance(); advance(); // public/private default
-                StmtPtr s = parsePropDecl();
-                s->b = true; // marks the class's default property
+                StmtPtr s = lower(peek().text) == "property" ? parsePropDecl() : parseProcDecl(false);
+                s->b = true; // marks the class's default member
                 return s;
             }
             if (w2 == "sub" || w2 == "function" || w2 == "property") {
@@ -215,9 +216,10 @@ StmtPtr Parser::parseStatement() {
         if (w == "with") return parseWith();
         if (w == "sub") return parseProcDecl(true);
         if (w == "function") return parseProcDecl(false);
-        if (w == "default" && peek(1).k == TK::Ident && lower(peek(1).text) == "property") {
+        if (w == "default" && peek(1).k == TK::Ident &&
+            (lower(peek(1).text) == "property" || lower(peek(1).text) == "function")) {
             advance();
-            StmtPtr s = parsePropDecl();
+            StmtPtr s = lower(peek().text) == "property" ? parsePropDecl() : parseProcDecl(false);
             s->b = true;
             return s;
         }
@@ -381,6 +383,7 @@ StmtPtr Parser::parseIf() {
         // block form
         s->body = parseStatements({"elseif", "else", "end"});
         while (atIdent("elseif")) {
+            s->armLines.push_back(peek().line);
             advance();
             ExprPtr c = parseExpr();
             expectIdent("then");
@@ -415,6 +418,7 @@ StmtPtr Parser::parseSelect() {
     for (;;) {
         skipSeparators();
         if (atIdent("end")) { advance(); expectIdent("select"); break; }
+        s->armLines.push_back(peek().line);
         expectIdent("case");
         std::vector<ExprPtr> items;
         bool isElse = false;
@@ -494,6 +498,7 @@ StmtPtr Parser::parseDo() {
     if (atIdent("while")) { advance(); s->name = "while"; s->e = parseExpr(); }
     else if (atIdent("until")) { advance(); s->name = "until"; s->e = parseExpr(); }
     s->body = parseStatements({"loop"});
+    s->line2 = peek().line;
     expectIdent("loop");
     if (atIdent("while")) { advance(); s->name2 = "while"; s->e2 = parseExpr(); }
     else if (atIdent("until")) { advance(); s->name2 = "until"; s->e2 = parseExpr(); }

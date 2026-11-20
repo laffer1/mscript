@@ -1,0 +1,17 @@
+c02 centre c20
+c00
+c22/24
+True True
+with
+dict 1
+field
+2
+2
+one one 44
+42 10
+2
+too few: 450
+too many: 450
+missing: 438
+Set on Let-only: 438
+Let on Set-only: 438
