@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
             unsigned hex = (e.number >= 0 && e.number <= 0xFFFF)
                                ? (unsigned)(e.number | 0x800A0000)
                                : (unsigned)e.number;
-            std::fprintf(stderr, "mscript: %s(%d): Microsoft VBScript runtime error '%08x': %s\n",
+            std::fprintf(stderr, "mscript: %s(%d): runtime error '%08x': %s\n",
                          srcName.c_str(), e.line, hex, e.what());
             return 1;
         }
