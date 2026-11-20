@@ -32,7 +32,7 @@ Boom
 WScript.Echo "boom err=" & Err.Number
 On Error Goto 0
 
-' Null propagation
+' Null propagation (& treats a lone Null as "", so it doesn't propagate)
 Dim n
 n = Null
 WScript.Echo IsNull(n + 1), IsNull(n & "x"), IsNull(n = 5)

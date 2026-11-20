@@ -1,0 +1,30 @@
+count 6 6 6 3
+alpha /out:file.txt /V beta
+each: alpha
+each: /out:file.txt
+each: /V
+each: beta
+each: /mode:a:b
+each: /empty:
+0 alpha
+1 /out:file.txt
+2 /V
+3 beta
+4 /mode:a:b
+5 /empty:
+unnamed 2 2 alpha beta
+unnamed each: alpha
+unnamed each: beta
+named 4 4
+file.txt file.txt file.txt
+True True True 0
+a:b [] 8 True
+False True
+named each: out
+named each: V
+named each: mode
+named each: empty
+past end: 9 Subscript out of range
+negative: 9
+unnamed past end: 9
+non-numeric: 13

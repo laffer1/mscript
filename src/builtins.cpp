@@ -267,7 +267,7 @@ void registerConstants(Interp& ip) {
     add("vbBack", Variant::mkStr("\b"));
     add("vbNullString", Variant::mkStr(""));
     add("vbNullChar", Variant::mkStr(std::string("\0", 1)));
-    add("vbObjectError", Variant::mkLong(-2147352576LL)); // &H80040000 as Long
+    add("vbObjectError", Variant::mkLong(-2147221504LL)); // &H80040000 as Long
     add("vbBinaryCompare", Variant::mkInt(0));
     add("vbTextCompare", Variant::mkInt(1));
     add("vbSunday", Variant::mkInt(1));
