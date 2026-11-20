@@ -1,7 +1,7 @@
+#!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 Lucas Holt. All rights reserved.
 
-#!/bin/sh
 # mscript test runner: runs each tests/*.vbs and diffs output against tests/<name>.expected
 # neg_* tests are expected to fail (nonzero exit); their .expected holds the stderr text.
 cd "$(dirname "$0")/.." || exit 1

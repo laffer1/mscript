@@ -1,7 +1,7 @@
+#!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 Lucas Holt. All rights reserved.
 
-#!/bin/sh
 # tests/wine/run.sh — run Wine's VBScript conformance .vbs files under mscript.
 #
 # The wine test sources are LGPL and are NOT vendored into this repo; point

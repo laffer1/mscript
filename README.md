@@ -5,8 +5,9 @@ Clang compiler. Run `.vbs` scripts directly on any platform with a C++23 toolcha
 no WSH/cscript required.
 
 **Build requirements:** XML support (`MSXML2.DOMDocument`) is parsed with
-[bsdxml](https://github.com/bugaevc/serd) (expat 2) — on MidnightBSD/FreeBSD that's the
-system `libbsdxml` (`-lbsdxml`); HTTPS fetching (`MSXML2.XMLHTTP`) uses the system
+bsdxml, the MidnightBSD/FreeBSD base-system copy of
+[libexpat](https://github.com/libexpat/libexpat) (expat 2, MIT licence) — on MidnightBSD/FreeBSD
+that's the system `libbsdxml` (`-lbsdxml`); HTTPS fetching (`MSXML2.XMLHTTP`) uses the system
 `libfetch` (`-lfetch`); database access (`ADODB.*`) uses the base-system SQLite3
 (`-lsqlite3`). All are already linked by the Makefile.
 
@@ -217,5 +218,10 @@ Malicious or buggy input fails with a clean VBScript error, not a crash:
 ## License
 
 BSD 2-Clause — see [LICENSE](LICENSE). Copyright (c) 2026 Lucas Holt.
+
+XML parsing uses expat, which is under the MIT licence. On MidnightBSD/FreeBSD it comes
+from the base system as `libbsdxml`. If you ship a binary statically linked against
+[libexpat](https://github.com/libexpat/libexpat) (for example a static Linux build),
+include libexpat's MIT copyright and permission notice (its `COPYING` file) with it.
 
 VBScript, Windows Script Host, MSXML, ADODB and WinHTTP are trademarks of Microsoft Corporation; mscript is not affiliated with or endorsed by Microsoft.
