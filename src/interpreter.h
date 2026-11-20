@@ -86,6 +86,9 @@ struct ClassInstance : VBObject {
     bool hasMethod(const std::string& n) const override;
     bool hasDefault() const override;
     Variant getDefault() override;
+    std::vector<Variant> enumItems() override;   // For Each via hidden _NewEnum
+    Variant invoke(const std::vector<Variant>& args) override;             // obj(i) -> default Get
+    void assignInvoke(const std::vector<Variant>& args, const Variant& v) override;
     Variant getMember(const std::string& n) override;
     void setMember(const std::string& n, const Variant& v) override;
     Variant callMember(const std::string& n, std::vector<Variant>& args) override;
@@ -136,6 +139,7 @@ struct Interp {
 
     std::shared_ptr<VBObject> errObj;
     std::shared_ptr<VBObject> wscriptObj;
+    std::shared_ptr<VBObject> globalThis;   // Me at global scope
     std::vector<std::string> scriptArgs;
     std::string scriptFullName;
     int exitCode = 0;
@@ -150,6 +154,7 @@ struct Interp {
     Interp(const Interp&) = delete;
     Interp& operator=(const Interp&) = delete;
     void load(Program& prog, const std::string& srcName);
+    void hoistDecls(Stmt& st); // procs/classes/consts are compile-time
     void run();
     // End of script: release script-level variables, Static locals and the
     // With stack, running Class_Terminate for each object that goes away.
