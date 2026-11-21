@@ -45,7 +45,7 @@ std::vector<Variant> ClassInstance::enumItems() {
     if (cls) {
         if (Proc* p = findProc("_newenum", 0)) {
             std::vector<ArgVal> noargs;
-            Variant v = interp->callProc(*p, noargs, self);
+            Variant v = interp->callProc(*p, noargs, self.lock());
             if (v.t == VT::Array && v.arr && v.arr->allocated)
                 return std::vector<Variant>(v.arr->data.begin(), v.arr->data.end());
         }
@@ -76,7 +76,7 @@ Variant ClassInstance::getMember(const std::string& n0) {
     if (Proc* p = findProc(n, 0)) {
         if (p->params->empty()) {
             std::vector<ArgVal> noargs;
-            return interp->callProc(*p, noargs, self);
+            return interp->callProc(*p, noargs, self.lock());
         }
     }
     throwErr(438, errDesc(438));
@@ -117,7 +117,6 @@ Variant ClassInstance::callMember(const std::string& n, std::vector<Variant>& ar
     throwErr(438, errDesc(438));
 }
 
-<<<<<<< HEAD
 // ---------- Class_Terminate ----------
 //
 // VBScript objects are reference counted, and Class_Terminate runs once, when
@@ -268,6 +267,8 @@ void Interp::shutdown() {
     // down) is freed without running script code.
     termQueue->enabled = false;
     termQueue->pending.clear();
+}
+
 // obj(args) -> indexed default Property Get
 Variant ClassInstance::invoke(const std::vector<Variant>& args) {
     if (cls && !cls->defaultProp.empty()) {
@@ -299,7 +300,6 @@ void ClassInstance::assignInvoke(const std::vector<Variant>& args, const Variant
         }
     }
     VBObject::assignInvoke(args, v);
-}
 }
 
 // ---------- Interp ----------
