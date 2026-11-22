@@ -878,7 +878,8 @@ void Interp::execStmt(Stmt& s, Frame& f) {
             withStack.pop_back();
             break;
         }
-        if (v.t != VT::Object || !v.obj) throwErr(424, errDesc(424));
+        // no type check here: With pushes any value, and a dot-expression
+        // against a non-object fails with 424 when it is evaluated
         withStack.push_back(v);
         try {
             execStmtList(ptrVec(s.body), f);
@@ -1001,6 +1002,15 @@ void Interp::execStmt(Stmt& s, Frame& f) {
         if (s.b) { f.resumeNext = true; f.hasErrLabel = false; }
         else if (s.num == 0) { f.resumeNext = false; f.hasErrLabel = false; }
         else { f.resumeNext = false; f.hasErrLabel = true; f.errLabel = s.name; }
+        // vbscript clears the Err object on any On Error statement
+        if (errObj) {
+            auto* m = static_cast<MapObject*>(errObj.get());
+            m->props["number"] = Variant::mkLong(0);
+            m->props["description"] = Variant::mkStr("");
+            m->props["source"] = Variant::mkStr("");
+            m->props["helpfile"] = Variant::mkStr("");
+            m->props["helpcontext"] = Variant::mkLong(0);
+        }
         break;
     }
 
@@ -1062,7 +1072,10 @@ void Interp::execStmt(Stmt& s, Frame& f) {
 
 Variant Interp::evalMemberBase(Expr& e, Frame& f) {
     if (e.k == Expr::Var && e.name == "\x01" "with") {
-        if (withStack.empty() || withStack.back().t != VT::Object || !withStack.back().obj)
+        // a dot-expression with no enclosing With is an invalid use of the
+        // With-block object (505), not "object required" (424)
+        if (withStack.empty()) throwErr(505, errDesc(505));
+        if (withStack.back().t != VT::Object || !withStack.back().obj)
             throwErr(424, errDesc(424));
         return withStack.back();
     }

@@ -5,6 +5,6 @@ handler off
 1234 mysource custom problem
 boom err=11
 True False True
-null arith err=11
+null arith err=0
 subscript err=9
 survived
