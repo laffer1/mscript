@@ -45,6 +45,7 @@ struct Scope {
 struct Proc {
     std::string name;                 // lowercased
     bool isSub = true;
+    bool isPrivate = false;           // declared Private inside a class
     int propKind = 0;                 // 0 normal, 1 get, 2 let, 3 set
     const std::vector<Param>* params = nullptr; // owned by the AST
     std::vector<Stmt*> body;
@@ -82,9 +83,11 @@ struct ClassInstance : VBObject {
     static std::shared_ptr<ClassInstance> create(Interp& ip, ClassInfo& ci);
 
     Proc* findProc(const std::string& name, int kind) const;
+    bool isPrivateMember(const std::string& n) const; // Private field or proc
     bool hasMember(const std::string& n) const override;
     bool hasMethod(const std::string& n) const override;
     bool hasDefault() const override;
+    bool hasDefaultSetter() const override;
     Variant getDefault() override;
     std::vector<Variant> enumItems() override;   // For Each via hidden _NewEnum
     Variant invoke(const std::vector<Variant>& args) override;             // obj(i) -> default Get
@@ -188,6 +191,7 @@ struct Interp {
     Variant evalCall(Expr& call, Frame& f);
     ArgVal evalArg(Expr& e, Frame& f);
     void assignTarget(Expr& t, Variant v, bool isSet, Frame& f);
+    void checkMemberAccess(const VBObject* obj, const std::string& n, Frame& f);
     Variant callProc(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self);
     Variant callProcBody(Proc& p, std::vector<ArgVal>& args, std::shared_ptr<ClassInstance> self);
     Variant callByName(const std::string& lowerName, std::vector<ArgVal>& args);

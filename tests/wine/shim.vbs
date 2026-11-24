@@ -62,6 +62,21 @@ Class ShimTestObj
 End Class
 Dim testObj
 Set testObj = New ShimTestObj
+' wine's C testObj answers 10 for any keyword-named property get
+testObj.and = 10 : testObj.byref = 10 : testObj.byval = 10 : testObj.call = 10
+testObj.case = 10 : testObj.class = 10 : testObj.const = 10 : testObj.dim = 10
+testObj.do = 10 : testObj.each = 10 : testObj.else = 10 : testObj.elseif = 10
+testObj.empty = 10 : testObj.end = 10 : testObj.eqv = 10 : testObj.exit = 10
+testObj.false = 10 : testObj.for = 10 : testObj.function = 10 : testObj.get = 10
+testObj.goto = 10 : testObj.if = 10 : testObj.imp = 10 : testObj.in = 10
+testObj.is = 10 : testObj.let = 10 : testObj.loop = 10 : testObj.me = 10
+testObj.mod = 10 : testObj.new = 10 : testObj.next = 10 : testObj.not = 10
+testObj.nothing = 10 : testObj.null = 10 : testObj.on = 10 : testObj.option = 10
+testObj.or = 10 : testObj.preserve = 10 : testObj.private = 10 : testObj.property = 10
+testObj.public = 10 : testObj.redim = 10 : testObj.rem = 10 : testObj.resume = 10
+testObj.select = 10 : testObj.set = 10 : testObj.stop = 10 : testObj.sub = 10
+testObj.then = 10 : testObj.to = 10 : testObj.true = 10 : testObj.until = 10
+testObj.wend = 10 : testObj.while = 10 : testObj.with = 10 : testObj.xor = 10
 
 ' wine's unkObj is an IUnknown; any object keeps `obj is unkObj` working
 Dim unkObj
@@ -91,7 +106,12 @@ Sub testArray(n, a)
 End Sub
 
 Function isArrayFixed(a)
-    isArrayFixed = False
+    ' a fixed-size array (Dim a(n)) rejects ReDim with error 10; probe it
+    On Error Resume Next
+    Err.Clear
+    ReDim Preserve a(UBound(a))
+    isArrayFixed = (Err.Number = 10)
+    On Error Goto 0
 End Function
 
 Sub ok(cond, msg)

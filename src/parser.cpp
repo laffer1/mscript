@@ -163,17 +163,22 @@ StmtPtr Parser::parseStatement() {
         if ((w == "public" || w == "private") && peek(1).k == TK::Ident) {
             std::string w2 = lower(peek(1).text);
             if (w2 == "default" && peek(2).k == TK::Ident &&
-                (lower(peek(2).text) == "property" || lower(peek(2).text) == "function")) {
+                (lower(peek(2).text) == "property" || lower(peek(2).text) == "function" ||
+                 lower(peek(2).text) == "sub")) {
                 advance(); advance(); // public/private default
-                StmtPtr s = lower(peek().text) == "property" ? parsePropDecl() : parseProcDecl(false);
+                StmtPtr s = lower(peek().text) == "property" ? parsePropDecl()
+                          : parseProcDecl(lower(peek().text) == "sub");
                 s->b = true; // marks the class's default member
+                s->priv = (w == "private");
                 return s;
             }
             if (w2 == "sub" || w2 == "function" || w2 == "property") {
                 advance(); // public/private
-                if (w2 == "sub") return parseProcDecl(true);
-                if (w2 == "function") return parseProcDecl(false);
-                return parsePropDecl();
+                StmtPtr s = w2 == "sub" ? parseProcDecl(true)
+                          : w2 == "function" ? parseProcDecl(false)
+                          : parsePropDecl();
+                s->priv = (w == "private");
+                return s;
             }
             if (w2 == "const") {
                 advance(); advance(); // public/private const
@@ -196,6 +201,7 @@ StmtPtr Parser::parseStatement() {
             advance();
             auto s = std::make_unique<Stmt>();
             s->k = Stmt::Dim; s->line = line; s->name = w; // "static" persists
+            s->priv = (w == "private");
             s->decls = parseDeclList(false);
             return s;
         }
@@ -233,9 +239,11 @@ StmtPtr Parser::parseStatement() {
         if (w == "sub") return parseProcDecl(true);
         if (w == "function") return parseProcDecl(false);
         if (w == "default" && peek(1).k == TK::Ident &&
-            (lower(peek(1).text) == "property" || lower(peek(1).text) == "function")) {
+            (lower(peek(1).text) == "property" || lower(peek(1).text) == "function" ||
+             lower(peek(1).text) == "sub")) {
             advance();
-            StmtPtr s = lower(peek().text) == "property" ? parsePropDecl() : parseProcDecl(false);
+            StmtPtr s = lower(peek().text) == "property" ? parsePropDecl()
+                      : parseProcDecl(lower(peek().text) == "sub");
             s->b = true;
             return s;
         }
