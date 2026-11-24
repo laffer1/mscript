@@ -202,6 +202,29 @@ The interpreter binary.
 .It Pa /usr/local/share/man/man1/mscript.1
 This manual page.
 .El
+.Sh TESTING
+The source tree ships a test suite:
+.Dl make test
+runs every
+.Pa tests/*.vbs
+against its
+.Pa .expected
+output.
+.Pp
+.Dl make test-wine
+optionally runs Wine's VBScript conformance suite
+.Pq Pa tests/wine/run.sh
+under
+.Nm .
+The Wine test sources are LGPL and are not vendored; set
+.Ev WINE_VBS_DIR
+to a Wine source tree's
+.Pa dlls/vbscript/tests
+directory, e.g.
+.Qq /usr/mports/emulators/wine/work/wine-11.0/dlls/vbscript/tests .
+The harness shim
+.Pa tests/wine/shim.vbs
+supplies the globals Wine's C test runner injects.
 .Sh EXIT STATUS
 .Ex -std mscript
 Normally, the exit status is 0.
