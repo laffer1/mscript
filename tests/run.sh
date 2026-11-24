@@ -40,8 +40,8 @@ for t in tests/*.vbs tests/*.asp; do
     # .asp tests run as classic-ASP templates with a scratch state db and a
     # fixed query string; REQUEST_METHOD is left unset so output is body-only
     if [ "${t##*.}" = "asp" ]; then
-        MSCRIPT_ASP_STATE_DB="$tmp.db"
-        export MSCRIPT_ASP_STATE_DB
+        MScript_ASP_STATE_DB="$tmp.db"
+        export MScript_ASP_STATE_DB
         QUERY_STRING="name=mscript&n=42"
         export QUERY_STRING
     fi
