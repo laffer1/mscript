@@ -1,0 +1,18 @@
+mscript 1 b True True 3.5
+{"name":"mscript","nothing":null,"ok":true,"pi":3.5,"tags":["a","b"],"ver":1}
+[1,"x",true,null]
+"2026-11-24T13:14:15.000Z"
+{
+  "name": "mscript",
+  "nothing": null,
+  "ok": true,
+  "pi": 3.5,
+  "tags": [
+    "a",
+    "b"
+  ],
+  "ver": 1
+}
+{"a":1,"b":[1,2]}
+{"a":1}
+err=1001

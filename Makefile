@@ -7,7 +7,10 @@ CXX      = clang++
 CXXFLAGS = -std=c++23 -O2 -Wall -Wextra -Wno-unused-parameter
 SRC      != ls src/*.cpp
 HDR      != ls src/*.h
-LDLIBS   = -lbsdxml -lfetch -lsqlite3
+# JSON extension uses libucl: the base system library (libprivateucl) when
+# present, otherwise the ports libucl
+UCLLIB   != [ -e /usr/lib/libprivateucl.so ] && echo -lprivateucl || echo -lucl
+LDLIBS   = -lbsdxml -lfetch -lsqlite3 $(UCLLIB)
 
 mscript: $(SRC) $(HDR)
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(LDLIBS)

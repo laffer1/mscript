@@ -4,6 +4,7 @@
 #include "objects.h"
 #include "adodb.h"
 #include "interpreter.h"
+#include "json.h"
 #include "regexp.h"
 #include "xmldom.h"
 #include "xmlhttp.h"
@@ -1054,6 +1055,8 @@ static std::shared_ptr<MapObject> makeNetwork() {
 void registerHostObjects(Interp& ip) {
     ip.errObj = makeErr(ip);
     ip.global.vars["err"] = Variant::mkObj(ip.errObj);
+    // JSON extension (not part of VBScript): global JSON object with Parse/Stringify
+    ip.global.vars["json"] = Variant::mkObj(makeJson(ip));
     // Me at global scope is the script's global object
     auto gt = std::make_shared<MapObject>();
     gt->kind = "Global";
