@@ -15,6 +15,8 @@ that's the system `libbsdxml` (`-lbsdxml`); HTTPS fetching (`MSXML2.XMLHTTP`) us
 $ make                # builds ./mscript with clang++ -std=c++23 -lbsdxml -lfetch -lsqlite3
 $ ./mscript hello.vbs
 Hello, World!
+$ chmod +x hello.vbs   # a "#!" first line (e.g. #!/usr/local/bin/mscript) is
+$ ./hello.vbs          # ignored, so scripts can be run directly (extension)
 $ make test           # runs the test suite (every tests/*.vbs)
 passed: N  failed: 0
 $ make test-wine      # optional: Wine's VBScript conformance suite (see below)

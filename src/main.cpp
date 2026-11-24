@@ -68,6 +68,14 @@ int main(int argc, char** argv) {
             std::ostringstream ss;
             ss << in.rdbuf();
             code = ss.str();
+            // extension: a "#!" first line (shebang, e.g. #!/usr/local/bin/mscript)
+            // is ignored; blank it out but keep the newline so line numbers
+            // still match the file
+            if (code.compare(0, 2, "#!") == 0) {
+                size_t nl = code.find('\n');
+                if (nl == std::string::npos) code.clear();
+                else code.replace(0, nl, nl, ' ');
+            }
         }
 
         Program prog = Parser(lex(code)).parseProgram();
