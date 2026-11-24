@@ -37,8 +37,16 @@ Sub throwWithDesc()
     Err.Raise &hdeadbeef&, "", "test", "test.chm", 10
 End Sub
 
+' wine's collectionObj is an enumerable object with a reset method
+Class ShimColl
+    Sub reset()
+    End Sub
+    Function _NewEnum()
+        _NewEnum = Array(1, 2, 3)
+    End Function
+End Class
 Dim collectionObj
-collectionObj = Array(1, 2, 3)
+Set collectionObj = New ShimColl
 
 Sub reportSuccess()
     ' wine prints a success marker here; the TAP summary is printed by the footer
@@ -59,12 +67,27 @@ Set testObj = New ShimTestObj
 Dim unkObj
 Set unkObj = New ShimTestObj
 
+' wine's harness registers a global named "test" (the script global object);
+' at global scope Me is that same object
+Dim test
+Set test = Me
+
 Sub testDisp(o)
     ' wine's C harness exercises IDispatch on the object; nothing to check here
 End Sub
 
 Sub testArray(n, a)
-    Call ok(IsArray(a), "testArray: IsArray")
+    ' wine's harness checks the array has the expected number of dimensions
+    Dim good, i
+    good = IsArray(a)
+    If good And n >= 0 Then
+        For i = 1 To n
+            On Error Resume Next
+            good = good And (UBound(a, i) >= 0)
+            On Error Goto 0
+        Next
+    End If
+    Call ok(good, "testArray dims=" & n)
 End Sub
 
 Function isArrayFixed(a)

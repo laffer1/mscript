@@ -494,6 +494,11 @@ void registerBuiltins(Interp& ip) {
         reg(name, minA, maxA, [fn](Interp&, std::vector<Variant>& a) { return fn(a); });
     };
 
+    // Erl: line number of the statement currently executing
+    reg("Erl", 0, 0, [](Interp& ip, std::vector<Variant>&) -> Variant {
+        return Variant::mkLong(ip.cur ? ip.cur->curLine : 0);
+    });
+
     // ---- strings ----
     reg1("Len", 1, 1, [](std::vector<Variant>& a) -> Variant {
         if (A(a,0).t == VT::Array) throwErr(13, errDesc(13));

@@ -19,17 +19,53 @@ static std::string joinContinuations(const std::string& src, std::vector<int>& l
     lineOf.reserve(src.size() + 1);
     size_t i = 0, n = src.size();
     int line = 1;
+    bool inString = false;   // inside a string literal ("" is an escaped quote)
+    bool inComment = false;  // inside a ' comment (ends at the newline)
+    auto emit = [&](char ch) { out += ch; lineOf.push_back(line); };
     while (i < n) {
         char c = src[i];
-        if (c == '\n') { out += '\n'; lineOf.push_back(line); line++; i++; continue; }
+        if (c == '\n') { emit('\n'); inComment = false; line++; i++; continue; }
         if (c == '\r') { i++; continue; }
-        // detect " _" at end of line (underscore preceded by whitespace, then EOL)
+        if (inComment) { emit(c); i++; continue; }
+        if (inString) {
+            emit(c);
+            if (c == '"') {
+                if (i + 1 < n && src[i + 1] == '"') { emit('"'); i += 2; continue; }
+                inString = false;
+            }
+            i++;
+            continue;
+        }
+        if (c == '"') { inString = true; emit(c); i++; continue; }
+        if (c == '\'') { inComment = true; emit(c); i++; continue; }
+        // Rem comment: keyword at the start of a statement (line or after ':')
+        if (std::isalpha((unsigned char)c)) {
+            size_t j = i;
+            while (j < n && (std::isalnum((unsigned char)src[j]) || src[j] == '_')) j++;
+            std::string word = src.substr(i, j - i);
+            for (auto& ch : word) ch = (char)std::tolower((unsigned char)ch);
+            bool stmtStart = true;
+            for (size_t k = out.size(); k-- > 0;) {
+                char p = out[k];
+                if (p == ' ' || p == '\t') continue;
+                stmtStart = (p == '\n' || p == ':');
+                break;
+            }
+            if (word == "rem" && stmtStart && (j >= n || src[j] == ' ' || src[j] == '\t')) {
+                inComment = true;
+                for (size_t k = i; k < j; k++) emit(src[k]);
+                i = j;
+                continue;
+            }
+        }
         // line continuation: a '_' followed only by whitespace and a newline,
-        // regardless of what precedes it (VBScript allows "x =_")
+        // not part of an identifier and not inside a string/comment
+        // (VBScript allows "x =_" — no preceding space needed)
         if (c == '_') {
+            bool partOfIdent = i > 0 && (std::isalnum((unsigned char)out.back()) || out.back() == '_');
             size_t j = i + 1;
             while (j < n && (src[j] == ' ' || src[j] == '\t')) j++;
-            if (j >= n || src[j] == '\n' || src[j] == '\r') {
+            if (!partOfIdent && (j >= n || src[j] == '\n' || src[j] == '\r')) {
                 i = j;
                 out += ' ';
                 lineOf.push_back(line);
