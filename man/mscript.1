@@ -20,6 +20,11 @@ built with the system Clang compiler.
 It executes
 .Pa .vbs
 scripts directly, without WSH/cscript.
+As an extension, a
+.Qq #!
+first line (shebang, e.g.
+.Qq #!/usr/local/bin/mscript )
+is ignored, so an executable script can be run directly.
 .Pp
 The interpreter implements Variant semantics (Empty, Null, Boolean, Byte,
 Integer, Long, Single, Double, Currency, Date, String, arrays and objects), the
