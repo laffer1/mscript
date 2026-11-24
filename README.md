@@ -17,7 +17,26 @@ $ ./mscript hello.vbs
 Hello, World!
 $ make test           # runs the test suite (every tests/*.vbs)
 passed: N  failed: 0
+$ make test-wine      # optional: Wine's VBScript conformance suite (see below)
 ```
+
+Wine compatibility suite (optional): `tests/wine/run.sh` runs the `.vbs`
+conformance files from a local Wine source tree under mscript and prints a
+TAP-style report. The Wine test files are LGPL and are **not** vendored —
+point `WINE_VBS_DIR` at the wine port's extracted test directory:
+
+```
+$ WINE_VBS_DIR=/usr/mports/emulators/wine/work/wine-11.0/dlls/vbscript/tests make test-wine
+lang.vbs     ok=...  not-ok=...   (of ...)
+error.vbs    ok=...  not-ok=...   (of ...)
+regexp.vbs   ok=...  not-ok=...   (of ...)
+```
+
+`tests/wine/shim.vbs` provides the harness globals wine's C runner injects
+(`ok`, `getVT`, `testObj`, ...). Known remaining differences are reported as
+TAP `TODO` or documented in the PR: `getVT` cannot reproduce wine's ByRef
+`*` marker from a VBScript shim, and the HRESULT-to-VB-error table is built
+from Microsoft's documentation rather than Wine's table.
 
 Install the binary and its manual page system-wide (default prefix `/usr/local`):
 
@@ -158,7 +177,9 @@ Not part of VBScript; scripts that use them will not run under WSH.
 ├── src/adodb.{h,cpp}   ADODB Connection/Recordset/Command on SQLite3
 ├── tests/              .vbs tests + .expected outputs + run.sh (make test);
 │                       18_xmlhttp.vbs / 20_winhttp.vbs run against tests/httpserver.py
-│                       (python3, 127.0.0.1:18099)
+│                       (python3, 127.0.0.1:18099);
+│                       tests/wine/ runs Wine's conformance suite (make test-wine,
+│                       WINE_VBS_DIR; wine sources are not vendored — LGPL)
 ├── man/mscript.1       mdoc manual page (installed by make install)
 └── examples/demo.vbs   word-frequency report demo
 ```

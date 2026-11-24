@@ -65,6 +65,7 @@ struct Decl {                // Dim / ReDim / Public / Private entry
     std::string name;        // lowercased
     bool isArray = false;    // has parens
     bool dynamic = false;    // empty parens: Dim x()
+    bool isPrivate = false;  // declared Private inside a class
     std::vector<ExprPtr> dims;
     std::string asType;      // optional As clause (informational)
 };
@@ -86,6 +87,7 @@ struct Stmt {
     std::string name, name2, op;       // names / operator / option kind
     Variant lit;
     bool b = false, b2 = false, b3 = false;
+    bool priv = false;                 // declared Private inside a class
     long long num = 0;
     ExprPtr e, e2, e3;
     std::vector<ExprPtr> exprs;                      // case items, erase targets handled via decls

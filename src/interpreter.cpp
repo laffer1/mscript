@@ -35,8 +35,27 @@ bool ClassInstance::hasMember(const std::string& n) const {
     return false;
 }
 
+bool ClassInstance::isPrivateMember(const std::string& n) const {
+    if (!cls || n == "class_terminate") return false; // Class_Terminate is always callable
+    for (Decl* d : cls->fields) if (d->name == n && d->isPrivate) return true;
+    for (Proc* p : cls->procs) if (p->name == n && p->isPrivate) return true;
+    return false;
+}
+
+// Private members are visible only from inside the class's own methods
+void Interp::checkMemberAccess(const VBObject* obj, const std::string& n, Frame& f) {
+    auto* ci = dynamic_cast<const ClassInstance*>(obj);
+    if (ci && ci->isPrivateMember(n) && (!f.self || f.self->cls != ci->cls))
+        throwErr(438, errDesc(438));
+}
+
 bool ClassInstance::hasDefault() const {
     return cls && !cls->defaultProp.empty();
+}
+
+bool ClassInstance::hasDefaultSetter() const {
+    return cls && !cls->defaultProp.empty() &&
+           (findProc(cls->defaultProp, 2) || findProc(cls->defaultProp, 3));
 }
 
 std::vector<Variant> ClassInstance::enumItems() {
@@ -407,6 +426,7 @@ Proc* Interp::registerProc(Stmt& s, const std::string& className) {
     p->params = &s.params;
     for (auto& st : s.body) p->body.push_back(st.get());
     p->className = className;
+    p->isPrivate = s.priv;
     Proc* raw = p.get();
     procStore.push_back(std::move(p));
     if (className.empty()) procs[s.name] = raw;
@@ -418,10 +438,13 @@ void Interp::registerClass(Stmt& s) {
     ci.name = s.name;
     for (auto& m : s.members) {
         if (m->k == Stmt::Dim) {
-            for (auto& d : m->decls) ci.fields.push_back(&d);
+            for (auto& d : m->decls) {
+                d.isPrivate = m->priv;
+                ci.fields.push_back(&d);
+            }
         } else if (m->k == Stmt::SubDecl || m->k == Stmt::FuncDecl || m->k == Stmt::PropDecl) {
-            if ((m->k == Stmt::PropDecl || m->k == Stmt::FuncDecl) && m->b)
-                ci.defaultProp = m->name; // Default Property / Default Function
+            if (m->b) // Default Property / Default Function / Default Sub
+                ci.defaultProp = m->name;
             ci.procs.push_back(registerProc(*m, s.name));
         }
     }
@@ -430,6 +453,22 @@ void Interp::registerClass(Stmt& s) {
 
 // Procedure, class and const declarations are compile-time constructs in
 // VBScript: they are visible everywhere, even inside blocks that never execute.
+// collect every Dim name in a statement list (Dim is procedure-scoped in
+// VBScript, regardless of the block it appears in)
+static void collectDimsStmt(Stmt& st, std::vector<std::string>& out) {
+    if (st.k == Stmt::Dim && st.name != "static") // statics live in proc->statics
+        for (auto& d : st.decls) out.push_back(d.name);
+    for (auto& sub : st.body) collectDimsStmt(*sub, out);
+    for (auto& sub : st.body2) collectDimsStmt(*sub, out);
+    for (auto& sub : st.body3) collectDimsStmt(*sub, out);
+    for (auto& sub : st.members) collectDimsStmt(*sub, out);
+    for (auto& arm : st.arms)
+        for (auto& sub : arm.second) collectDimsStmt(*sub, out);
+}
+static void collectDims(const std::vector<Stmt*>& body, std::vector<std::string>& out) {
+    for (Stmt* st : body) collectDimsStmt(*st, out);
+}
+
 void Interp::hoistDecls(Stmt& st) {
     switch (st.k) {
         case Stmt::SubDecl: case Stmt::FuncDecl: case Stmt::PropDecl:
@@ -760,8 +799,24 @@ void Interp::execStmt(Stmt& s, Frame& f) {
         try {
             Variant coll = evalExpr(*s.e2, f);
             if (coll.t == VT::Array) {
-                if (!coll.arr || !coll.arr->allocated) throwErr(9, errDesc(9));
-                items.assign(coll.arr->data.begin(), coll.arr->data.end());
+                // an unallocated array (Dim a() with no ReDim) is simply empty
+                if (!coll.arr) throwErr(9, errDesc(9));
+                if (coll.arr->allocated) {
+                    // storage is row-major, but For Each walks the FIRST
+                    // dimension fastest (VBScript enumeration order)
+                    VArray& a = *coll.arr;
+                    long long total = a.totalSize();
+                    items.reserve((size_t)total);
+                    std::vector<long long> idx(a.dims.size(), a.base);
+                    for (long long k = 0; k < total; k++) {
+                        long long r = k;
+                        for (size_t d = 0; d < a.dims.size(); d++) {
+                            idx[d] = a.base + r % a.dims[d];
+                            r /= a.dims[d];
+                        }
+                        items.push_back(a.at(idx));
+                    }
+                }
             } else if (coll.t == VT::Object) {
                 if (!coll.obj) throwErr(424, errDesc(424));
                 items = coll.obj->enumItems();
@@ -793,7 +848,7 @@ void Interp::execStmt(Stmt& s, Frame& f) {
                 throw;
             }
         }
-        *cell = Variant(); // after For Each the loop variable is Empty
+        // after For Each the loop variable keeps its last value (VBScript)
         break;
     }
 
@@ -1086,6 +1141,8 @@ Variant Interp::evalMemberBase(Expr& e, Frame& f) {
 
 void Interp::assignTarget(Expr& t, Variant v, bool isSet, Frame& f) {
     if (isSet && v.t != VT::Object) throwErr(424, errDesc(424));
+    // assigning Nothing without Set is error 91 (Object variable not set)
+    if (!isSet && v.t == VT::Object && !v.obj) throwErr(91, errDesc(91));
     switch (t.k) {
     case Expr::Var: {
         if (ClassInstance* me = classMemberFor(f, t.name, true)) {
@@ -1111,7 +1168,7 @@ void Interp::assignTarget(Expr& t, Variant v, bool isSet, Frame& f) {
         }
         // obj = value on an object with a default setter dispatches to it
         // instead of replacing the object reference
-        if (!isSet && cell->t == VT::Object && cell->obj && cell->obj->hasDefault() && v.t != VT::Object) {
+        if (!isSet && cell->t == VT::Object && cell->obj && cell->obj->hasDefaultSetter() && v.t != VT::Object) {
             cell->obj->setMember("", v);
             return;
         }
@@ -1123,6 +1180,7 @@ void Interp::assignTarget(Expr& t, Variant v, bool isSet, Frame& f) {
     case Expr::Member: {
         Variant base = evalMemberBase(*t.a[0], f);
         if (base.t != VT::Object || !base.obj) throwErr(424, errDesc(424));
+        checkMemberAccess(base.obj.get(), t.name, f);
         if (auto* ci = dynamic_cast<ClassInstance*>(base.obj.get())) {
             std::vector<Variant> noargs;
             ci->letProp(t.name, noargs, v, isSet);
@@ -1257,6 +1315,7 @@ Variant Interp::evalCall(Expr& call, Frame& f) {
     if (callee.k == Expr::Member) {
         Variant base = evalMemberBase(*callee.a[0], f);
         if (base.t != VT::Object || !base.obj) throwErr(424, errDesc(424));
+        checkMemberAccess(base.obj.get(), callee.name, f);
         if (auto* ci = dynamic_cast<ClassInstance*>(base.obj.get()))
             return ci->getProp(callee.name, args); // keeps ByRef arguments
         if (base.obj->hasMethod(callee.name)) return base.obj->callMember(callee.name, vals);
@@ -1338,7 +1397,10 @@ Variant Interp::evalExpr(Expr& e, Frame& f) {
     }
     case Expr::Member: {
         Variant base = evalMemberBase(*e.a[0], f);
-        if (base.t == VT::Object && base.obj) return base.obj->getMember(e.name);
+        if (base.t == VT::Object && base.obj) {
+            checkMemberAccess(base.obj.get(), e.name, f);
+            return base.obj->getMember(e.name);
+        }
         throwErr(424, errDesc(424));
     }
     case Expr::Call:
@@ -1395,6 +1457,14 @@ Variant Interp::callProcBody(Proc& p, std::vector<ArgVal>& args, std::shared_ptr
         if (aliased) byRef.push_back({pm.name, args[i].ref});
     }
 
+    // Dim names exist (as Empty) from procedure entry, so an assignment that
+    // textually precedes the Dim statement assigns the local, not a global
+    {
+        std::vector<std::string> dims;
+        collectDims(p.body, dims);
+        for (auto& n : dims) (*f.scope)[n] = Variant();
+    }
+
     f.bodyList = &p.body;
     buildLabels(p.body, f.labelMap);
 
@@ -1438,6 +1508,12 @@ Variant Interp::callByName(const std::string& lowerName, std::vector<ArgVal>& ar
 // ---------- classes ----------
 
 Variant Interp::instantiateClass(const std::string& name, std::vector<Expr*>& argExprs, Frame& f, int line) {
+    // the built-in RegExp class always wins over a script class of the same
+    // name (as on Windows: there is no way to instantiate your own)
+    if (name == "regexp") {
+        auto host = createHostObject(*this, name);
+        if (host) return Variant::mkObj(host);
+    }
     auto it = classes.find(name);
     if (it == classes.end()) {
         // not a script-defined class: try a host ProgID (e.g. New RegExp)

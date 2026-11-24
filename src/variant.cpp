@@ -362,6 +362,9 @@ bool toBool(const Variant& v0) {
             if (parseNumericString(v.s, d)) return d != 0;
             throwErr(13, errDesc(13));
         }
+        case VT::Object:
+            if (!v.obj) throwErr(91, errDesc(91)); // Nothing used as a Boolean
+            throwErr(13, errDesc(13));
         default: throwErr(13, errDesc(13));
     }
 }
@@ -738,7 +741,10 @@ static bool isIntFamily(VT t) {
 // Operand subtype for arithmetic; objects with a default property take the
 // subtype of that value. Arrays and plain objects raise 13 later, through toDouble.
 static Variant arithOperand(const Variant& v) {
-    if (v.t == VT::Object && v.obj && v.obj->hasDefault()) return arithOperand(v.obj->getDefault());
+    if (v.t == VT::Object) {
+        if (!v.obj) throwErr(91, errDesc(91)); // Nothing in arithmetic
+        if (v.obj->hasDefault()) return arithOperand(v.obj->getDefault());
+    }
     return v;
 }
 
@@ -881,8 +887,11 @@ Variant opAdd(const Variant& a, const Variant& b) {
 }
 
 Variant opConcat(const Variant& a, const Variant& b) {
-    // Only Null & Null is Null; a single Null operand counts as "" (like Empty)
+    // Only Null & Null is Null; a single Null operand counts as "" (like Empty).
+    // Nothing (a null object) is an error 91 here.
     if (a.isNull() && b.isNull()) return Variant::mkNull();
+    if (a.t == VT::Object && !a.obj) throwErr(91, errDesc(91));
+    if (b.t == VT::Object && !b.obj) throwErr(91, errDesc(91));
     return Variant::mkStr((a.isNull() ? std::string() : toStr(a)) +
                           (b.isNull() ? std::string() : toStr(b)));
 }
@@ -952,7 +961,8 @@ static Variant logicOperand(const Variant& v) {
             return Variant::mkBool(toBool(v));
         }
         case VT::Object:
-            if (v.obj && v.obj->hasDefault()) return logicOperand(v.obj->getDefault());
+            if (!v.obj) throwErr(91, errDesc(91)); // Not Nothing etc.
+            if (v.obj->hasDefault()) return logicOperand(v.obj->getDefault());
             throwErr(13, errDesc(13));
         case VT::Array: throwErr(13, errDesc(13));
         default: return Variant::mkLong(toLongValue(v)); // Single, Double, Currency, Date

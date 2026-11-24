@@ -123,6 +123,7 @@ struct VBObject {
     virtual void assignInvoke(const std::vector<Variant>& args, const Variant& v); // obj(args) = v
     virtual std::vector<Variant> enumItems();                               // For Each support
     virtual bool hasDefault() const { return false; }                       // default property
+    virtual bool hasDefaultSetter() const { return false; }                 // default Let/Set
     virtual Variant getDefault() { throwErr(438, errDesc(438)); }
     virtual std::string objectKind() const { return "Object"; }
     virtual std::string toString();

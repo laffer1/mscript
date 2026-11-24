@@ -51,7 +51,7 @@ Option Base 0
 ' IsArray
 WScript.Echo IsArray(a), IsArray(5), VarType(a) - vbArray
 
-' multi-dim For Each order (row-major)
+' multi-dim For Each order (first dimension varies fastest, as in VBScript)
 Dim mm(1, 1)
 mm(0, 0) = "a" : mm(0, 1) = "b" : mm(1, 0) = "c" : mm(1, 1) = "d"
 Dim acc
