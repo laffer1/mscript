@@ -30,13 +30,21 @@ if command -v python3 >/dev/null 2>&1; then
 fi
 trap '[ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null' EXIT
 
-for t in tests/*.vbs; do
-    name=$(basename "$t" .vbs)
+for t in tests/*.vbs tests/*.asp; do
+    name=$(basename "$t"); name="${name%.*}"
     exp="tests/$name.expected"
     [ -f "$exp" ] || continue
     case "$name" in
     18_*|20_*) [ -n "$SRV_PID" ] || continue ;; # need the local test server
     esac
+    # .asp tests run as classic-ASP templates with a scratch state db and a
+    # fixed query string; REQUEST_METHOD is left unset so output is body-only
+    if [ "${t##*.}" = "asp" ]; then
+        MSCRIPT_ASP_STATE_DB="$tmp.db"
+        export MSCRIPT_ASP_STATE_DB
+        QUERY_STRING="name=mscript&n=42"
+        export QUERY_STRING
+    fi
     # tests/<name>.args, if present, replaces the default arguments
     # (whitespace-separated, no quoting or globbing)
     args="hello 42"
@@ -67,6 +75,6 @@ for t in tests/*.vbs; do
         ;;
     esac
 done
-rm -f "$tmp"
+rm -f "$tmp" "$tmp.db"
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

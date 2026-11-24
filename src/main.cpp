@@ -8,6 +8,7 @@
 #include "lexer.h"
 #include "objects.h"
 #include "parser.h"
+#include "asp.h"
 
 #include <cstdio>
 #include <cstring>
@@ -78,10 +79,20 @@ int main(int argc, char** argv) {
             }
         }
 
+        // extension: .asp files are classic-ASP templates (mixed HTML and
+        // <% %> code blocks); transform to plain VBScript before lexing
+        bool aspMode = srcName.size() >= 4 &&
+                       lower(srcName.substr(srcName.size() - 4)) == ".asp";
+        if (aspMode) code = aspToVbs(code);
+
         Program prog = Parser(lex(code)).parseProgram();
 
         Interp ip;
         initWScript(ip, srcName, srcName, scriptArgs);
+        if (aspMode) {
+            ip.aspMode = true;
+            registerAspObjects(ip, std::getenv("REQUEST_METHOD") != nullptr);
+        }
         ip.load(prog, srcName);
         try {
             ip.run();
@@ -94,9 +105,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "mscript: %s(%d): mscript runtime error '%08x': %s\n",
                          srcName.c_str(), e.line, hex, e.what());
             std::fflush(stderr);
+            if (aspMode) flushAspResponse(ip); // still emit the CGI response
             ip.shutdown(); // objects still alive get Class_Terminate after the error
             return 1;
         }
+        if (aspMode) flushAspResponse(ip);
         ip.shutdown(); // Class_Terminate for objects still alive at script end
         return ip.exitCode;
     } catch (ParseError& e) {

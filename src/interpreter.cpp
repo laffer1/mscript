@@ -3,6 +3,7 @@
 
 #include "interpreter.h"
 
+#include "asp.h"
 #include "builtins.h"
 #include "objects.h"
 #include "parser.h"
@@ -389,7 +390,11 @@ Interp::Interp() {
 
 Scope& Interp::curScope() { return cur ? *cur->scope : global; }
 
-void Interp::printOut(const std::string& s) { std::fwrite(s.data(), 1, s.size(), stdout); }
+void Interp::printOut(const std::string& s) {
+    // in ASP mode, Echo output goes to the Response body, not raw stdout
+    if (aspMode && aspResponseWrite(*this, s)) return;
+    std::fwrite(s.data(), 1, s.size(), stdout);
+}
 
 void Interp::seedRng(double s) {
     // VB Randomize semantics: seed from number

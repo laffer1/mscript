@@ -153,6 +153,8 @@ struct Interp {
     std::shared_ptr<VBObject> errObj;
     std::shared_ptr<VBObject> wscriptObj;
     std::shared_ptr<VBObject> globalThis;   // Me at global scope
+    bool aspMode = false;                   // running an .asp template
+    std::shared_ptr<VBObject> responseObj;  // ASP Response object, if any
     std::vector<std::string> scriptArgs;
     std::string scriptFullName;
     int exitCode = 0;

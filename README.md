@@ -155,6 +155,18 @@ WScript.Echo "sum = " & total        ' sum = 5050
   `JSON.Stringify(value [, replacer] [, space])` serializes back to JSON (dates as ISO 8601,
   `Empty`/`Null`/`Nothing` as `null`; `replacer` may be an array of keys to include, `space`
   a number 0–10 or a string for indentation). Parse errors raise VB error 1001
+- **Classic ASP templates (extension, for web servers / CGI)** — a file named `*.asp` is
+  transformed to plain VBScript before lexing: HTML text becomes `Response.Write`,
+  `<%= expr %>` becomes `Response.Write (expr)`, `<% code %>` runs as-is, `<%@ %>`
+  directives are dropped. The CGI object model is provided: `Request` (`QueryString`,
+  `Form`, `Cookies`, `ServerVariables`, `TotalBytes`, `BinaryRead`), `Response`
+  (`Write`, `BinaryWrite`, `Buffer`, `Flush`, `Clear`, `End`, `Redirect`, `AddHeader`,
+  `Cookies`, `Status`, `ContentType`, `Expires`), `Server` (`CreateObject`, `HTMLEncode`,
+  `URLEncode`, `MapPath`, `Execute`, `Transfer`, `ScriptTimeout`), and SQLite-backed
+  `Session` / `Application` state (`Session("k")` / `Application("k")`, values serialized
+  as JSON) stored in `/var/db/mscript/asp-state.db` (override with `MScript_ASP_STATE_DB`).
+  Under a web server (`REQUEST_METHOD` set) the CGI headers are emitted automatically.
+  With Apache `mod_cgi`: `AddHandler cgi-script .asp` + `#!/usr/local/bin/mscript`.
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
@@ -185,6 +197,8 @@ Not part of VBScript; scripts that use them will not run under WSH.
 ├── src/regexp.{h,cpp}  VBScript.RegExp on the libc POSIX regex
 ├── src/adodb.{h,cpp}   ADODB Connection/Recordset/Command on SQLite3
 ├── src/json.{h,cpp}    JSON extension object on the base-system libucl
+├── src/asp.{h,cpp}     classic-ASP extension: .asp templates + CGI object model,
+│                       Session/Application state in SQLite (/var/db/mscript)
 ├── tests/              .vbs tests + .expected outputs + run.sh (make test);
 │                       18_xmlhttp.vbs / 20_winhttp.vbs run against tests/httpserver.py
 │                       (python3, 127.0.0.1:18099);

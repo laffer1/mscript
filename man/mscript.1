@@ -26,6 +26,40 @@ first line (shebang, e.g.
 .Qq #!/usr/local/bin/mscript )
 is ignored, so an executable script can be run directly.
 .Pp
+As an extension for web servers, a script named
+.Pa *.asp
+is treated as a classic ASP template: HTML text becomes
+.Dv Response.Write ,
+.Qq <% Ar expr %>
+becomes
+.Qq Response.Write ( expr ) ,
+.Qq <% Ar code %>
+runs as-is and
+.Qq <%@ Ar directive %>
+is dropped.
+The CGI object model is provided:
+.Dv Request
+.Pq Dv QueryString , Form , Cookies , ServerVariables , TotalBytes , BinaryRead ) ,
+.Dv Response
+.Pq Dv Write , BinaryWrite , Buffer , Flush , Clear , End , Redirect , AddHeader , Cookies , Status , ContentType , Expires ) ,
+.Dv Server
+.Pq Dv CreateObject , HTMLEncode , URLEncode , MapPath , Execute , Transfer , ScriptTimeout ) ,
+and
+.Dv Session Ns / Dv Application
+state backed by SQLite in
+.Pa /var/db/mscript/asp-state.db
+(override with the
+.Ev MScript_ASP_STATE_DB
+environment variable).
+When
+.Ev REQUEST_METHOD
+is set (CGI), the
+.Qq Status: ,
+.Qq Content-Type:
+and
+.Qq Set-Cookie:
+headers are emitted before the body.
+.Pp
 The interpreter implements Variant semantics (Empty, Null, Boolean, Byte,
 Integer, Long, Single, Double, Currency, Date, String, arrays and objects), the
 full VBScript operator
