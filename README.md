@@ -146,6 +146,13 @@ WScript.Echo "sum = " & total        ' sum = 5050
   **HTTP fetching** uses the system libfetch, linked via `-lfetch`;
   **regular expressions** use the libc POSIX regex (`regcomp`/`regexec`, no extra library);
   **database access** uses the base-system SQLite3, linked via `-lsqlite3`
+- **JSON (extension, not part of VBScript)** — a global `JSON` object with JavaScript-style
+  methods, parsed with the base-system libucl (`-lprivateucl`, ports `-lucl` as fallback):
+  `JSON.Parse(text)` returns objects as dictionaries-like objects (keys are case-insensitive,
+  as VBScript properties are), arrays, strings, numbers, booleans and `Null`;
+  `JSON.Stringify(value [, replacer] [, space])` serializes back to JSON (dates as ISO 8601,
+  `Empty`/`Null`/`Nothing` as `null`; `replacer` may be an array of keys to include, `space`
+  a number 0–10 or a string for indentation). Parse errors raise VB error 1001
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
@@ -175,6 +182,7 @@ Not part of VBScript; scripts that use them will not run under WSH.
 ├── src/xmlhttp.{h,cpp} MSXML2.XMLHTTP + WinHttp.WinHttpRequest.5.1 client (raw HTTP/1.1 + libfetch)
 ├── src/regexp.{h,cpp}  VBScript.RegExp on the libc POSIX regex
 ├── src/adodb.{h,cpp}   ADODB Connection/Recordset/Command on SQLite3
+├── src/json.{h,cpp}    JSON extension object on the base-system libucl
 ├── tests/              .vbs tests + .expected outputs + run.sh (make test);
 │                       18_xmlhttp.vbs / 20_winhttp.vbs run against tests/httpserver.py
 │                       (python3, 127.0.0.1:18099);

@@ -303,6 +303,32 @@ libfetch
 and SQLite3 from the base system
 .Pq Fl lsqlite3 ;
 regular expressions use the libc POSIX regex, no extra library.
+.Pp
+As an extension (not part of VBScript), a global
+.Dv JSON
+object provides JavaScript-style
+.Dv Parse
+and
+.Dv Stringify
+methods, parsed with the base-system libucl
+.Pq Fl lprivateucl ,
+ports libucl
+.Pq Fl lucl
+as fallback.
+.Dv JSON.Parse Ar text
+returns objects (keys are case-insensitive, like VBScript properties), arrays,
+strings, numbers, Booleans and
+.Dv Null ;
+parse errors raise VB error 1001.
+.Dv JSON.Stringify Ar value Op Ar replacer Op Ar space
+serializes back (dates as ISO 8601,
+.Dv Empty Ns / Dv Null Ns / Dv Nothing
+as
+.Qq null ) ;
+.Ar replacer
+may be an array of keys to include and
+.Ar space
+a number 0-10 or string for indentation.
 .Dv ADODB
 recordsets materialize the full result in memory; the
 .Dv recordsAffected
