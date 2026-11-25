@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -645,37 +646,60 @@ std::string stateDbPath() {
     return "/var/db/mscript/asp-state.db";
 }
 
+// A private state directory: refuse anything another local user could have
+// prepared in advance (a symlink, a directory they own, or one they can
+// write to). Our own directory with read-only group/other bits is tightened.
+bool privateDir(const std::string& dir) {
+    if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    struct stat st;
+    if (lstat(dir.c_str(), &st) != 0) return false;
+    if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid()) return false;
+    if (st.st_mode & 022) return false; // was writable by others: may hold planted files
+    if ((st.st_mode & 077) && chmod(dir.c_str(), 0700) != 0) return false;
+    return true;
+}
+
+std::string g_dbPath; // the state db actually opened (the lock file sits next to it)
+
 sqlite3* stateDb() {
     static sqlite3* db = []() -> sqlite3* {
         std::string path = stateDbPath();
         const char* env = std::getenv("MScript_ASP_STATE_DB");
-        if (!env || !*env) {
-            // default location: /var/db/mscript, owner-only
-            std::error_code ec;
-            std::filesystem::create_directories("/var/db/mscript", ec);
-            std::filesystem::permissions("/var/db/mscript",
-                                         std::filesystem::perms::owner_all,
-                                         std::filesystem::perm_options::replace, ec);
-        } else {
-            std::error_code ec;
-            std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-        }
-        umask(0077); // state files must be owner-only
-        sqlite3* d = nullptr;
-        if (sqlite3_open(path.c_str(), &d) != SQLITE_OK) {
-            if (d) sqlite3_close(d);
-            // site-specific private fallback (never a shared /tmp file)
-            std::string dir = "/tmp/mscript-asp-" + std::to_string((long long)getuid());
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-            std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
-                                         std::filesystem::perm_options::replace, ec);
-            path = dir + "/asp-state.db";
-            if (sqlite3_open(path.c_str(), &d) != SQLITE_OK) {
+        // the umask only covers creating the state files; restored below so
+        // files the script itself creates keep the normal permissions
+        // (SQLite gives its -wal/-shm files the db file's own mode)
+        mode_t oldMask = umask(0077);
+        auto open = [](const std::string& p, int extra) -> sqlite3* {
+            sqlite3* d = nullptr;
+            if (sqlite3_open_v2(p.c_str(), &d, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | extra,
+                                nullptr) != SQLITE_OK) {
                 if (d) sqlite3_close(d);
                 return nullptr;
             }
+            return d;
+        };
+        sqlite3* d = nullptr;
+        if (env && *env) {
+            // administrator-chosen location
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+            d = open(path, 0);
+        } else if (privateDir("/var/db/mscript")) {
+            d = open(path, SQLITE_OPEN_NOFOLLOW);
         }
+        if (!d) {
+            // per-user private fallback; the name is predictable, so it is only
+            // used when privateDir verifies we own it exclusively, and the db
+            // file itself must not be a symlink
+            std::string dir = "/tmp/mscript-asp-" + std::to_string((long long)geteuid());
+            if (privateDir(dir)) {
+                path = dir + "/asp-state.db";
+                d = open(path, SQLITE_OPEN_NOFOLLOW);
+            }
+        }
+        umask(oldMask);
+        if (!d) return nullptr; // fail closed: state calls raise "database unavailable"
+        g_dbPath = path;
         chmod(path.c_str(), 0600);
         // concurrent CGI requests share this file: wait for a competing
         // writer instead of failing immediately with SQLITE_BUSY
@@ -996,15 +1020,10 @@ bool metaClaim(const std::string& k) {
 // cross-process lock for Application.Lock/Unlock (flock on a file next to the db)
 int appLockFd() {
     static int fd = []() -> int {
-        std::string path = stateDbPath() + ".lock";
-        int f = open(path.c_str(), O_RDWR | O_CREAT, 0600);
-        if (f < 0) {
-            std::string dir = "/tmp/mscript-asp-" + std::to_string((long long)getuid());
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-            f = open((dir + "/asp-state.lock").c_str(), O_RDWR | O_CREAT, 0600);
-        }
-        return f;
+        if (!stateDb() || g_dbPath.empty()) return -1;
+        // next to the db actually in use; never follow a planted symlink
+        std::string path = g_dbPath + ".lock";
+        return open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     }();
     return fd;
 }
