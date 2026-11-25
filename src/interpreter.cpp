@@ -499,6 +499,14 @@ void Interp::hoistDecls(Stmt& st) {
         for (auto& sub : arm.second) hoistDecls(*sub);
 }
 
+bool Interp::callGlobalProc(const std::string& name) {
+    auto it = procs.find(lower(name));
+    if (it == procs.end()) return false;
+    std::vector<ArgVal> noargs;
+    callProc(*it->second, noargs, nullptr);
+    return true;
+}
+
 void Interp::load(Program& p, const std::string& srcName) {
     prog = &p;
     sourceName = srcName;

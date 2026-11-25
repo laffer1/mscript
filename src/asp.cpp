@@ -58,13 +58,36 @@ void emitLiteral(std::string& out, const std::string& lit) {
 
 } // namespace
 
-std::string aspToVbs(const std::string& src) {
+std::string aspToVbs(const std::string& src, bool dropText) {
     std::string out;
     out.reserve(src.size() + src.size() / 3 + 16);
     std::string lit;
     bool skipNl = false; // a <%@ %> directive also swallows the following newline
+    // dropText: only code blocks are kept (global.asa — its HTML is never rendered)
+    auto emitLit = [&](std::string& o, const std::string& l) { if (!dropText) emitLiteral(o, l); };
     size_t i = 0, n = src.size();
     while (i < n) {
+        // <script runat="server"> ... </script> blocks (global.asa style)
+        if (i + 7 <= n && lower(src.substr(i, 7)) == "<script") {
+            size_t tagEnd = src.find('>', i + 7);
+            if (tagEnd != std::string::npos) {
+                std::string tag = lower(src.substr(i, tagEnd - i));
+                if (tag.find("runat") != std::string::npos &&
+                    tag.find("server") != std::string::npos) {
+                    emitLit(out, lit);
+                    lit.clear();
+                    size_t close = std::string::npos;
+                    for (size_t j = tagEnd + 1; j + 8 <= n; j++)
+                        if (lower(src.substr(j, 8)) == "</script") { close = j; break; }
+                    if (close == std::string::npos) close = n;
+                    std::string code = src.substr(tagEnd + 1, close - (tagEnd + 1));
+                    out += code;
+                    if (!code.empty() && code.back() != '\n') out += '\n';
+                    i = (close >= n) ? n : close + 9; // skip "</script>" incl. '>'
+                    continue;
+                }
+            }
+        }
         if (src.compare(i, 2, "<%") == 0) {
             if (skipNl) {
                 // swallow the newline(s) immediately after the directive line
@@ -72,7 +95,7 @@ std::string aspToVbs(const std::string& src) {
                     lit.erase(lit.begin());
             }
             skipNl = false;
-            emitLiteral(out, lit);
+            emitLit(out, lit);
             lit.clear();
             size_t close = src.find("%>", i + 2);
             if (close == std::string::npos) close = n; // unterminated: rest is code
@@ -90,7 +113,7 @@ std::string aspToVbs(const std::string& src) {
             lit += src[i++];
         }
     }
-    emitLiteral(out, lit);
+    emitLit(out, lit);
     return out;
 }
 
@@ -219,12 +242,24 @@ struct AspResponse {
     std::string body;
     std::string status = "200 OK";
     std::string contentType = "text/html";
+    std::string charset;                                        // appended to Content-Type
+    std::string cacheControl;                                   // Cache-Control header
+    std::string pics;                                           // PICS-Label header
+    std::string expiresAbs;                                     // Expires header (absolute)
     std::vector<std::pair<std::string, std::string>> headers; // extra headers
-    std::vector<std::string> cookies;                          // Set-Cookie values
+    std::map<std::string, std::shared_ptr<MapObject>> outCookies; // Response.Cookies(name)
     bool buffer = true;
     bool headersSent = false;
     bool ended = false;
 };
+
+// format a VB date serial as an HTTP date (RFC 1123)
+std::string httpDate(double serial) {
+    time_t t = (time_t)((serial - 25569.0) * 86400.0); // 1899-12-30 -> unix epoch
+    char buf[64];
+    std::strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", std::gmtime(&t));
+    return buf;
+}
 
 // one interpreter per CGI process
 std::shared_ptr<AspResponse> g_resp;
@@ -254,6 +289,23 @@ void syncRespProps() {
         g_resp->headers.push_back({"Expires", buf});
         g_respObj->props.erase(it);
     }
+    // one-shot property writes: move them into the response state once
+    auto take = [&](const char* prop, std::string& field, const char* what) {
+        auto i2 = g_respObj->props.find(prop);
+        if (i2 != g_respObj->props.end() && i2->second.t != VT::Empty) {
+            field = cleanHeaderText(toStr(i2->second), what);
+            g_respObj->props.erase(i2);
+        }
+    };
+    take("cachecontrol", g_resp->cacheControl, "CacheControl");
+    take("pics", g_resp->pics, "PICS");
+    take("charset", g_resp->charset, "Charset");
+    auto eit = g_respObj->props.find("expiresabsolute");
+    if (eit != g_respObj->props.end() && eit->second.t != VT::Empty) {
+        if (eit->second.t == VT::Date) g_resp->expiresAbs = httpDate(eit->second.d);
+        else g_resp->expiresAbs = cleanHeaderText(toStr(eit->second), "ExpiresAbsolute");
+        g_respObj->props.erase(eit);
+    }
 }
 
 void ensureHeaders() {
@@ -263,8 +315,36 @@ void ensureHeaders() {
     syncRespProps();
     std::string h;
     if (g_resp->status != "200 OK") h += "Status: " + g_resp->status + "\r\n";
-    h += "Content-Type: " + g_resp->contentType + "\r\n";
-    for (auto& c : g_resp->cookies) h += "Set-Cookie: " + c + "\r\n";
+    h += "Content-Type: " + g_resp->contentType +
+         (g_resp->charset.empty() ? "" : "; charset=" + g_resp->charset) + "\r\n";
+    if (!g_resp->cacheControl.empty()) h += "Cache-Control: " + g_resp->cacheControl + "\r\n";
+    if (!g_resp->pics.empty()) h += "PICS-Label: " + g_resp->pics + "\r\n";
+    if (!g_resp->expiresAbs.empty()) h += "Expires: " + g_resp->expiresAbs + "\r\n";
+    for (auto& [name, ck] : g_resp->outCookies) {
+        // Response.Cookies("name") objects carry value + attributes as props
+        std::string c = cleanHeaderText(name, "cookie name") + "=" +
+                        urlEncode(toStr(ck->props.count("value") ? ck->props["value"] : Variant()));
+        auto attr = [&](const char* k) -> std::string {
+            auto i2 = ck->props.find(k);
+            return i2 == ck->props.end() ? "" : toStr(i2->second);
+        };
+        std::string path = attr("path");
+        if (!path.empty()) c += "; path=" + cleanHeaderText(path, "cookie path");
+        auto eit = ck->props.find("expires");
+        if (eit != ck->props.end() && eit->second.t == VT::Date)
+            c += "; expires=" + httpDate(eit->second.d);
+        else {
+            std::string ex = attr("expires");
+            if (!ex.empty()) c += "; expires=" + cleanHeaderText(ex, "cookie expires");
+        }
+        std::string dom = attr("domain");
+        if (!dom.empty()) c += "; domain=" + cleanHeaderText(dom, "cookie domain");
+        auto sit = ck->props.find("secure");
+        if (sit != ck->props.end() && toBool(sit->second)) c += "; secure";
+        auto hit = ck->props.find("httponly");
+        if (hit != ck->props.end() && toBool(hit->second)) c += "; httponly";
+        h += "Set-Cookie: " + c + "\r\n";
+    }
     for (auto& kv : g_resp->headers) h += kv.first + ": " + kv.second + "\r\n";
     h += "\r\n";
     std::fwrite(h.data(), 1, h.size(), stdout);
@@ -319,6 +399,7 @@ std::shared_ptr<MapObject> makeColl(std::map<std::string, std::string> data, con
         for (auto& kv : data) out.push_back(Variant::mkStr(kv.first));
         return out;
     };
+    c->methods["item"] = c->onInvoke; // collection .Item(key), same as the default call
     return c;
 }
 
@@ -444,6 +525,59 @@ void stateRemoveAll(const std::string& sid) {
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
+}
+
+void stateRemove(bool isSession, const std::string& sid, const std::string& k) {
+    sqlite3* db = stateDb();
+    if (!db) return;
+    sqlite3_stmt* st = nullptr;
+    const char* sql = isSession
+        ? "DELETE FROM sessions WHERE sid=?1 AND k=?2"
+        : "DELETE FROM app WHERE k=?1";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) return;
+    if (isSession) {
+        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
+    } else {
+        std::string ak = appKey(k);
+        sqlite3_bind_text(st, 1, ak.data(), (int)ak.size(), SQLITE_TRANSIENT);
+    }
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+long long stateCount(bool isSession, const std::string& sid) {
+    sqlite3* db = stateDb();
+    if (!db) return 0;
+    sqlite3_stmt* st = nullptr;
+    // instr() prefix match avoids LIKE wildcard issues in the app namespace
+    const char* sql = isSession
+        ? "SELECT COUNT(*) FROM sessions WHERE sid=?1"
+        : "SELECT COUNT(*) FROM app WHERE instr(k, ?1)=1";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) return 0;
+    if (isSession) {
+        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    } else {
+        std::string ns = g_appNs + "|";
+        sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
+    }
+    long long n = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+void stateRemoveAllKeys(bool isSession, const std::string& sid) {
+    if (isSession) { stateRemoveAll(sid); return; }
+    sqlite3* db = stateDb();
+    if (!db) return;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "DELETE FROM app WHERE instr(k, ?1)=1", -1, &st, nullptr) != SQLITE_OK)
+        return;
+    std::string ns = g_appNs + "|";
+    sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
 }
 
 void sessionTouch(const std::string& sid) {
@@ -732,9 +866,57 @@ std::string stateKeyOf(std::vector<Variant>& a) {
     return lower(toStr(a[0]));
 }
 
-// stateful collection object backed by the sqlite store
-std::shared_ptr<MapObject> makeStateColl(Interp& ip, bool isSession, std::shared_ptr<std::string> sid) {
+// Session.Contents / Application.Contents: the documented collection view
+// (Count, Item, Remove, RemoveAll) over the same sqlite-backed store
+std::shared_ptr<MapObject> makeContentsColl(bool isSession, std::shared_ptr<std::string> sid) {
     auto c = std::make_shared<MapObject>();
+    c->kind = "Contents";
+    c->onInvoke = [isSession, sid](MapObject*, std::vector<Variant>& a) -> Variant {
+        return fromJsonText(stateGet(isSession, isSession ? *sid : "", stateKeyOf(a)));
+    };
+    c->onAssignInvoke = [isSession, sid](MapObject*, std::vector<Variant>& a, const Variant& v) {
+        stateSet(isSession, isSession ? *sid : "", stateKeyOf(a), toJsonText(v));
+    };
+    c->methods["item"] = c->onInvoke;
+    c->methods["count"] = [isSession, sid](MapObject*, std::vector<Variant>&) -> Variant {
+        return Variant::mkLong(stateCount(isSession, isSession ? *sid : ""));
+    };
+    c->methods["remove"] = [isSession, sid](MapObject*, std::vector<Variant>& a) -> Variant {
+        stateRemove(isSession, isSession ? *sid : "", stateKeyOf(a));
+        return Variant();
+    };
+    c->methods["removeall"] = [isSession, sid](MapObject*, std::vector<Variant>&) -> Variant {
+        stateRemoveAllKeys(isSession, isSession ? *sid : "");
+        return Variant();
+    };
+    return c;
+}
+
+// Session object: dict-style contents plus the LCID/CodePage properties
+// (LCID drives the same locale state as SetLocale/GetLocale)
+struct SessionObj : MapObject {
+    Interp* ip;
+    long long codePage = 1252; // Windows-1252 default
+    explicit SessionObj(Interp& i) : ip(&i) {}
+    Variant getMember(const std::string& n) override {
+        if (n == "lcid") return ip->localeId;
+        if (n == "codepage") return Variant::mkLong(codePage);
+        return MapObject::getMember(n);
+    }
+    void setMember(const std::string& n, const Variant& v) override {
+        if (n == "lcid") {
+            long long l = toInt64(v);
+            if (l < 0 || l > 0x7FFFFFFFLL) throwErr(5, errDesc(5));
+            ip->localeId = Variant::mkLong(l);
+            return;
+        }
+        if (n == "codepage") { codePage = toInt64(v); return; }
+        MapObject::setMember(n, v);
+    }
+};
+
+// stateful collection object backed by the sqlite store
+void fillStateColl(Interp& ip, MapObject* c, bool isSession, std::shared_ptr<std::string> sid) {
     c->kind = isSession ? "Session" : "Application";
     if (isSession) c->props["sessionid"] = Variant::mkStr(*sid);
     auto timeoutOf = [c]() -> long long {
@@ -742,10 +924,15 @@ std::shared_ptr<MapObject> makeStateColl(Interp& ip, bool isSession, std::shared
         return it == c->props.end() ? 20 : toInt64(it->second);
     };
     if (isSession) c->props["timeout"] = Variant::mkLong(20);
-    c->onInvoke = [isSession, sid, timeoutOf](MapObject*, std::vector<Variant>& a) -> Variant {
+    c->props["contents"] = Variant::mkObj(makeContentsColl(isSession, sid));
+    c->onInvoke = [isSession, sid, timeoutOf, &ip](MapObject*, std::vector<Variant>& a) -> Variant {
         std::string k = stateKeyOf(a);
         if (isSession) {
-            if (sessionExpired(*sid, timeoutOf())) { stateRemoveAll(*sid); return Variant(); }
+            if (sessionExpired(*sid, timeoutOf())) {
+                stateRemoveAll(*sid);
+                ip.callGlobalProc("session_onend");
+                return Variant();
+            }
             sessionTouch(*sid);
             return fromJsonText(stateGet(true, *sid, k));
         }
@@ -757,15 +944,18 @@ std::shared_ptr<MapObject> makeStateColl(Interp& ip, bool isSession, std::shared
         stateSet(isSession, isSession ? *sid : "", k, toJsonText(v));
     };
     if (isSession) {
-        c->methods["abandon"] = [c, sid](MapObject*, std::vector<Variant>&) -> Variant {
+        c->methods["abandon"] = [c, sid, &ip](MapObject*, std::vector<Variant>&) -> Variant {
+            ip.callGlobalProc("session_onend");
             stateRemoveAll(*sid);
             // rotate: the abandoned id must not be reused
             *sid = newSessionId();
             c->props["sessionid"] = Variant::mkStr(*sid);
             if (g_resp) {
-                for (auto& ck : g_resp->cookies)
-                    if (ck.rfind("MScriptSessionID=", 0) == 0) ck = "MScriptSessionID=" + *sid + "; path=/";
-                g_resp->cookies.push_back("MScriptSessionID=" + *sid + "; path=/");
+                auto ck = std::make_shared<MapObject>();
+                ck->kind = "Cookie";
+                ck->props["value"] = Variant::mkStr(*sid);
+                ck->props["path"] = Variant::mkStr("/");
+                g_resp->outCookies["mscriptsessionid"] = ck;
             }
             return Variant();
         };
@@ -781,7 +971,6 @@ std::shared_ptr<MapObject> makeStateColl(Interp& ip, bool isSession, std::shared
             return Variant();
         };
     }
-    return c;
 }
 
 } // namespace
@@ -802,6 +991,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
     ip.responseObj = resp;
     g_respObj = resp.get();
     resp->props["buffer"] = Variant::mkBool(true);
+    resp->props["isclientconnected"] = Variant::mkBool(true); // CGI cannot detect disconnects
     resp->props["contenttype"] = Variant::mkStr("text/html");
     resp->props["status"] = Variant::mkStr("200 OK");
     resp->methods["write"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
@@ -856,27 +1046,51 @@ void registerAspObjects(Interp& ip, bool cgi) {
         return Variant();
     };
 
-    // Response.Cookies("name") = value / read
+    // Response.Cookies("name") returns a per-name cookie object whose props
+    // carry value/expires/path/domain/secure/httponly; Set-Cookie is built at
+    // header time. Response.Cookies("name") = value sets the value.
     auto cookies = std::make_shared<MapObject>();
     cookies->kind = "Cookies";
     auto reqCookies = parseCookies(std::getenv("HTTP_COOKIE") ? std::getenv("HTTP_COOKIE") : "");
-    cookies->onAssignInvoke = [](MapObject*, std::vector<Variant>& a, const Variant& v) {
-        if (a.empty() || !g_resp) return;
-        g_resp->cookies.push_back(cleanHeaderText(toStr(a[0]), "cookie name") + "=" +
-                                  urlEncode(toStr(v)) + "; path=/");
+    auto cookieFor = [](const std::string& name) -> std::shared_ptr<MapObject> {
+        if (!g_resp) return nullptr;
+        std::string k = lower(cleanHeaderText(name, "cookie name"));
+        auto it = g_resp->outCookies.find(k);
+        if (it != g_resp->outCookies.end()) return it->second;
+        auto ck = std::make_shared<MapObject>();
+        ck->kind = "Cookie";
+        ck->props["value"] = Variant::mkStr("");
+        ck->props["path"] = Variant::mkStr("/");
+        // Response.Cookies("n")("path") = "/" and reads of the same form
+        ck->onInvoke = [](MapObject* self, std::vector<Variant>& a) -> Variant {
+            if (a.empty()) throwErr(450, errDesc(450));
+            auto it = self->props.find(lower(toStr(a[0])));
+            return it == self->props.end() ? Variant() : it->second;
+        };
+        ck->onAssignInvoke = [](MapObject* self, std::vector<Variant>& a, const Variant& v) {
+            if (!a.empty()) self->props[lower(toStr(a[0]))] = v;
+        };
+        g_resp->outCookies[k] = ck;
+        return ck;
     };
-    cookies->onInvoke = [reqCookies](MapObject*, std::vector<Variant>& a) -> Variant {
+    cookies->onInvoke = [cookieFor](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
-        auto it = reqCookies.find(lower(toStr(a[0])));
-        return Variant::mkStr(it == reqCookies.end() ? "" : it->second);
+        auto ck = cookieFor(toStr(a[0]));
+        if (!ck) throwErr(5, errDesc(5));
+        return Variant::mkObj(ck);
+    };
+    cookies->onAssignInvoke = [cookieFor](MapObject*, std::vector<Variant>& a, const Variant& v) {
+        if (a.empty()) return;
+        auto ck = cookieFor(toStr(a[0]));
+        if (ck) ck->props["value"] = v;
     };
     resp->props["cookies"] = Variant::mkObj(cookies);
 
     // ---- Request ----
     auto req = std::make_shared<MapObject>();
     req->kind = "Request";
-    req->props["querystring"] = Variant::mkObj(makeColl(
-        parsePairs(std::getenv("QUERY_STRING") ? std::getenv("QUERY_STRING") : ""), "QueryString"));
+    auto qs = parsePairs(std::getenv("QUERY_STRING") ? std::getenv("QUERY_STRING") : "");
+    req->props["querystring"] = Variant::mkObj(makeColl(qs, "QueryString"));
     std::map<std::string, std::string> form;
     {
         const char* rm = std::getenv("REQUEST_METHOD");
@@ -891,6 +1105,25 @@ void registerAspObjects(Interp& ip, bool cgi) {
     }
     req->props["form"] = Variant::mkObj(makeColl(form, "Form"));
     req->props["cookies"] = Variant::mkObj(makeColl(reqCookies, "Cookies"));
+    // Request("name"): combined lookup in the documented order —
+    // QueryString, Form, Cookies, ServerVariables
+    req->onInvoke = [qs, form, reqCookies](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.empty()) throwErr(450, errDesc(450));
+        std::string k = lower(toStr(a[0]));
+        auto it = qs.find(k);
+        if (it != qs.end()) return Variant::mkStr(it->second);
+        it = form.find(k);
+        if (it != form.end()) return Variant::mkStr(it->second);
+        it = reqCookies.find(k);
+        if (it != reqCookies.end()) return Variant::mkStr(it->second);
+        const char* v = std::getenv(toStr(a[0]).c_str());
+        if (!v) {
+            std::string up = toStr(a[0]);
+            for (auto& ch : up) ch = (char)std::toupper((unsigned char)ch);
+            v = std::getenv(up.c_str()); // CGI variables are uppercase
+        }
+        return Variant::mkStr(v ? v : "");
+    };
     auto sv = std::make_shared<MapObject>();
     sv->kind = "ServerVariables";
     sv->onInvoke = [](MapObject*, std::vector<Variant>& a) -> Variant {
@@ -997,18 +1230,38 @@ void registerAspObjects(Interp& ip, bool cgi) {
     }
     if (sid->empty()) {
         *sid = newSessionId();
-        if (g_resp) g_resp->cookies.push_back("MScriptSessionID=" + *sid + "; path=/");
+        ip.aspNewSession = true;
+        if (g_resp) {
+            auto ck = std::make_shared<MapObject>();
+            ck->kind = "Cookie";
+            ck->props["value"] = Variant::mkStr(*sid);
+            ck->props["path"] = Variant::mkStr("/");
+            g_resp->outCookies["mscriptsessionid"] = ck;
+        }
     }
     if (sessionExpired(*sid, 20)) stateRemoveAll(*sid);
     sessionTouch(*sid);
-    auto session = makeStateColl(ip, true, sid);
-    auto app = makeStateColl(ip, false, sid);
+    auto session = std::make_shared<SessionObj>(ip);
+    fillStateColl(ip, session.get(), true, sid);
+    auto app = std::make_shared<MapObject>();
+    fillStateColl(ip, app.get(), false, sid);
 
     ip.global.vars["request"] = Variant::mkObj(req);
     ip.global.vars["response"] = Variant::mkObj(resp);
     ip.global.vars["server"] = Variant::mkObj(srv);
     ip.global.vars["session"] = Variant::mkObj(session);
     ip.global.vars["application"] = Variant::mkObj(app);
+}
+
+// global.asa hooks, called once per request after the program is loaded:
+// Application_OnStart is guarded in the state db so it runs once per
+// application even though each CGI request is a fresh process
+void aspGlobalAsaHooks(Interp& ip) {
+    if (stateGet(false, "", "global.asa.onstart").empty()) {
+        if (ip.callGlobalProc("application_onstart"))
+            stateSet(false, "", "global.asa.onstart", "1");
+    }
+    if (ip.aspNewSession) ip.callGlobalProc("session_onstart");
 }
 
 bool aspResponseWrite(Interp& ip, const std::string& s) {

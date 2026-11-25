@@ -87,6 +87,25 @@ int main(int argc, char** argv) {
 
         Program prog = Parser(lex(code)).parseProgram();
 
+        // ASP extension: a global.asa next to the script contributes its
+        // declarations (Application_OnStart / Session_OnStart / ...) ahead
+        // of the page's own statements
+        if (aspMode) {
+            std::error_code ec;
+            std::filesystem::path gasa =
+                std::filesystem::path(srcName).parent_path() / "global.asa";
+            if (std::filesystem::exists(gasa, ec)) {
+                std::ifstream gin(gasa, std::ios::binary);
+                std::ostringstream gss;
+                gss << gin.rdbuf();
+                Program g = Parser(lex(aspToVbs(gss.str(), true))).parseProgram();
+                std::vector<StmtPtr> merged;
+                for (auto& st : g.stmts) merged.push_back(std::move(st));
+                for (auto& st : prog.stmts) merged.push_back(std::move(st));
+                prog.stmts = std::move(merged);
+            }
+        }
+
         Interp ip;
         ip.scriptFullName = srcName;
         initWScript(ip, srcName, srcName, scriptArgs);
@@ -97,6 +116,7 @@ int main(int argc, char** argv) {
             ip.aspStart = (double)std::time(nullptr);
         }
         ip.load(prog, srcName);
+        if (aspMode) aspGlobalAsaHooks(ip);
         try {
             ip.run();
         } catch (VBSError& e) {

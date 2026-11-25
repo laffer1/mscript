@@ -44,6 +44,16 @@ for t in tests/*.vbs tests/*.asp; do
         export MScript_ASP_STATE_DB
         QUERY_STRING="name=mscript&n=42"
         export QUERY_STRING
+        # 39_* exercises CGI headers/cookies: run as GET with a fixed valid
+        # session id so the Set-Cookie line is deterministic
+        case "$name" in
+        39_*)
+            REQUEST_METHOD=GET
+            export REQUEST_METHOD
+            HTTP_COOKIE="MScriptSessionID=0123456789abcdef0123456789abcdef; theme=dark"
+            export HTTP_COOKIE
+            ;;
+        esac
     fi
     # tests/<name>.args, if present, replaces the default arguments
     # (whitespace-separated, no quoting or globbing)
@@ -75,6 +85,24 @@ for t in tests/*.vbs tests/*.asp; do
         ;;
     esac
 done
+
+# global.asa hook test (own subdirectory so other .asp tests are unaffected);
+# body-only output (no REQUEST_METHOD) keeps the fresh session id out of it
+if [ -f tests/aspapp/page.asp ]; then
+    name=aspapp_page
+    exp=tests/aspapp/page.expected
+    env -u REQUEST_METHOD -u HTTP_COOKIE \
+        MScript_ASP_STATE_DB="$tmp.db" QUERY_STRING="" \
+        "$BIN" tests/aspapp/page.asp >"$tmp" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ] && cmp -s "$tmp" "$exp"; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "FAIL $name (rc=$rc)"
+        diff "$exp" "$tmp" | head -20
+    fi
+fi
 rm -f "$tmp" "$tmp.db"
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]
