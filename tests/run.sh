@@ -137,6 +137,7 @@ if [ -d tests/aspsec ]; then
             fail=$((fail + 1))
             echo "FAIL aspsec_$cname (rc=$crc)"
             head -10 "$tmp"
+            echo
         fi
     }
     # overlong / truncated UTF-8 must not decode to markup after HTMLEncode
