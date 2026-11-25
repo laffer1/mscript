@@ -298,6 +298,7 @@ void registerConstants(Interp& ip) {
     add("vbFriday", Variant::mkInt(6));
     add("vbSaturday", Variant::mkInt(7));
     add("vbUseSystem", Variant::mkInt(0));
+    add("vbUseSystemDayOfWeek", Variant::mkInt(1));
     add("vbFirstJan1", Variant::mkInt(1));
     add("vbFirstFourDays", Variant::mkInt(2));
     add("vbFirstFullWeek", Variant::mkInt(3));
@@ -1105,6 +1106,72 @@ void registerBuiltins(Interp& ip) {
         std::string pat = "%";
         if (digits >= 0) pat = "0." + std::string((size_t)digits, '0') + "%";
         return Variant::mkStr(fmtNum(v, pat));
+    });
+
+    // Filter(sourcearray, string [, include [, compare]]): 1-D string array subset.
+    // No matches -> uninitialized array (UBound on it raises 9), as in MS VBScript.
+    reg("Filter", 2, 4, [](Interp&, std::vector<Variant>& a) -> Variant {
+        const Variant& src = A(a, 0);
+        if (src.t != VT::Array || !src.arr || !src.arr->allocated || src.arr->dims.size() != 1)
+            throwErr(13, errDesc(13));
+        std::string match = toStr(A(a, 1));
+        bool include = a.size() >= 3 ? toBool(A(a, 2)) : true;
+        long long cmp = a.size() >= 4 ? toInt64(A(a, 3)) : 0;
+        if (cmp != 0 && cmp != 1) throwErr(5, errDesc(5));
+        auto needle = cpv(match, cmp == 1);
+        std::vector<Variant> out;
+        for (auto& e : src.arr->data) {
+            auto hay = cpv(toStr(e), cmp == 1);
+            bool found = needle.empty(); // InStr(x, "") is always found
+            for (size_t i = 0; !found && i + needle.size() <= hay.size(); i++) {
+                bool ok = true;
+                for (size_t j = 0; j < needle.size(); j++)
+                    if (hay[i + j] != needle[j]) { ok = false; break; }
+                if (ok) found = true;
+            }
+            if (found == include) out.push_back(Variant::mkStr(toStr(e)));
+        }
+        if (out.empty()) return Variant::mkArr(std::make_shared<VArray>());
+        auto arr = std::make_shared<VArray>();
+        arr->alloc({(long long)out.size()}, 0, false);
+        for (size_t i = 0; i < out.size(); i++) arr->data[i] = std::move(out[i]);
+        return Variant::mkArr(arr);
+    });
+
+    // FormatCurrency(expr [, digits [, leadingdigit [, parens [, groupdigits]]]])
+    // tri-state args: -1 True, 0 False, -2 UseDefault (en-US defaults: 2 digits,
+    // leading zero shown, parentheses for negatives, thousands grouping)
+    reg("FormatCurrency", 1, 5, [](Interp&, std::vector<Variant>& a) -> Variant {
+        double v = toDouble(A(a, 0));
+        long long digits = a.size() >= 2 ? toInt64(A(a, 1)) : -1;
+        if (digits < 0) digits = 2;
+        if (digits > 99) throwErr(5, errDesc(5));
+        auto tri = [&](size_t idx) -> bool { // -2 (UseDefault) -> true
+            if (a.size() <= idx) return true;
+            long long x = toInt64(A(a, idx));
+            return x != 0; // -1 true, 0 false, -2 default(true)
+        };
+        bool lead = tri(2), par = tri(3), grp = tri(4);
+        std::string pat = std::string(grp ? "," : "") + "0." + std::string((size_t)digits, '0');
+        std::string num = fmtNum(std::fabs(v), pat);
+        if (!lead && num.size() > 1 && num[0] == '0' &&
+            (num[1] == '.' || (grp && num[1] == ',')))
+            num.erase(0, 1); // $0.50 -> $.50
+        if (v < 0) return Variant::mkStr(par ? "($" + num + ")" : "-$" + num);
+        return Variant::mkStr("$" + num);
+    });
+
+    // GetLocale/SetLocale: locale id (LCID number or short name), default 1033 (en-US).
+    // SetLocale returns the previous locale id, per MS docs.
+    reg("GetLocale", 0, 0, [](Interp& ip, std::vector<Variant>&) -> Variant {
+        return ip.localeId;
+    });
+    reg("SetLocale", 1, 1, [](Interp& ip, std::vector<Variant>& a) -> Variant {
+        Variant v = A(a, 0);
+        if (!v.isNum() && v.t != VT::String) throwErr(5, errDesc(5));
+        Variant prev = ip.localeId;
+        ip.localeId = v;
+        return prev;
     });
 
     // ---- host interaction ----

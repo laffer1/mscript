@@ -1419,6 +1419,10 @@ Variant Interp::evalExpr(Expr& e, Frame& f) {
         if (op == "and" || op == "or" || op == "xor" || op == "eqv" || op == "imp")
             return opLogic(op, l, r);
         if (op == "is") return Variant::mkBool(objSame(l, r));
+        if (op == "like") {
+            if (l.isNull() || r.isNull()) throwErr(94, errDesc(94));
+            return Variant::mkBool(opLike(toStr(l), toStr(r), compareText));
+        }
         return opCompare(op, l, r, compareText);
     }
     case Expr::Member: {

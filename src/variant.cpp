@@ -1096,6 +1096,113 @@ Variant opCompare(const std::string& op, const Variant& a0, const Variant& b0, b
     return Variant::mkBool(r);
 }
 
+namespace {
+
+// decode one UTF-8 code point at bytePos
+unsigned likeCpAt(const std::string& s, size_t bytePos, size_t* adv) {
+    unsigned char c = (unsigned char)s[bytePos];
+    if (c < 0x80) { *adv = 1; return c; }
+    if ((c & 0xE0) == 0xC0 && bytePos + 1 < s.size()) {
+        *adv = 2;
+        return ((c & 0x1F) << 6) | ((unsigned char)s[bytePos + 1] & 0x3F);
+    }
+    if ((c & 0xF0) == 0xE0 && bytePos + 2 < s.size()) {
+        *adv = 3;
+        return ((c & 0x0F) << 12) | (((unsigned char)s[bytePos + 1] & 0x3F) << 6) |
+               ((unsigned char)s[bytePos + 2] & 0x3F);
+    }
+    if ((c & 0xF8) == 0xF0 && bytePos + 3 < s.size()) {
+        *adv = 4;
+        return ((c & 0x07) << 18) | (((unsigned char)s[bytePos + 1] & 0x3F) << 12) |
+               (((unsigned char)s[bytePos + 2] & 0x3F) << 6) | ((unsigned char)s[bytePos + 3] & 0x3F);
+    }
+    *adv = 1;
+    return c;
+}
+
+unsigned likeFold(unsigned c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 32; // Latin-1 supplement
+    return c;
+}
+
+// VBScript Like pattern matcher over code points:
+//   ?  any single char   *  any sequence (incl. empty)   #  any digit
+//   [charlist]  any listed char (ranges a-z allowed)   [!charlist]  any char NOT listed
+//   ']' first in the list is literal; an unterminated '[' matches a literal '['
+bool likeMatch(const std::vector<unsigned>& s, size_t si,
+               const std::vector<unsigned>& p, size_t pi) {
+    while (pi < p.size()) {
+        unsigned pc = p[pi];
+        if (pc == '*') {
+            while (pi < p.size() && p[pi] == '*') pi++;
+            if (pi == p.size()) return true;
+            for (size_t i = si; i <= s.size(); i++)
+                if (likeMatch(s, i, p, pi)) return true;
+            return false;
+        }
+        if (si >= s.size()) return false;
+        if (pc == '?') { si++; pi++; continue; }
+        if (pc == '#') {
+            if (s[si] < '0' || s[si] > '9') return false;
+            si++; pi++; continue;
+        }
+        if (pc == '[') {
+            size_t j = pi + 1;
+            bool neg = false;
+            if (j < p.size() && p[j] == '!') { neg = true; j++; }
+            size_t firstPos = j; // ']' here is a literal member
+            std::vector<unsigned> list;
+            bool closed = false;
+            while (j < p.size()) {
+                unsigned c = p[j];
+                if (c == ']' && j != firstPos) { j++; closed = true; break; }
+                if (j + 2 < p.size() && p[j + 1] == '-' && p[j + 2] != ']') {
+                    unsigned lo = c, hi = p[j + 2];
+                    if (lo <= hi) { for (unsigned k = lo; k <= hi; k++) list.push_back(k); }
+                    else { list.push_back(lo); list.push_back('-'); list.push_back(hi); }
+                    j += 3;
+                } else {
+                    list.push_back(c);
+                    j++;
+                }
+            }
+            if (!closed) { // unterminated '[': literal '['
+                if (s[si] != '[') return false;
+                si++; pi++;
+                continue;
+            }
+            bool found = false;
+            for (unsigned k : list) if (k == s[si]) { found = true; break; }
+            if (found == neg) return false;
+            si++; pi = j;
+            continue;
+        }
+        if (s[si] != pc) return false;
+        si++; pi++;
+    }
+    return si == s.size();
+}
+
+} // namespace
+
+bool opLike(const std::string& str, const std::string& pattern, bool compareText) {
+    std::vector<unsigned> s, p;
+    for (size_t i = 0; i < str.size();) {
+        size_t adv;
+        unsigned c = likeCpAt(str, i, &adv);
+        s.push_back(compareText ? likeFold(c) : c);
+        i += adv;
+    }
+    for (size_t i = 0; i < pattern.size();) {
+        size_t adv;
+        unsigned c = likeCpAt(pattern, i, &adv);
+        p.push_back(compareText ? likeFold(c) : c);
+        i += adv;
+    }
+    return likeMatch(s, 0, p, 0);
+}
+
 bool objSame(const Variant& a, const Variant& b) {
     if (a.t == VT::Object && b.t == VT::Object) return a.obj == b.obj;
     // "x Is Nothing" on an Empty/Null variant is legal and simply False/Null

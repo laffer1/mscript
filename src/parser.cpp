@@ -693,7 +693,7 @@ int Parser::precOf(const std::string& op) const {
     if (op == "mod") return 10;
     if (op == "+" || op == "-") return 9;
     if (op == "&") return 8;
-    if (op == "=" || op == "<>" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "is") return 7;
+    if (op == "=" || op == "<>" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "is" || op == "like") return 7;
     if (op == "not") return 6;
     if (op == "and") return 5;
     if (op == "or") return 4;
