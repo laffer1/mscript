@@ -574,6 +574,27 @@ void Interp::execStmtList(const std::vector<Stmt*>& list, Frame& f) {
     size_t i = 0;
     while (i < list.size()) {
         runPendingTerminators(); // objects released by the previous statement
+        // enforce Server.ScriptTimeout (ASP mode): checked periodically, cheap.
+        // the counter is a member so nested execStmtList calls (loops) count too;
+        // the timeout is read live from the Server object so the script can
+        // change Server.ScriptTimeout while running
+        if (aspStart > 0 && (++stmtTick & 0x1FF) == 0) {
+            long long secs = 90;
+            if (serverObj) {
+                auto* m = dynamic_cast<MapObject*>(serverObj.get());
+                if (m) {
+                    auto it = m->props.find("scripttimeout");
+                    if (it != m->props.end()) secs = toInt64(it->second);
+                }
+            }
+            double now = std::chrono::duration<double>(
+                             std::chrono::system_clock::now().time_since_epoch()).count();
+            if (secs > 0 && now - aspStart > (double)secs) {
+                VBSError e(1002, "ASP script timed out (Server.ScriptTimeout)");
+                e.line = list[i]->line;
+                throw e;
+            }
+        }
         Stmt& s = *list[i];
         f.curLine = s.line;
         try {

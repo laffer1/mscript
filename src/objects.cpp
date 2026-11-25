@@ -217,14 +217,14 @@ void initWScript(Interp& ip, const std::string& scriptName, const std::string& f
     ws->props["stdout"] = Variant::mkObj(makeStream(stdout, false));
     ws->props["stderr"] = Variant::mkObj(makeStream(stderr, false));
     ws->props["stdin"] = Variant::mkObj(makeStream(stdin, true));
-    ws->methods["echo"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
+    ws->methods["echo"] = [&ip](MapObject*, std::vector<Variant>& a) -> Variant {
         std::string out;
         for (size_t i = 0; i < a.size(); i++) {
             if (i) out += ' ';
             out += toStrLenient(a[i]);
         }
         out += '\n';
-        std::fwrite(out.data(), 1, out.size(), stdout);
+        ip.printOut(out); // routes into the ASP Response body in ASP mode
         std::fflush(stdout);
         return Variant();
     };

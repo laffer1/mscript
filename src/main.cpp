@@ -88,10 +88,13 @@ int main(int argc, char** argv) {
         Program prog = Parser(lex(code)).parseProgram();
 
         Interp ip;
+        ip.scriptFullName = srcName;
         initWScript(ip, srcName, srcName, scriptArgs);
         if (aspMode) {
             ip.aspMode = true;
             registerAspObjects(ip, std::getenv("REQUEST_METHOD") != nullptr);
+            // arm the Server.ScriptTimeout wall-clock check (read live in execStmtList)
+            ip.aspStart = (double)std::time(nullptr);
         }
         ip.load(prog, srcName);
         try {
