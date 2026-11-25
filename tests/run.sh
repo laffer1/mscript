@@ -102,6 +102,20 @@ if [ -f tests/aspapp/page.asp ]; then
         echo "FAIL $name (rc=$rc)"
         diff "$exp" "$tmp" | head -20
     fi
+    # a page in a subdirectory shares the app root's global.asa
+    name=aspapp_sub_page
+    exp=tests/aspapp/sub/page2.expected
+    env -u REQUEST_METHOD -u HTTP_COOKIE \
+        MScript_ASP_STATE_DB="$tmp.db" QUERY_STRING="" \
+        "$BIN" tests/aspapp/sub/page2.asp >"$tmp" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ] && cmp -s "$tmp" "$exp"; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "FAIL $name (rc=$rc)"
+        diff "$exp" "$tmp" | head -20
+    fi
 fi
 rm -f "$tmp" "$tmp.db"
 echo "passed: $pass  failed: $fail"

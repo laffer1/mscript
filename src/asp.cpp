@@ -25,6 +25,7 @@
 #include <fstream>
 #include <format>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -247,7 +248,10 @@ struct AspResponse {
     std::string pics;                                           // PICS-Label header
     std::string expiresAbs;                                     // Expires header (absolute)
     std::vector<std::pair<std::string, std::string>> headers; // extra headers
-    std::map<std::string, std::shared_ptr<MapObject>> outCookies; // Response.Cookies(name)
+    std::map<std::string, std::shared_ptr<MapObject>> outCookies; // Response.Cookies(name), original case
+    std::set<std::string> dirtyCookies;                  // lowercased names actually written
+    int outCp = 0;                                        // 1252/28591 -> transcode output to Latin-1
+    bool expiresConsumed = false;                         // Response.Expires consumed once
     bool buffer = true;
     bool headersSent = false;
     bool ended = false;
@@ -263,7 +267,9 @@ std::string httpDate(double serial) {
 
 // one interpreter per CGI process
 std::shared_ptr<AspResponse> g_resp;
-MapObject* g_respObj = nullptr; // for property sync (Response.X = v)
+MapObject* g_respObj = nullptr;   // for property sync (Response.X = v)
+struct SessionObj;
+long long g_sessionCodePage = 1252; // Session.CodePage -> output charset
 
 // reject CR/LF in header names/values (response splitting)
 std::string cleanHeaderText(const std::string& s, const char* what) {
@@ -281,21 +287,17 @@ void syncRespProps() {
     if (it != g_respObj->props.end()) g_resp->contentType = cleanHeaderText(toStr(it->second), "ContentType");
     it = g_respObj->props.find("status");
     if (it != g_respObj->props.end()) g_resp->status = cleanHeaderText(toStr(it->second), "Status");
+    // properties stay readable after syncing (only copied into state, never
+    // erased); Response.Expires is relative to the first sync, so consume once
     it = g_respObj->props.find("expires");
-    if (it != g_respObj->props.end() && it->second.t != VT::Empty) {
-        time_t t = std::time(nullptr) + (time_t)(toInt64(it->second) * 60);
-        char buf[64];
-        std::strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", std::gmtime(&t));
-        g_resp->headers.push_back({"Expires", buf});
-        g_respObj->props.erase(it);
+    if (it != g_respObj->props.end() && it->second.t != VT::Empty && !g_resp->expiresConsumed) {
+        g_resp->expiresConsumed = true;
+        g_resp->expiresAbs = httpDate((double)std::time(nullptr) + (double)(toInt64(it->second) * 60) / 86400.0 + 25569.0);
     }
-    // one-shot property writes: move them into the response state once
     auto take = [&](const char* prop, std::string& field, const char* what) {
         auto i2 = g_respObj->props.find(prop);
-        if (i2 != g_respObj->props.end() && i2->second.t != VT::Empty) {
+        if (i2 != g_respObj->props.end() && i2->second.t != VT::Empty)
             field = cleanHeaderText(toStr(i2->second), what);
-            g_respObj->props.erase(i2);
-        }
     };
     take("cachecontrol", g_resp->cacheControl, "CacheControl");
     take("pics", g_resp->pics, "PICS");
@@ -304,8 +306,39 @@ void syncRespProps() {
     if (eit != g_respObj->props.end() && eit->second.t != VT::Empty) {
         if (eit->second.t == VT::Date) g_resp->expiresAbs = httpDate(eit->second.d);
         else g_resp->expiresAbs = cleanHeaderText(toStr(eit->second), "ExpiresAbsolute");
-        g_respObj->props.erase(eit);
     }
+}
+
+// cookie attribute values must not carry cookie delimiters (';' would inject
+// extra directives) or CR/LF
+std::string cleanCookieAttr(const std::string& s, const char* what) {
+    if (s.find(';') != std::string::npos || s.find('\r') != std::string::npos ||
+        s.find('\n') != std::string::npos)
+        throwErr(5, std::string("ASP cookie: ';' and CR/LF not allowed in ") + what);
+    return s;
+}
+
+// transcode UTF-8 output to Latin-1 when the session code page asks for it
+std::string encodeOut(const std::string& s) {
+    if (!g_resp || (g_resp->outCp != 1252 && g_resp->outCp != 28591)) return s;
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        unsigned cp; size_t adv;
+        if (c < 0x80) { cp = c; adv = 1; }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < s.size()) {
+            cp = ((c & 0x1F) << 6) | ((unsigned char)s[i + 1] & 0x3F); adv = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < s.size()) {
+            cp = ((c & 0x0F) << 12) | (((unsigned char)s[i + 1] & 0x3F) << 6) |
+                 ((unsigned char)s[i + 2] & 0x3F); adv = 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < s.size()) {
+            cp = ((c & 0x07) << 18) | (((unsigned char)s[i + 1] & 0x3F) << 12) |
+                 (((unsigned char)s[i + 2] & 0x3F) << 6) | ((unsigned char)s[i + 3] & 0x3F); adv = 4;
+        } else { cp = c; adv = 1; }
+        out += (cp <= 0xFF) ? (char)cp : '?';
+        i += adv;
+    }
+    return out;
 }
 
 void ensureHeaders() {
@@ -313,6 +346,16 @@ void ensureHeaders() {
     g_resp->headersSent = true;
     if (!std::getenv("REQUEST_METHOD")) return; // local run: body only
     syncRespProps();
+    // Session.CodePage drives the output charset when the page did not set one
+    if (g_resp->charset.empty()) {
+        switch (g_sessionCodePage) {
+            case 65001: g_resp->charset = "utf-8"; break;
+            case 1252: g_resp->charset = "windows-1252"; g_resp->outCp = 1252; break;
+            case 28591: g_resp->charset = "iso-8859-1"; g_resp->outCp = 28591; break;
+            case 1200: g_resp->charset = "utf-16"; break;
+            default: break;
+        }
+    }
     std::string h;
     if (g_resp->status != "200 OK") h += "Status: " + g_resp->status + "\r\n";
     h += "Content-Type: " + g_resp->contentType +
@@ -321,7 +364,9 @@ void ensureHeaders() {
     if (!g_resp->pics.empty()) h += "PICS-Label: " + g_resp->pics + "\r\n";
     if (!g_resp->expiresAbs.empty()) h += "Expires: " + g_resp->expiresAbs + "\r\n";
     for (auto& [name, ck] : g_resp->outCookies) {
-        // Response.Cookies("name") objects carry value + attributes as props
+        // only cookies the page actually wrote get a Set-Cookie header; a bare
+        // read of Response.Cookies(name) must not emit an empty cookie
+        if (!g_resp->dirtyCookies.count(lower(name))) continue;
         std::string c = cleanHeaderText(name, "cookie name") + "=" +
                         urlEncode(toStr(ck->props.count("value") ? ck->props["value"] : Variant()));
         auto attr = [&](const char* k) -> std::string {
@@ -329,16 +374,16 @@ void ensureHeaders() {
             return i2 == ck->props.end() ? "" : toStr(i2->second);
         };
         std::string path = attr("path");
-        if (!path.empty()) c += "; path=" + cleanHeaderText(path, "cookie path");
+        if (!path.empty()) c += "; path=" + cleanCookieAttr(path, "path");
         auto eit = ck->props.find("expires");
         if (eit != ck->props.end() && eit->second.t == VT::Date)
             c += "; expires=" + httpDate(eit->second.d);
         else {
             std::string ex = attr("expires");
-            if (!ex.empty()) c += "; expires=" + cleanHeaderText(ex, "cookie expires");
+            if (!ex.empty()) c += "; expires=" + cleanCookieAttr(ex, "expires");
         }
         std::string dom = attr("domain");
-        if (!dom.empty()) c += "; domain=" + cleanHeaderText(dom, "cookie domain");
+        if (!dom.empty()) c += "; domain=" + cleanCookieAttr(dom, "domain");
         auto sit = ck->props.find("secure");
         if (sit != ck->props.end() && toBool(sit->second)) c += "; secure";
         auto hit = ck->props.find("httponly");
@@ -356,7 +401,8 @@ void responseBody(const std::string& s) {
     if (g_resp->buffer) g_resp->body += s;
     else {
         ensureHeaders();
-        std::fwrite(s.data(), 1, s.size(), stdout);
+        std::string out = encodeOut(s);
+        std::fwrite(out.data(), 1, out.size(), stdout);
         std::fflush(stdout);
     }
 }
@@ -405,7 +451,7 @@ std::shared_ptr<MapObject> makeColl(std::map<std::string, std::string> data, con
 
 // ---------- SQLite state store (Session / Application) ----------
 
-std::string g_appNs; // namespace for Application keys (per ASP "application" = script)
+std::string g_appNs; // namespace for Application keys (the application root dir)
 
 std::string stateDbPath() {
     const char* env = std::getenv("MScript_ASP_STATE_DB");
@@ -449,8 +495,17 @@ sqlite3* stateDb() {
             "PRAGMA journal_mode=WAL;"
             "CREATE TABLE IF NOT EXISTS app(k TEXT PRIMARY KEY, v TEXT);"
             "CREATE TABLE IF NOT EXISTS sessions(sid TEXT, k TEXT, v TEXT, PRIMARY KEY(sid, k));"
-            "CREATE TABLE IF NOT EXISTS session_meta(sid TEXT PRIMARY KEY, last REAL);",
+            "CREATE TABLE IF NOT EXISTS session_meta(sid TEXT PRIMARY KEY, last REAL,"
+            "                                        lcid INTEGER, codepage INTEGER);"
+            // abandoned session ids that must never be written again
+            "CREATE TABLE IF NOT EXISTS dead(sid TEXT PRIMARY KEY, until REAL);"
+            // app-level markers (e.g. the Application_OnStart claim), kept out
+            // of the app table so Application.Contents never exposes them
+            "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);",
             nullptr, nullptr, nullptr);
+        // older databases predate the lcid/codepage columns
+        sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN lcid INTEGER;", nullptr, nullptr, nullptr);
+        sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN codepage INTEGER;", nullptr, nullptr, nullptr);
         return d;
     }();
     return db;
@@ -464,7 +519,35 @@ sqlite3* stateDb() {
 // sites sharing one database do not collide
 std::string appKey(const std::string& k) { return g_appNs + "|" + k; }
 
+// an abandoned session id is dead: reads see nothing and writes are dropped,
+// so an in-flight request holding the old id cannot recreate its state
+bool sessionIsDead(const std::string& sid) {
+    sqlite3* db = stateDb();
+    if (!db) return false;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM dead WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
+        return false;
+    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bool dead = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return dead;
+}
+
+void sessionMarkDead(const std::string& sid) {
+    sqlite3* db = stateDb();
+    if (!db) stateFail("database unavailable");
+    sqlite3_exec(db, "DELETE FROM dead WHERE until < strftime('%s','now');", nullptr, nullptr, nullptr);
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO dead(sid, until) VALUES(?1, ?2)", -1, &st, nullptr) != SQLITE_OK)
+        stateFail("prepare");
+    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 2, (double)std::time(nullptr) + 86400.0);
+    if (sqlite3_step(st) != SQLITE_DONE) stateFail("mark dead");
+    sqlite3_finalize(st);
+}
+
 std::string stateGet(bool isSession, const std::string& sid, const std::string& k) {
+    if (isSession && sessionIsDead(sid)) return "";
     sqlite3* db = stateDb();
     if (!db) return "";
     sqlite3_stmt* st = nullptr;
@@ -489,6 +572,7 @@ std::string stateGet(bool isSession, const std::string& sid, const std::string& 
 }
 
 void stateSet(bool isSession, const std::string& sid, const std::string& k, const std::string& v) {
+    if (isSession && sessionIsDead(sid)) return; // abandoned id stays dead
     sqlite3* db = stateDb();
     if (!db) stateFail("database unavailable");
     sqlite3_stmt* st = nullptr;
@@ -529,12 +613,12 @@ void stateRemoveAll(const std::string& sid) {
 
 void stateRemove(bool isSession, const std::string& sid, const std::string& k) {
     sqlite3* db = stateDb();
-    if (!db) return;
+    if (!db) stateFail("database unavailable");
     sqlite3_stmt* st = nullptr;
     const char* sql = isSession
         ? "DELETE FROM sessions WHERE sid=?1 AND k=?2"
         : "DELETE FROM app WHERE k=?1";
-    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) return;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
         sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
@@ -542,19 +626,19 @@ void stateRemove(bool isSession, const std::string& sid, const std::string& k) {
         std::string ak = appKey(k);
         sqlite3_bind_text(st, 1, ak.data(), (int)ak.size(), SQLITE_TRANSIENT);
     }
-    sqlite3_step(st);
+    if (sqlite3_step(st) != SQLITE_DONE) stateFail("remove");
     sqlite3_finalize(st);
 }
 
 long long stateCount(bool isSession, const std::string& sid) {
     sqlite3* db = stateDb();
-    if (!db) return 0;
+    if (!db) stateFail("database unavailable");
     sqlite3_stmt* st = nullptr;
     // instr() prefix match avoids LIKE wildcard issues in the app namespace
     const char* sql = isSession
         ? "SELECT COUNT(*) FROM sessions WHERE sid=?1"
         : "SELECT COUNT(*) FROM app WHERE instr(k, ?1)=1";
-    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
         sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
     } else {
@@ -562,50 +646,124 @@ long long stateCount(bool isSession, const std::string& sid) {
         sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
     }
     long long n = 0;
-    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int64(st, 0);
+    if (sqlite3_step(st) != SQLITE_ROW) stateFail("count");
+    n = sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     return n;
 }
 
+// Contents.RemoveAll: clears keys only — for a session the metadata row must
+// survive, otherwise the live session would look expired on the next access
 void stateRemoveAllKeys(bool isSession, const std::string& sid) {
-    if (isSession) { stateRemoveAll(sid); return; }
     sqlite3* db = stateDb();
-    if (!db) return;
+    if (!db) stateFail("database unavailable");
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, "DELETE FROM app WHERE instr(k, ?1)=1", -1, &st, nullptr) != SQLITE_OK)
-        return;
-    std::string ns = g_appNs + "|";
-    sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
-    sqlite3_step(st);
+    const char* sql = isSession
+        ? "DELETE FROM sessions WHERE sid=?1"
+        : "DELETE FROM app WHERE instr(k, ?1)=1";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
+    if (isSession) {
+        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    } else {
+        std::string ns = g_appNs + "|";
+        sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
+    }
+    if (sqlite3_step(st) != SQLITE_DONE) stateFail("removeall");
     sqlite3_finalize(st);
 }
 
 void sessionTouch(const std::string& sid) {
+    if (sessionIsDead(sid)) return;
     sqlite3* db = stateDb();
-    if (!db) return;
+    if (!db) stateFail("database unavailable");
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO session_meta(sid, last) VALUES(?1, ?2)", -1, &st, nullptr) != SQLITE_OK)
-        return;
+    // upsert: keep any lcid/codepage columns already on the row
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO session_meta(sid, last) VALUES(?1, ?2) "
+            "ON CONFLICT(sid) DO UPDATE SET last=?2", -1, &st, nullptr) != SQLITE_OK)
+        stateFail("prepare");
     sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
     sqlite3_bind_double(st, 2, (double)std::time(nullptr));
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("touch");
     sqlite3_finalize(st);
 }
 
-bool sessionExpired(const std::string& sid, long long timeoutMin) {
+// atomically check expiry and, when expired, delete contents+meta in the same
+// write transaction, so a concurrent touch cannot resurrect the session
+// between the check and the delete. Returns true when the session was expired.
+bool sessionExpireIfNeeded(const std::string& sid, long long timeoutMin) {
     sqlite3* db = stateDb();
     if (!db || timeoutMin <= 0) return false;
+    if (sessionIsDead(sid)) return true;
+    sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
+    bool expired = true; // no metadata row counts as expired
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT last FROM session_meta WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
-    bool expired = true;
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        double last = sqlite3_column_double(st, 0);
-        expired = (std::time(nullptr) - (time_t)last) > timeoutMin * 60;
+    if (sqlite3_prepare_v2(db, "SELECT last FROM session_meta WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            double last = sqlite3_column_double(st, 0);
+            expired = (std::time(nullptr) - (time_t)last) > timeoutMin * 60;
+        }
+        sqlite3_finalize(st);
     }
-    sqlite3_finalize(st);
+    if (expired) {
+        if (sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+            sqlite3_step(st);
+            sqlite3_finalize(st);
+        }
+        if (sqlite3_prepare_v2(db, "DELETE FROM session_meta WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+            sqlite3_step(st);
+            sqlite3_finalize(st);
+        }
+    }
+    sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
     return expired;
+}
+
+// persisted per-session settings (lcid/codepage); col is an internal constant
+void sessionSetProp(const std::string& sid, const char* col, long long v) {
+    sqlite3* db = stateDb();
+    if (!db) stateFail("database unavailable");
+    std::string sql = std::string("INSERT INTO session_meta(sid, last, ") + col + ") VALUES(?1, ?2, ?3) "
+                      "ON CONFLICT(sid) DO UPDATE SET " + col + "=?3";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
+    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 2, (double)std::time(nullptr));
+    sqlite3_bind_int64(st, 3, v);
+    if (sqlite3_step(st) != SQLITE_DONE) stateFail("set prop");
+    sqlite3_finalize(st);
+}
+
+long long sessionGetProp(const std::string& sid, const char* col, long long dflt) {
+    sqlite3* db = stateDb();
+    if (!db) return dflt;
+    std::string sql = std::string("SELECT ") + col + " FROM session_meta WHERE sid=?1";
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return dflt;
+    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    long long out = dflt;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
+        out = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return out;
+}
+
+// atomically claim an app-level marker in the separate meta table (never
+// visible through Application.Contents); true if this caller claimed it
+bool metaClaim(const std::string& k) {
+    sqlite3* db = stateDb();
+    if (!db) stateFail("database unavailable");
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO meta(k, v) VALUES(?1, '1')", -1, &st, nullptr) != SQLITE_OK)
+        stateFail("prepare");
+    sqlite3_bind_text(st, 1, k.data(), (int)k.size(), SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) stateFail("claim");
+    int changed = sqlite3_changes(db);
+    sqlite3_finalize(st);
+    return changed == 1;
 }
 
 // cross-process lock for Application.Lock/Unlock (flock on a file next to the db)
@@ -892,12 +1050,14 @@ std::shared_ptr<MapObject> makeContentsColl(bool isSession, std::shared_ptr<std:
     return c;
 }
 
-// Session object: dict-style contents plus the LCID/CodePage properties
-// (LCID drives the same locale state as SetLocale/GetLocale)
+// Session object: dict-style contents plus the LCID/CodePage properties.
+// LCID drives the same locale state as SetLocale/GetLocale; both persist in
+// session_meta so the next request with the same cookie restores them.
 struct SessionObj : MapObject {
     Interp* ip;
+    std::shared_ptr<std::string> sid;
     long long codePage = 1252; // Windows-1252 default
-    explicit SessionObj(Interp& i) : ip(&i) {}
+    SessionObj(Interp& i, std::shared_ptr<std::string> s) : ip(&i), sid(std::move(s)) {}
     Variant getMember(const std::string& n) override {
         if (n == "lcid") return ip->localeId;
         if (n == "codepage") return Variant::mkLong(codePage);
@@ -908,15 +1068,31 @@ struct SessionObj : MapObject {
             long long l = toInt64(v);
             if (l < 0 || l > 0x7FFFFFFFLL) throwErr(5, errDesc(5));
             ip->localeId = Variant::mkLong(l);
+            sessionSetProp(*sid, "lcid", l);
             return;
         }
-        if (n == "codepage") { codePage = toInt64(v); return; }
+        if (n == "codepage") {
+            codePage = toInt64(v);
+            g_sessionCodePage = codePage; // affects output charset/encoding
+            sessionSetProp(*sid, "codepage", codePage);
+            return;
+        }
+        MapObject::setMember(n, v);
+    }
+};
+
+// Response object: IsClientConnected is read-only (CGI cannot detect
+// disconnects, so it is always True and assignment raises 438)
+struct RespObj : MapObject {
+    void setMember(const std::string& n, const Variant& v) override {
+        if (n == "isclientconnected") throwErr(438, errDesc(438));
         MapObject::setMember(n, v);
     }
 };
 
 // stateful collection object backed by the sqlite store
-void fillStateColl(Interp& ip, MapObject* c, bool isSession, std::shared_ptr<std::string> sid) {
+void fillStateColl(Interp& ip, MapObject* c, bool isSession,
+                   std::shared_ptr<std::string> sid, std::shared_ptr<bool> ended) {
     c->kind = isSession ? "Session" : "Application";
     if (isSession) c->props["sessionid"] = Variant::mkStr(*sid);
     auto timeoutOf = [c]() -> long long {
@@ -925,12 +1101,17 @@ void fillStateColl(Interp& ip, MapObject* c, bool isSession, std::shared_ptr<std
     };
     if (isSession) c->props["timeout"] = Variant::mkLong(20);
     c->props["contents"] = Variant::mkObj(makeContentsColl(isSession, sid));
-    c->onInvoke = [isSession, sid, timeoutOf, &ip](MapObject*, std::vector<Variant>& a) -> Variant {
+    c->onInvoke = [isSession, sid, timeoutOf, &ip, ended](MapObject*, std::vector<Variant>& a) -> Variant {
         std::string k = stateKeyOf(a);
         if (isSession) {
-            if (sessionExpired(*sid, timeoutOf())) {
-                stateRemoveAll(*sid);
-                ip.callGlobalProc("session_onend");
+            if (sessionExpireIfNeeded(*sid, timeoutOf())) {
+                // OnEnd fires at most once per request, even if the hook
+                // itself (or the page afterwards) touches Session again
+                if (ended && !*ended) {
+                    *ended = true;
+                    ip.callGlobalProc("session_onend");
+                }
+                sessionTouch(*sid); // the replacement session starts fresh
                 return Variant();
             }
             sessionTouch(*sid);
@@ -944,18 +1125,29 @@ void fillStateColl(Interp& ip, MapObject* c, bool isSession, std::shared_ptr<std
         stateSet(isSession, isSession ? *sid : "", k, toJsonText(v));
     };
     if (isSession) {
-        c->methods["abandon"] = [c, sid, &ip](MapObject*, std::vector<Variant>&) -> Variant {
-            ip.callGlobalProc("session_onend");
+        c->methods["abandon"] = [c, sid, &ip, ended](MapObject*, std::vector<Variant>&) -> Variant {
+            if (ended && !*ended) {
+                *ended = true;
+                try {
+                    ip.callGlobalProc("session_onend");
+                } catch (...) {
+                    // a failing/ending Session_OnEnd must not block abandonment
+                }
+            }
             stateRemoveAll(*sid);
-            // rotate: the abandoned id must not be reused
+            sessionMarkDead(*sid); // in-flight requests with the old id cannot write it back
+            // rotate: the abandoned id must not be reused; the replacement is
+            // a new session and gets Session_OnStart
             *sid = newSessionId();
+            ip.aspNewSession = true;
             c->props["sessionid"] = Variant::mkStr(*sid);
             if (g_resp) {
                 auto ck = std::make_shared<MapObject>();
                 ck->kind = "Cookie";
                 ck->props["value"] = Variant::mkStr(*sid);
                 ck->props["path"] = Variant::mkStr("/");
-                g_resp->outCookies["mscriptsessionid"] = ck;
+                g_resp->outCookies["MScriptSessionID"] = ck;
+                g_resp->dirtyCookies.insert("mscriptsessionid");
             }
             return Variant();
         };
@@ -975,18 +1167,32 @@ void fillStateColl(Interp& ip, MapObject* c, bool isSession, std::shared_ptr<std
 
 } // namespace
 
+// The ASP application root is the nearest ancestor directory of the script
+// (including its own directory) that contains a global.asa; if none does,
+// the script's own directory. Pages in subdirectories share their app root's
+// global.asa and Application namespace.
+std::string aspAppRootOf(const std::string& scriptFullName) {
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::absolute(scriptFullName, ec).parent_path();
+    std::filesystem::path p = dir;
+    for (;;) {
+        if (std::filesystem::exists(p / "global.asa", ec)) return p.lexically_normal().string();
+        if (!p.has_parent_path() || p == p.parent_path()) break;
+        p = p.parent_path();
+    }
+    return dir.lexically_normal().string();
+}
+
 void registerAspObjects(Interp& ip, bool cgi) {
     (void)cgi;
-    // Application values are namespaced by the script (the ASP "application")
-    {
-        std::error_code ec;
-        std::string fn = std::filesystem::path(ip.scriptFullName).filename().string();
-        g_appNs = lower(fn.empty() ? "default" : fn);
-    }
+    // Application values are namespaced by the application root (the nearest
+    // ancestor with a global.asa), so all pages of one app share state and
+    // distinct apps never collide — even with same-named pages
+    g_appNs = lower(aspAppRootOf(ip.scriptFullName));
 
     // ---- Response ----
     g_resp = std::make_shared<AspResponse>();
-    auto resp = std::make_shared<MapObject>();
+    auto resp = std::make_shared<RespObj>();
     resp->kind = "Response";
     ip.responseObj = resp;
     g_respObj = resp.get();
@@ -1052,25 +1258,28 @@ void registerAspObjects(Interp& ip, bool cgi) {
     auto cookies = std::make_shared<MapObject>();
     cookies->kind = "Cookies";
     auto reqCookies = parseCookies(std::getenv("HTTP_COOKIE") ? std::getenv("HTTP_COOKIE") : "");
+    // keys keep the original casing; lookup is case-insensitive
     auto cookieFor = [](const std::string& name) -> std::shared_ptr<MapObject> {
         if (!g_resp) return nullptr;
-        std::string k = lower(cleanHeaderText(name, "cookie name"));
-        auto it = g_resp->outCookies.find(k);
-        if (it != g_resp->outCookies.end()) return it->second;
+        std::string disp = cleanHeaderText(name, "cookie name");
+        std::string k = lower(disp);
+        for (auto& [existing, ck] : g_resp->outCookies)
+            if (lower(existing) == k) return ck;
         auto ck = std::make_shared<MapObject>();
         ck->kind = "Cookie";
         ck->props["value"] = Variant::mkStr("");
-        ck->props["path"] = Variant::mkStr("/");
-        // Response.Cookies("n")("path") = "/" and reads of the same form
+        // Response.Cookies("n")("path") = "/" and reads of the same form;
+        // any assignment marks the cookie dirty so it gets a Set-Cookie
         ck->onInvoke = [](MapObject* self, std::vector<Variant>& a) -> Variant {
             if (a.empty()) throwErr(450, errDesc(450));
             auto it = self->props.find(lower(toStr(a[0])));
             return it == self->props.end() ? Variant() : it->second;
         };
-        ck->onAssignInvoke = [](MapObject* self, std::vector<Variant>& a, const Variant& v) {
+        ck->onAssignInvoke = [k](MapObject* self, std::vector<Variant>& a, const Variant& v) {
             if (!a.empty()) self->props[lower(toStr(a[0]))] = v;
+            if (g_resp) g_resp->dirtyCookies.insert(k);
         };
-        g_resp->outCookies[k] = ck;
+        g_resp->outCookies[disp] = ck;
         return ck;
     };
     cookies->onInvoke = [cookieFor](MapObject*, std::vector<Variant>& a) -> Variant {
@@ -1082,7 +1291,10 @@ void registerAspObjects(Interp& ip, bool cgi) {
     cookies->onAssignInvoke = [cookieFor](MapObject*, std::vector<Variant>& a, const Variant& v) {
         if (a.empty()) return;
         auto ck = cookieFor(toStr(a[0]));
-        if (ck) ck->props["value"] = v;
+        if (ck) {
+            ck->props["value"] = v;
+            if (g_resp) g_resp->dirtyCookies.insert(lower(toStr(a[0])));
+        }
     };
     resp->props["cookies"] = Variant::mkObj(cookies);
 
@@ -1129,8 +1341,20 @@ void registerAspObjects(Interp& ip, bool cgi) {
     sv->onInvoke = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
         const char* v = std::getenv(toStr(a[0]).c_str());
+        if (!v) {
+            std::string up = toStr(a[0]);
+            for (auto& ch : up) ch = (char)std::toupper((unsigned char)ch);
+            v = std::getenv(up.c_str()); // CGI variables are uppercase
+        }
         return Variant::mkStr(v ? v : "");
     };
+    sv->methods["item"] = sv->onInvoke;
+    sv->props["count"] = Variant::mkLong([] {
+        extern char** environ;
+        long long n = 0;
+        for (char** e = environ; e && *e; e++) n++;
+        return n;
+    }());
     req->props["servervariables"] = Variant::mkObj(sv);
     req->props["totalbytes"] = Variant::mkLong([] {
         const char* cl = std::getenv("CONTENT_LENGTH");
@@ -1223,6 +1447,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
 
     // ---- Session / Application (SQLite-backed) ----
     auto sid = std::make_shared<std::string>();
+    auto ended = std::make_shared<bool>(false); // Session_OnEnd fired this request
     {
         auto it = reqCookies.find("mscriptsessionid");
         // only accept well-formed ids; a client-chosen garbage id is replaced
@@ -1236,15 +1461,31 @@ void registerAspObjects(Interp& ip, bool cgi) {
             ck->kind = "Cookie";
             ck->props["value"] = Variant::mkStr(*sid);
             ck->props["path"] = Variant::mkStr("/");
-            g_resp->outCookies["mscriptsessionid"] = ck;
+            g_resp->outCookies["MScriptSessionID"] = ck;
+            g_resp->dirtyCookies.insert("mscriptsessionid");
         }
     }
-    if (sessionExpired(*sid, 20)) stateRemoveAll(*sid);
+    // expiry is checked and cleaned atomically; an expired session fires
+    // OnEnd once and the continuation counts as a new session (OnStart runs)
+    if (sessionExpireIfNeeded(*sid, 20)) {
+        if (!*ended) {
+            *ended = true;
+            ip.callGlobalProc("session_onend");
+        }
+        ip.aspNewSession = true;
+    }
     sessionTouch(*sid);
-    auto session = std::make_shared<SessionObj>(ip);
-    fillStateColl(ip, session.get(), true, sid);
+    auto session = std::make_shared<SessionObj>(ip, sid);
+    fillStateColl(ip, session.get(), true, sid, ended);
+    // restore persisted session settings
+    {
+        long long lcid = sessionGetProp(*sid, "lcid", 0);
+        if (lcid > 0) ip.localeId = Variant::mkLong(lcid);
+        session->codePage = sessionGetProp(*sid, "codepage", 1252);
+        g_sessionCodePage = session->codePage;
+    }
     auto app = std::make_shared<MapObject>();
-    fillStateColl(ip, app.get(), false, sid);
+    fillStateColl(ip, app.get(), false, sid, nullptr);
 
     ip.global.vars["request"] = Variant::mkObj(req);
     ip.global.vars["response"] = Variant::mkObj(resp);
@@ -1257,10 +1498,11 @@ void registerAspObjects(Interp& ip, bool cgi) {
 // Application_OnStart is guarded in the state db so it runs once per
 // application even though each CGI request is a fresh process
 void aspGlobalAsaHooks(Interp& ip) {
-    if (stateGet(false, "", "global.asa.onstart").empty()) {
-        if (ip.callGlobalProc("application_onstart"))
-            stateSet(false, "", "global.asa.onstart", "1");
-    }
+    // claim the marker atomically BEFORE running the hook: overlapping first
+    // requests must not both run Application_OnStart, and a hook error must
+    // not leave the marker unset (the claim lives in the separate meta table,
+    // never visible through Application.Contents)
+    if (metaClaim(g_appNs + "|onstart")) ip.callGlobalProc("application_onstart");
     if (ip.aspNewSession) ip.callGlobalProc("session_onstart");
 }
 
@@ -1276,7 +1518,8 @@ void flushAspResponse(Interp& ip) {
     syncRespProps();
     if (!g_resp->headersSent) ensureHeaders();
     if (!g_resp->body.empty()) {
-        std::fwrite(g_resp->body.data(), 1, g_resp->body.size(), stdout);
+        std::string out = encodeOut(g_resp->body);
+        std::fwrite(out.data(), 1, out.size(), stdout);
         std::fflush(stdout);
         g_resp->body.clear();
     }

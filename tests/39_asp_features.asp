@@ -11,11 +11,24 @@ Response.Cookies("theme")("path") = "/app"
 Response.Cookies("theme")("expires") = CDate("2031-06-01 12:00:00")
 Response.Cookies("pref") = "x=1"
 Response.Cookies("pref")("httponly") = True
+Response.Cookies("MixedCase") = "v"
+Dim unused : unused = Response.Cookies("readOnly")   ' read must not emit Set-Cookie
+On Error Resume Next
+Response.IsClientConnected = False                    ' read-only: error 438
+WScript.Echo "ro-err=" & Err.Number
+Err.Clear
+On Error Goto 0
 Response.Write "req-name=" & Request("name") & vbCrLf
 Response.Write "req-cookie=" & Request("theme") & vbCrLf
 Response.Write "req-sv=" & Request("QUERY_STRING") & vbCrLf
 Response.Write "qs-count=" & Request.QueryString.Count & vbCrLf
 Response.Write "qs-item=" & Request.QueryString.Item("n") & vbCrLf
+Response.Write "sv-item=" & Request.ServerVariables.Item("QUERY_STRING") & vbCrLf
+Response.Write "sv-count>0=" & (Request.ServerVariables.Count > 0) & vbCrLf
+Response.Write "cc=" & Response.CacheControl & vbCrLf   ' readable after a write synced it
+Session.CodePage = 65001
+Response.Write "cp-charset-ok" & vbCrLf
+Session.CodePage = 1252
 Session("user") = "alice"
 Session.Contents("role") = "admin"
 Response.Write "contents=" & Session.Contents.Count & ":" & Session.Contents.Item("role") & vbCrLf

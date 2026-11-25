@@ -92,8 +92,10 @@ int main(int argc, char** argv) {
         // of the page's own statements
         if (aspMode) {
             std::error_code ec;
+            // global.asa lives at the application root, so pages in
+            // subdirectories get the same hooks
             std::filesystem::path gasa =
-                std::filesystem::path(srcName).parent_path() / "global.asa";
+                std::filesystem::path(aspAppRootOf(srcName)) / "global.asa";
             if (std::filesystem::exists(gasa, ec)) {
                 std::ifstream gin(gasa, std::ios::binary);
                 std::ostringstream gss;
@@ -116,8 +118,10 @@ int main(int argc, char** argv) {
             ip.aspStart = (double)std::time(nullptr);
         }
         ip.load(prog, srcName);
-        if (aspMode) aspGlobalAsaHooks(ip);
         try {
+            // inside the VBSError handler so hook errors get the normal ASP
+            // error report + response flush
+            if (aspMode) aspGlobalAsaHooks(ip);
             ip.run();
         } catch (VBSError& e) {
             // small positive codes are VB errors shown as &H800Axxxx; a full

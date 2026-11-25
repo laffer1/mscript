@@ -22,6 +22,10 @@ struct Interp;
 // Newlines are preserved so error line numbers still match the .asp file.
 std::string aspToVbs(const std::string& src, bool dropText = false);
 
+// The ASP application root for a script: the nearest ancestor directory
+// containing a global.asa, else the script's own directory.
+std::string aspAppRootOf(const std::string& scriptFullName);
+
 // Register the ASP globals (request/response/server/session/application).
 // cgi=true when running under a web server (REQUEST_METHOD is set).
 void registerAspObjects(Interp& ip, bool cgi);
