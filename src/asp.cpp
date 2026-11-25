@@ -250,8 +250,33 @@ std::map<std::string, std::string> parseMultipart(const std::string& body, const
 
 // ---------- Response state ----------
 
+// Response.Cookies(name), with classic-ASP semantics: the cookie's content is
+// either a scalar value (Response.Cookies("n") = v) or a sub-key dictionary
+// (Response.Cookies("n")("k") = v, sent as k=v&k2=v2). Attributes are set only
+// through properties (.Path .Domain .Expires .Secure .HttpOnly .SameSite), so
+// a sub-key name can never turn into a cookie attribute. Any write marks the
+// cookie dirty so it gets a Set-Cookie header.
+struct CookieObj : MapObject {
+    std::string key;   // lowercased name
+    std::string value; // scalar value (when there are no sub-keys)
+    std::vector<std::pair<std::string, std::string>> subkeys; // original case, insertion order
+    explicit CookieObj(std::string k);
+    void markDirty();
+    std::string content() const;
+    Variant getMember(const std::string& n) override;
+    void setMember(const std::string& n, const Variant& v) override;
+    bool hasMember(const std::string& n) const override;
+};
+
+// one piece of the buffered body: text is transcoded per Session.CodePage at
+// output time, binary (Response.BinaryWrite) is emitted byte-for-byte
+struct BodyChunk {
+    std::string data;
+    bool binary;
+};
+
 struct AspResponse {
-    std::string body;
+    std::vector<BodyChunk> body;
     std::string status = "200 OK";
     std::string contentType = "text/html";
     std::string charset;                                        // appended to Content-Type
@@ -259,7 +284,7 @@ struct AspResponse {
     std::string pics;                                           // PICS-Label header
     std::string expiresAbs;                                     // Expires header (absolute)
     std::vector<std::pair<std::string, std::string>> headers; // extra headers
-    std::map<std::string, std::shared_ptr<MapObject>> outCookies; // Response.Cookies(name), original case
+    std::map<std::string, std::shared_ptr<CookieObj>> outCookies; // Response.Cookies(name), original case
     std::set<std::string> dirtyCookies;                  // lowercased names actually written
     int outCp = 0;                                        // 1252/28591 -> transcode output to Latin-1
     bool expiresConsumed = false;                         // Response.Expires consumed once
@@ -342,6 +367,85 @@ std::string cleanCookieAttr(const std::string& s, const char* what) {
     return s;
 }
 
+// cookie names must be RFC 6265 tokens: a ';', '=', ',' or space in a name
+// would inject attributes or split the header
+std::string cleanCookieName(const std::string& s) {
+    if (s.empty()) throwErr(5, "ASP cookie: empty cookie name");
+    for (unsigned char c : s) {
+        if (c <= 0x20 || c >= 0x7F || std::strchr("()<>@,;:\\\"/[]?={}", c))
+            throwErr(5, "ASP cookie: invalid character in cookie name");
+    }
+    return s;
+}
+
+const std::set<std::string>& cookieAttrNames() {
+    static const std::set<std::string> a = {"path", "domain", "expires", "secure", "httponly", "samesite"};
+    return a;
+}
+
+CookieObj::CookieObj(std::string k) : key(std::move(k)) {
+    kind = "Cookie";
+    // sub-key dictionary: cookie("k") reads, cookie("k") = v writes
+    onInvoke = [](MapObject* self, std::vector<Variant>& a) -> Variant {
+        auto* ck = static_cast<CookieObj*>(self);
+        if (a.empty()) return Variant::mkStr(ck->content());
+        std::string k = lower(toStr(a[0]));
+        for (auto& [sk, sv] : ck->subkeys)
+            if (lower(sk) == k) return Variant::mkStr(sv);
+        return Variant::mkStr("");
+    };
+    onAssignInvoke = [](MapObject* self, std::vector<Variant>& a, const Variant& v) {
+        auto* ck = static_cast<CookieObj*>(self);
+        if (a.empty()) throwErr(450, errDesc(450));
+        std::string name = toStr(a[0]);
+        std::string k = lower(name);
+        std::string val = toStr(v);
+        ck->value.clear(); // a cookie with keys has no scalar value
+        bool found = false;
+        for (auto& [sk, sv] : ck->subkeys)
+            if (lower(sk) == k) { sv = val; found = true; break; }
+        if (!found) ck->subkeys.emplace_back(name, val);
+        ck->markDirty();
+    };
+}
+
+void CookieObj::markDirty() {
+    if (g_resp) g_resp->dirtyCookies.insert(key);
+}
+
+std::string CookieObj::content() const {
+    if (subkeys.empty()) return urlEncode(value);
+    std::string out;
+    for (auto& [k, v] : subkeys) {
+        if (!out.empty()) out += '&';
+        out += urlEncode(k) + "=" + urlEncode(v);
+    }
+    return out;
+}
+
+bool CookieObj::hasMember(const std::string& n) const {
+    return n == "haskeys" || cookieAttrNames().count(n) || MapObject::hasMember(n);
+}
+
+Variant CookieObj::getMember(const std::string& n) {
+    if (n == "haskeys") return Variant::mkBool(!subkeys.empty());
+    if (cookieAttrNames().count(n)) {
+        auto it = props.find(n);
+        if (it != props.end()) return it->second;
+        if (n == "secure" || n == "httponly") return Variant::mkBool(false);
+        if (n == "expires") return Variant();
+        return Variant::mkStr("");
+    }
+    return MapObject::getMember(n);
+}
+
+void CookieObj::setMember(const std::string& n, const Variant& v) {
+    if (n == "haskeys") throwErr(438, errDesc(438)); // read-only
+    if (!cookieAttrNames().count(n)) throwErr(438, errDesc(438));
+    MapObject::setMember(n, v);
+    markDirty(); // e.g. .Expires = <past date> alone deletes a cookie
+}
+
 // transcode UTF-8 output to Latin-1 when the session code page asks for it
 std::string encodeOut(const std::string& s) {
     if (!g_resp || (g_resp->outCp != 1252 && g_resp->outCp != 28591)) return s;
@@ -400,8 +504,7 @@ void ensureHeaders() {
         // only cookies the page actually wrote get a Set-Cookie header; a bare
         // read of Response.Cookies(name) must not emit an empty cookie
         if (!g_resp->dirtyCookies.count(lower(name))) continue;
-        std::string c = cleanHeaderText(name, "cookie name") + "=" +
-                        urlEncode(toStr(ck->props.count("value") ? ck->props["value"] : Variant()));
+        std::string c = cleanCookieName(name) + "=" + ck->content();
         auto attr = [&](const char* k) -> std::string {
             auto i2 = ck->props.find(k);
             return i2 == ck->props.end() ? "" : toStr(i2->second);
@@ -430,14 +533,36 @@ void ensureHeaders() {
     std::fwrite(h.data(), 1, h.size(), stdout);
 }
 
-void responseBody(const std::string& s) {
+// the single output path for body bytes (buffered flush, unbuffered writes
+// and the final flush): text is transcoded, binary is written untouched
+void emitChunk(const BodyChunk& c) {
+    if (c.binary) {
+        std::fwrite(c.data.data(), 1, c.data.size(), stdout);
+    } else {
+        std::string out = encodeOut(c.data);
+        std::fwrite(out.data(), 1, out.size(), stdout);
+    }
+}
+
+void flushBody() {
+    if (!g_resp) return;
+    ensureHeaders();
+    for (auto& c : g_resp->body) emitChunk(c);
+    g_resp->body.clear();
+    std::fflush(stdout);
+}
+
+void responseBody(const std::string& s, bool binary = false) {
     if (!g_resp || g_resp->ended) return;
     syncRespProps();
-    if (g_resp->buffer) g_resp->body += s;
-    else {
+    if (g_resp->buffer) {
+        if (!g_resp->body.empty() && g_resp->body.back().binary == binary)
+            g_resp->body.back().data += s;
+        else
+            g_resp->body.push_back({s, binary});
+    } else {
         ensureHeaders();
-        std::string out = encodeOut(s);
-        std::fwrite(out.data(), 1, out.size(), stdout);
+        emitChunk({s, binary});
         std::fflush(stdout);
     }
 }
@@ -1035,9 +1160,8 @@ Variant fromJsonText(const std::string& s) {
 // whenever the request arrived over TLS
 void setSessionCookie(const std::string& sid) {
     if (!g_resp) return;
-    auto ck = std::make_shared<MapObject>();
-    ck->kind = "Cookie";
-    ck->props["value"] = Variant::mkStr(sid);
+    auto ck = std::make_shared<CookieObj>("mscriptsessionid");
+    ck->value = sid;
     ck->props["path"] = Variant::mkStr("/");
     ck->props["httponly"] = Variant::mkBool(true);
     ck->props["samesite"] = Variant::mkStr("Lax");
@@ -1271,12 +1395,14 @@ void registerAspObjects(Interp& ip, bool cgi) {
     resp->methods["binarywrite"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         for (auto& v : a) {
             if (v.t == VT::Array && v.arr) {
-                for (auto& e : v.arr->data) {
-                    // each element is a raw byte, not decimal text
-                    responseBody(std::string(1, (char)(unsigned char)toInt64(e)));
-                }
+                // each element is a raw byte, not decimal text; binary output
+                // bypasses the code-page transcoding
+                std::string bytes;
+                bytes.reserve(v.arr->data.size());
+                for (auto& e : v.arr->data) bytes += (char)(unsigned char)toInt64(e);
+                responseBody(bytes, true);
             } else {
-                responseBody(toStr(v));
+                responseBody(toStr(v), true);
             }
         }
         return Variant();
@@ -1284,10 +1410,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
     resp->methods["flush"] = [](MapObject*, std::vector<Variant>&) -> Variant {
         if (g_resp) {
             syncRespProps();
-            ensureHeaders();
-            std::fwrite(g_resp->body.data(), 1, g_resp->body.size(), stdout);
-            std::fflush(stdout);
-            g_resp->body.clear();
+            flushBody(); // same transcoding as the final flush
         }
         return Variant();
     };
@@ -1323,26 +1446,13 @@ void registerAspObjects(Interp& ip, bool cgi) {
     cookies->kind = "Cookies";
     auto reqCookies = parseCookies(std::getenv("HTTP_COOKIE") ? std::getenv("HTTP_COOKIE") : "");
     // keys keep the original casing; lookup is case-insensitive
-    auto cookieFor = [](const std::string& name) -> std::shared_ptr<MapObject> {
+    auto cookieFor = [](const std::string& name) -> std::shared_ptr<CookieObj> {
         if (!g_resp) return nullptr;
-        std::string disp = cleanHeaderText(name, "cookie name");
+        std::string disp = cleanCookieName(name);
         std::string k = lower(disp);
         for (auto& [existing, ck] : g_resp->outCookies)
             if (lower(existing) == k) return ck;
-        auto ck = std::make_shared<MapObject>();
-        ck->kind = "Cookie";
-        ck->props["value"] = Variant::mkStr("");
-        // Response.Cookies("n")("path") = "/" and reads of the same form;
-        // any assignment marks the cookie dirty so it gets a Set-Cookie
-        ck->onInvoke = [](MapObject* self, std::vector<Variant>& a) -> Variant {
-            if (a.empty()) throwErr(450, errDesc(450));
-            auto it = self->props.find(lower(toStr(a[0])));
-            return it == self->props.end() ? Variant() : it->second;
-        };
-        ck->onAssignInvoke = [k](MapObject* self, std::vector<Variant>& a, const Variant& v) {
-            if (!a.empty()) self->props[lower(toStr(a[0]))] = v;
-            if (g_resp) g_resp->dirtyCookies.insert(k);
-        };
+        auto ck = std::make_shared<CookieObj>(k);
         g_resp->outCookies[disp] = ck;
         return ck;
     };
@@ -1352,12 +1462,14 @@ void registerAspObjects(Interp& ip, bool cgi) {
         if (!ck) throwErr(5, errDesc(5));
         return Variant::mkObj(ck);
     };
+    // Response.Cookies("n") = v sets the scalar value (dropping any sub-keys)
     cookies->onAssignInvoke = [cookieFor](MapObject*, std::vector<Variant>& a, const Variant& v) {
-        if (a.empty()) return;
+        if (a.empty()) throwErr(450, errDesc(450));
         auto ck = cookieFor(toStr(a[0]));
         if (ck) {
-            ck->props["value"] = v;
-            if (g_resp) g_resp->dirtyCookies.insert(lower(toStr(a[0])));
+            ck->value = toStr(v);
+            ck->subkeys.clear();
+            ck->markDirty();
         }
     };
     resp->props["cookies"] = Variant::mkObj(cookies);
@@ -1575,11 +1687,5 @@ void flushAspResponse(Interp& ip) {
     (void)ip;
     if (!g_resp) return;
     syncRespProps();
-    if (!g_resp->headersSent) ensureHeaders();
-    if (!g_resp->body.empty()) {
-        std::string out = encodeOut(g_resp->body);
-        std::fwrite(out.data(), 1, out.size(), stdout);
-        std::fflush(stdout);
-        g_resp->body.clear();
-    }
+    flushBody();
 }

@@ -156,6 +156,10 @@ if [ -d tests/aspsec ]; then
     asp_check expires_huge match 'Expires: .* 9999 ' tests/aspsec/expires.asp
     # Response.Redirect inside Session_OnStart ends the request cleanly
     asp_check onstart_redirect match 'Location: /login' tests/aspsec/app/page.asp
+    # BinaryWrite bytes are never transcoded (0xFF 0xD8 0xE9 stay as-is)
+    asp_check binarywrite match "$(printf '\377\330\351')" tests/aspsec/binwrite.asp
+    # Response.Flush transcodes like the final flush (é -> one 0xE9 byte, both sides)
+    asp_check flush_transcode match "$(printf 'caf\351|caf\351.')" tests/aspsec/flush.asp
     # LF-only multipart: no crash, value intact
     printf -- '--B\nContent-Disposition: form-data; name="a"\n\n--B\nContent-Disposition: form-data; name="b"\n\nhello\n--B--' >"$tmp.body"
     env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \
