@@ -34,6 +34,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+extern char** environ; // file scope: inside the anonymous namespace it would get internal linkage
+
 namespace {
 
 // ---------- template transform ----------
@@ -177,7 +179,10 @@ std::map<std::string, std::string> parsePairs(const std::string& s) {
     return m;
 }
 
-// cookies use '; ' as the delimiter, not '&'
+// cookies use '; ' as the delimiter, not '&'. Values are kept RAW (still
+// URL-encoded): a cookie written with sub-keys (n=k=v&k2=v2) must be split
+// on '&'/'=' before decoding, or an encoded '&' inside a sub-key value would
+// split it. Use urlDecode() for the whole value.
 std::map<std::string, std::string> parseCookies(const std::string& s) {
     std::map<std::string, std::string> m;
     size_t pos = 0;
@@ -190,7 +195,7 @@ std::map<std::string, std::string> parseCookies(const std::string& s) {
         if (!pair.empty()) {
             size_t eq = pair.find('=');
             std::string k = lower(urlDecode(eq == std::string::npos ? pair : pair.substr(0, eq)));
-            std::string v = eq == std::string::npos ? "" : urlDecode(pair.substr(eq + 1));
+            std::string v = eq == std::string::npos ? "" : pair.substr(eq + 1);
             // first occurrence wins: browsers send the most specific
             // (longest path) cookie first, so a cookie tossed in from a
             // broader path or a parent domain cannot override it
@@ -615,6 +620,159 @@ const std::string& requestBody() {
         }
     }
     return g_reqBody;
+}
+
+std::string g_appRoot; // the application root dir (original case), for APPL_PHYSICAL_PATH
+
+// ---------- Request.Cookies ----------
+
+// Request.Cookies("n"), as classic ASP's read cookie: the decoded value is
+// the default property (so it still reads as a string), and a cookie written
+// with sub-keys exposes them: Request.Cookies("n")("k"), .HasKeys, .Count.
+struct ReqCookieObj : MapObject {
+    std::string raw;                         // as received, URL-encoded
+    std::map<std::string, std::string> keys; // decoded sub-keys, lowercased names
+    bool hasKeys = false;
+    explicit ReqCookieObj(std::string r);
+    bool hasDefault() const override { return true; }
+    Variant getDefault() override { return Variant::mkStr(urlDecode(raw)); }
+};
+
+ReqCookieObj::ReqCookieObj(std::string r) : raw(std::move(r)) {
+    kind = "IReadCookie";
+    // sub-keys exist only when the raw value has an unencoded '=' (a scalar
+    // value written by Response.Cookies is URL-encoded, so its '=' is %3D)
+    hasKeys = raw.find('=') != std::string::npos;
+    if (hasKeys) keys = parsePairs(raw);
+    props["haskeys"] = Variant::mkBool(hasKeys);
+    props["count"] = Variant::mkLong(hasKeys ? (long long)keys.size() : 0);
+    onInvoke = [](MapObject* self, std::vector<Variant>& a) -> Variant {
+        auto* ck = static_cast<ReqCookieObj*>(self);
+        if (a.empty()) return ck->getDefault();
+        auto it = ck->keys.find(lower(toStr(a[0])));
+        return Variant::mkStr(it == ck->keys.end() ? "" : it->second);
+    };
+    methods["item"] = onInvoke;
+    onEnum = [](MapObject* self) -> std::vector<Variant> {
+        std::vector<Variant> out;
+        for (auto& kv : static_cast<ReqCookieObj*>(self)->keys) out.push_back(Variant::mkStr(kv.first));
+        return out;
+    };
+}
+
+std::shared_ptr<MapObject> makeReqCookies(const std::map<std::string, std::string>& raw) {
+    auto c = std::make_shared<MapObject>();
+    c->kind = "Cookies";
+    c->props["count"] = Variant::mkLong((long long)raw.size());
+    // a missing cookie is an empty cookie object (reads as ""), as in ASP
+    c->onInvoke = [raw](MapObject*, std::vector<Variant>& a) -> Variant {
+        if (a.empty()) throwErr(450, errDesc(450));
+        auto it = raw.find(lower(toStr(a[0])));
+        return Variant::mkObj(std::make_shared<ReqCookieObj>(it == raw.end() ? "" : it->second));
+    };
+    c->methods["item"] = c->onInvoke;
+    c->onEnum = [raw](MapObject*) -> std::vector<Variant> {
+        std::vector<Variant> out;
+        for (auto& kv : raw) out.push_back(Variant::mkStr(kv.first));
+        return out;
+    };
+    return c;
+}
+
+// ---------- Request.ServerVariables ----------
+//
+// Only request metadata is exposed, not the whole process environment: the
+// RFC 3875 CGI variables, the request headers (HTTP_*), TLS details (SSL_*,
+// HTTPS) and common web-server extras, plus the IIS names synthesized from
+// them. Anything else in the environment (secrets passed with SetEnv, PATH,
+// MScript_ASP_STATE_DB, ...) is not reachable through ServerVariables or
+// the Request("name") fallback.
+
+const std::set<std::string>& cgiVarNames() {
+    static const std::set<std::string> n = {
+        // RFC 3875
+        "AUTH_TYPE", "CONTENT_LENGTH", "CONTENT_TYPE", "GATEWAY_INTERFACE", "PATH_INFO",
+        "PATH_TRANSLATED", "QUERY_STRING", "REMOTE_ADDR", "REMOTE_HOST", "REMOTE_IDENT",
+        "REMOTE_USER", "REQUEST_METHOD", "SCRIPT_NAME", "SERVER_NAME", "SERVER_PORT",
+        "SERVER_PROTOCOL", "SERVER_SOFTWARE",
+        // common server extras (Apache, nginx, lighttpd)
+        "DOCUMENT_ROOT", "HTTPS", "REDIRECT_STATUS", "REDIRECT_URL", "REMOTE_PORT",
+        "REQUEST_SCHEME", "REQUEST_URI", "SCRIPT_FILENAME", "SCRIPT_URI", "SCRIPT_URL",
+        "SERVER_ADDR", "SERVER_ADMIN", "SERVER_SIGNATURE", "CONTEXT_DOCUMENT_ROOT",
+        "CONTEXT_PREFIX", "UNIQUE_ID",
+    };
+    return n;
+}
+
+bool exposedEnvName(const std::string& up) {
+    return cgiVarNames().count(up) || up.rfind("HTTP_", 0) == 0 || up.rfind("SSL_", 0) == 0;
+}
+
+std::string envOr(const char* name, const char* dflt = "") {
+    const char* v = std::getenv(name);
+    return v ? v : dflt;
+}
+
+// HTTP_ACCEPT_LANGUAGE -> Accept-Language (for ALL_RAW)
+std::string headerNameOf(const std::string& var) {
+    std::string out;
+    bool up = true;
+    for (size_t i = 5; i < var.size(); i++) {
+        char c = var[i];
+        if (c == '_') { out += '-'; up = true; continue; }
+        out += up ? c : (char)std::tolower((unsigned char)c);
+        up = false;
+    }
+    return out;
+}
+
+std::vector<std::string> exposedEnvNames() {
+    std::vector<std::string> out;
+    for (char** e = environ; e && *e; e++) {
+        std::string kv = *e;
+        size_t eq = kv.find('=');
+        if (eq == std::string::npos) continue;
+        std::string name = kv.substr(0, eq);
+        if (exposedEnvName(name)) out.push_back(name);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// the IIS-only names, derived from the CGI environment
+const std::vector<std::string>& synthVarNames() {
+    static const std::vector<std::string> n = {
+        "ALL_HTTP", "ALL_RAW", "APPL_PHYSICAL_PATH", "AUTH_USER", "LOCAL_ADDR",
+        "LOGON_USER", "SERVER_PORT_SECURE", "URL"};
+    return n;
+}
+
+bool serverVariable(const std::string& name, std::string& out) {
+    std::string up = name;
+    for (auto& ch : up) ch = (char)std::toupper((unsigned char)ch);
+    if (up == "ALL_HTTP" || up == "ALL_RAW") {
+        out.clear();
+        for (auto& n : exposedEnvNames()) {
+            if (n.rfind("HTTP_", 0) != 0) continue;
+            if (up == "ALL_HTTP") out += n + ":" + envOr(n.c_str()) + "\n";
+            else out += headerNameOf(n) + ": " + envOr(n.c_str()) + "\r\n";
+        }
+        return true;
+    }
+    if (up == "URL") { out = envOr("SCRIPT_NAME"); return true; }
+    if (up == "LOCAL_ADDR") { out = envOr("SERVER_ADDR"); return true; }
+    if (up == "AUTH_USER" || up == "LOGON_USER") { out = envOr("REMOTE_USER"); return true; }
+    if (up == "SERVER_PORT_SECURE") {
+        std::string h = lower(envOr("HTTPS"));
+        out = (h == "on" || h == "1") ? "1" : "0";
+        return true;
+    }
+    if (up == "APPL_PHYSICAL_PATH") { out = g_appRoot + "/"; return true; }
+    if (!exposedEnvName(up)) return false;
+    const char* v = std::getenv(up.c_str());
+    if (!v) return false;
+    out = v;
+    return true;
 }
 
 // ---------- key/value collection (Request.QueryString, Form, ...) ----------
@@ -1553,7 +1711,8 @@ void registerAspObjects(Interp& ip, bool cgi) {
     // Application values are namespaced by the application root (the nearest
     // ancestor with a global.asa), so all pages of one app share state and
     // distinct apps never collide — even with same-named pages
-    g_appNs = lower(aspAppRootOf(ip.scriptFullName));
+    g_appRoot = aspAppRootOf(ip.scriptFullName);
+    g_appNs = lower(g_appRoot);
 
     // ---- Response ----
     g_resp = std::make_shared<AspResponse>();
@@ -1682,7 +1841,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
         }
     }
     req->props["form"] = Variant::mkObj(makeColl(form, "Form"));
-    req->props["cookies"] = Variant::mkObj(makeColl(reqCookies, "Cookies"));
+    req->props["cookies"] = Variant::mkObj(makeReqCookies(reqCookies));
     // Request("name"): combined lookup in the documented order —
     // QueryString, Form, Cookies, ServerVariables
     req->onInvoke = [qs, form, reqCookies](MapObject*, std::vector<Variant>& a) -> Variant {
@@ -1693,34 +1852,33 @@ void registerAspObjects(Interp& ip, bool cgi) {
         it = form.find(k);
         if (it != form.end()) return Variant::mkStr(it->second);
         it = reqCookies.find(k);
-        if (it != reqCookies.end()) return Variant::mkStr(it->second);
-        const char* v = std::getenv(toStr(a[0]).c_str());
-        if (!v) {
-            std::string up = toStr(a[0]);
-            for (auto& ch : up) ch = (char)std::toupper((unsigned char)ch);
-            v = std::getenv(up.c_str()); // CGI variables are uppercase
-        }
-        return Variant::mkStr(v ? v : "");
+        if (it != reqCookies.end()) return Variant::mkStr(urlDecode(it->second));
+        std::string v;
+        return Variant::mkStr(serverVariable(toStr(a[0]), v) ? v : "");
     };
     auto sv = std::make_shared<MapObject>();
     sv->kind = "ServerVariables";
     sv->onInvoke = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
-        const char* v = std::getenv(toStr(a[0]).c_str());
-        if (!v) {
-            std::string up = toStr(a[0]);
-            for (auto& ch : up) ch = (char)std::toupper((unsigned char)ch);
-            v = std::getenv(up.c_str()); // CGI variables are uppercase
-        }
-        return Variant::mkStr(v ? v : "");
+        std::string v;
+        return Variant::mkStr(serverVariable(toStr(a[0]), v) ? v : "");
     };
     sv->methods["item"] = sv->onInvoke;
-    sv->props["count"] = Variant::mkLong([] {
-        extern char** environ;
-        long long n = 0;
-        for (char** e = environ; e && *e; e++) n++;
+    // For Each name In Request.ServerVariables: the exposed variables present
+    // plus the synthesized IIS names
+    auto svNames = [] {
+        std::vector<std::string> n = exposedEnvNames();
+        for (auto& x : synthVarNames()) n.push_back(x);
+        std::sort(n.begin(), n.end());
+        n.erase(std::unique(n.begin(), n.end()), n.end());
         return n;
-    }());
+    };
+    sv->onEnum = [svNames](MapObject*) -> std::vector<Variant> {
+        std::vector<Variant> out;
+        for (auto& n : svNames()) out.push_back(Variant::mkStr(n));
+        return out;
+    };
+    sv->props["count"] = Variant::mkLong((long long)svNames().size());
     req->props["servervariables"] = Variant::mkObj(sv);
     req->props["totalbytes"] = Variant::mkLong([] {
         const char* cl = std::getenv("CONTENT_LENGTH");
@@ -1843,12 +2001,13 @@ void registerAspObjects(Interp& ip, bool cgi) {
         // malformed, unknown (client-chosen), expired or abandoned id is
         // replaced with a fresh one, so an attacker cannot fix a victim's
         // session id in advance
-        if (it != reqCookies.end() && validSessionId(it->second)) {
-            switch (sessionCheck(it->second, &timeout)) {
-                case SessState::Live: *sid = it->second; break;
+        std::string presented = it == reqCookies.end() ? "" : urlDecode(it->second);
+        if (validSessionId(presented)) {
+            switch (sessionCheck(presented, &timeout)) {
+                case SessState::Live: *sid = presented; break;
                 // Session_OnEnd runs from aspGlobalAsaHooks, once global.asa
                 // is loaded (it is not yet, here)
-                case SessState::Expired: g_sess.pendingEnd = it->second; break;
+                case SessState::Expired: g_sess.pendingEnd = presented; break;
                 case SessState::Invalid: break;
             }
         }
