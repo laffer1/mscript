@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -250,8 +251,33 @@ std::map<std::string, std::string> parseMultipart(const std::string& body, const
 
 // ---------- Response state ----------
 
+// Response.Cookies(name), with classic-ASP semantics: the cookie's content is
+// either a scalar value (Response.Cookies("n") = v) or a sub-key dictionary
+// (Response.Cookies("n")("k") = v, sent as k=v&k2=v2). Attributes are set only
+// through properties (.Path .Domain .Expires .Secure .HttpOnly .SameSite), so
+// a sub-key name can never turn into a cookie attribute. Any write marks the
+// cookie dirty so it gets a Set-Cookie header.
+struct CookieObj : MapObject {
+    std::string key;   // lowercased name
+    std::string value; // scalar value (when there are no sub-keys)
+    std::vector<std::pair<std::string, std::string>> subkeys; // original case, insertion order
+    explicit CookieObj(std::string k);
+    void markDirty();
+    std::string content() const;
+    Variant getMember(const std::string& n) override;
+    void setMember(const std::string& n, const Variant& v) override;
+    bool hasMember(const std::string& n) const override;
+};
+
+// one piece of the buffered body: text is transcoded per Session.CodePage at
+// output time, binary (Response.BinaryWrite) is emitted byte-for-byte
+struct BodyChunk {
+    std::string data;
+    bool binary;
+};
+
 struct AspResponse {
-    std::string body;
+    std::vector<BodyChunk> body;
     std::string status = "200 OK";
     std::string contentType = "text/html";
     std::string charset;                                        // appended to Content-Type
@@ -259,7 +285,7 @@ struct AspResponse {
     std::string pics;                                           // PICS-Label header
     std::string expiresAbs;                                     // Expires header (absolute)
     std::vector<std::pair<std::string, std::string>> headers; // extra headers
-    std::map<std::string, std::shared_ptr<MapObject>> outCookies; // Response.Cookies(name), original case
+    std::map<std::string, std::shared_ptr<CookieObj>> outCookies; // Response.Cookies(name), original case
     std::set<std::string> dirtyCookies;                  // lowercased names actually written
     int outCp = 0;                                        // 1252/28591 -> transcode output to Latin-1
     bool expiresConsumed = false;                         // Response.Expires consumed once
@@ -289,14 +315,40 @@ std::string httpDate(double serial) {
 // one interpreter per CGI process
 std::shared_ptr<AspResponse> g_resp;
 MapObject* g_respObj = nullptr;   // for property sync (Response.X = v)
+bool g_suppressOutput = false;    // Session_OnEnd running: it has no Response (as in IIS)
 struct SessionObj;
 long long g_sessionCodePage = 1252; // Session.CodePage -> output charset
 
 // reject CR/LF in header names/values (response splitting)
 std::string cleanHeaderText(const std::string& s, const char* what) {
-    if (s.find('\r') != std::string::npos || s.find('\n') != std::string::npos)
-        throwErr(5, std::string("ASP response: CR/LF not allowed in ") + what);
+    if (s.find('\r') != std::string::npos || s.find('\n') != std::string::npos ||
+        s.find('\0') != std::string::npos)
+        throwErr(5, std::string("ASP response: CR/LF/NUL not allowed in ") + what);
     return s;
+}
+
+// header changes after the headers went out cannot take effect: raise the
+// IIS error instead of silently dropping them (ASP 0156, E_FAIL)
+void requireHeadersUnsent() {
+    if (g_resp && g_resp->headersSent)
+        throw VBSError((int)0x80004005,
+                       "Response object error 'ASP 0156 : 80004005': Header Error. "
+                       "The HTTP headers are already written to the client browser.");
+}
+
+std::string htmlEncode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            default: out += c;
+        }
+    }
+    return out;
 }
 
 // pull Response.X = v property writes into the live response state
@@ -340,6 +392,86 @@ std::string cleanCookieAttr(const std::string& s, const char* what) {
         s.find('\n') != std::string::npos)
         throwErr(5, std::string("ASP cookie: ';' and CR/LF not allowed in ") + what);
     return s;
+}
+
+// cookie names must be RFC 6265 tokens: a ';', '=', ',' or space in a name
+// would inject attributes or split the header
+std::string cleanCookieName(const std::string& s) {
+    if (s.empty()) throwErr(5, "ASP cookie: empty cookie name");
+    for (unsigned char c : s) {
+        if (c <= 0x20 || c >= 0x7F || std::strchr("()<>@,;:\\\"/[]?={}", c))
+            throwErr(5, "ASP cookie: invalid character in cookie name");
+    }
+    return s;
+}
+
+const std::set<std::string>& cookieAttrNames() {
+    static const std::set<std::string> a = {"path", "domain", "expires", "secure", "httponly", "samesite"};
+    return a;
+}
+
+CookieObj::CookieObj(std::string k) : key(std::move(k)) {
+    kind = "Cookie";
+    // sub-key dictionary: cookie("k") reads, cookie("k") = v writes
+    onInvoke = [](MapObject* self, std::vector<Variant>& a) -> Variant {
+        auto* ck = static_cast<CookieObj*>(self);
+        if (a.empty()) return Variant::mkStr(ck->content());
+        std::string k = lower(toStr(a[0]));
+        for (auto& [sk, sv] : ck->subkeys)
+            if (lower(sk) == k) return Variant::mkStr(sv);
+        return Variant::mkStr("");
+    };
+    onAssignInvoke = [](MapObject* self, std::vector<Variant>& a, const Variant& v) {
+        auto* ck = static_cast<CookieObj*>(self);
+        if (a.empty()) throwErr(450, errDesc(450));
+        std::string name = toStr(a[0]);
+        std::string k = lower(name);
+        std::string val = toStr(v);
+        ck->value.clear(); // a cookie with keys has no scalar value
+        bool found = false;
+        for (auto& [sk, sv] : ck->subkeys)
+            if (lower(sk) == k) { sv = val; found = true; break; }
+        if (!found) ck->subkeys.emplace_back(name, val);
+        ck->markDirty();
+    };
+}
+
+void CookieObj::markDirty() {
+    requireHeadersUnsent();
+    if (g_resp) g_resp->dirtyCookies.insert(key);
+}
+
+std::string CookieObj::content() const {
+    if (subkeys.empty()) return urlEncode(value);
+    std::string out;
+    for (auto& [k, v] : subkeys) {
+        if (!out.empty()) out += '&';
+        out += urlEncode(k) + "=" + urlEncode(v);
+    }
+    return out;
+}
+
+bool CookieObj::hasMember(const std::string& n) const {
+    return n == "haskeys" || cookieAttrNames().count(n) || MapObject::hasMember(n);
+}
+
+Variant CookieObj::getMember(const std::string& n) {
+    if (n == "haskeys") return Variant::mkBool(!subkeys.empty());
+    if (cookieAttrNames().count(n)) {
+        auto it = props.find(n);
+        if (it != props.end()) return it->second;
+        if (n == "secure" || n == "httponly") return Variant::mkBool(false);
+        if (n == "expires") return Variant();
+        return Variant::mkStr("");
+    }
+    return MapObject::getMember(n);
+}
+
+void CookieObj::setMember(const std::string& n, const Variant& v) {
+    if (n == "haskeys") throwErr(438, errDesc(438)); // read-only
+    if (!cookieAttrNames().count(n)) throwErr(438, errDesc(438));
+    MapObject::setMember(n, v);
+    markDirty(); // e.g. .Expires = <past date> alone deletes a cookie
 }
 
 // transcode UTF-8 output to Latin-1 when the session code page asks for it
@@ -400,8 +532,7 @@ void ensureHeaders() {
         // only cookies the page actually wrote get a Set-Cookie header; a bare
         // read of Response.Cookies(name) must not emit an empty cookie
         if (!g_resp->dirtyCookies.count(lower(name))) continue;
-        std::string c = cleanHeaderText(name, "cookie name") + "=" +
-                        urlEncode(toStr(ck->props.count("value") ? ck->props["value"] : Variant()));
+        std::string c = cleanCookieName(name) + "=" + ck->content();
         auto attr = [&](const char* k) -> std::string {
             auto i2 = ck->props.find(k);
             return i2 == ck->props.end() ? "" : toStr(i2->second);
@@ -430,14 +561,36 @@ void ensureHeaders() {
     std::fwrite(h.data(), 1, h.size(), stdout);
 }
 
-void responseBody(const std::string& s) {
-    if (!g_resp || g_resp->ended) return;
-    syncRespProps();
-    if (g_resp->buffer) g_resp->body += s;
-    else {
-        ensureHeaders();
-        std::string out = encodeOut(s);
+// the single output path for body bytes (buffered flush, unbuffered writes
+// and the final flush): text is transcoded, binary is written untouched
+void emitChunk(const BodyChunk& c) {
+    if (c.binary) {
+        std::fwrite(c.data.data(), 1, c.data.size(), stdout);
+    } else {
+        std::string out = encodeOut(c.data);
         std::fwrite(out.data(), 1, out.size(), stdout);
+    }
+}
+
+void flushBody() {
+    if (!g_resp) return;
+    ensureHeaders();
+    for (auto& c : g_resp->body) emitChunk(c);
+    g_resp->body.clear();
+    std::fflush(stdout);
+}
+
+void responseBody(const std::string& s, bool binary = false) {
+    if (!g_resp || g_resp->ended || g_suppressOutput) return;
+    syncRespProps();
+    if (g_resp->buffer) {
+        if (!g_resp->body.empty() && g_resp->body.back().binary == binary)
+            g_resp->body.back().data += s;
+        else
+            g_resp->body.push_back({s, binary});
+    } else {
+        ensureHeaders();
+        emitChunk({s, binary});
         std::fflush(stdout);
     }
 }
@@ -494,37 +647,60 @@ std::string stateDbPath() {
     return "/var/db/mscript/asp-state.db";
 }
 
+// A private state directory: refuse anything another local user could have
+// prepared in advance (a symlink, a directory they own, or one they can
+// write to). Our own directory with read-only group/other bits is tightened.
+bool privateDir(const std::string& dir) {
+    if (mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    struct stat st;
+    if (lstat(dir.c_str(), &st) != 0) return false;
+    if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid()) return false;
+    if (st.st_mode & 022) return false; // was writable by others: may hold planted files
+    if ((st.st_mode & 077) && chmod(dir.c_str(), 0700) != 0) return false;
+    return true;
+}
+
+std::string g_dbPath; // the state db actually opened (the lock file sits next to it)
+
 sqlite3* stateDb() {
     static sqlite3* db = []() -> sqlite3* {
         std::string path = stateDbPath();
         const char* env = std::getenv("MScript_ASP_STATE_DB");
-        if (!env || !*env) {
-            // default location: /var/db/mscript, owner-only
-            std::error_code ec;
-            std::filesystem::create_directories("/var/db/mscript", ec);
-            std::filesystem::permissions("/var/db/mscript",
-                                         std::filesystem::perms::owner_all,
-                                         std::filesystem::perm_options::replace, ec);
-        } else {
-            std::error_code ec;
-            std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-        }
-        umask(0077); // state files must be owner-only
-        sqlite3* d = nullptr;
-        if (sqlite3_open(path.c_str(), &d) != SQLITE_OK) {
-            if (d) sqlite3_close(d);
-            // site-specific private fallback (never a shared /tmp file)
-            std::string dir = "/tmp/mscript-asp-" + std::to_string((long long)getuid());
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-            std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
-                                         std::filesystem::perm_options::replace, ec);
-            path = dir + "/asp-state.db";
-            if (sqlite3_open(path.c_str(), &d) != SQLITE_OK) {
+        // the umask only covers creating the state files; restored below so
+        // files the script itself creates keep the normal permissions
+        // (SQLite gives its -wal/-shm files the db file's own mode)
+        mode_t oldMask = umask(0077);
+        auto open = [](const std::string& p, int extra) -> sqlite3* {
+            sqlite3* d = nullptr;
+            if (sqlite3_open_v2(p.c_str(), &d, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | extra,
+                                nullptr) != SQLITE_OK) {
                 if (d) sqlite3_close(d);
                 return nullptr;
             }
+            return d;
+        };
+        sqlite3* d = nullptr;
+        if (env && *env) {
+            // administrator-chosen location
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+            d = open(path, 0);
+        } else if (privateDir("/var/db/mscript")) {
+            d = open(path, SQLITE_OPEN_NOFOLLOW);
         }
+        if (!d) {
+            // per-user private fallback; the name is predictable, so it is only
+            // used when privateDir verifies we own it exclusively, and the db
+            // file itself must not be a symlink
+            std::string dir = "/tmp/mscript-asp-" + std::to_string((long long)geteuid());
+            if (privateDir(dir)) {
+                path = dir + "/asp-state.db";
+                d = open(path, SQLITE_OPEN_NOFOLLOW);
+            }
+        }
+        umask(oldMask);
+        if (!d) return nullptr; // fail closed: state calls raise "database unavailable"
+        g_dbPath = path;
         chmod(path.c_str(), 0600);
         // concurrent CGI requests share this file: wait for a competing
         // writer instead of failing immediately with SQLITE_BUSY
@@ -534,7 +710,8 @@ sqlite3* stateDb() {
             "CREATE TABLE IF NOT EXISTS app(k TEXT PRIMARY KEY, v TEXT);"
             "CREATE TABLE IF NOT EXISTS sessions(sid TEXT, k TEXT, v TEXT, PRIMARY KEY(sid, k));"
             "CREATE TABLE IF NOT EXISTS session_meta(sid TEXT PRIMARY KEY, last REAL,"
-            "                                        lcid INTEGER, codepage INTEGER);"
+            "                                        lcid INTEGER, codepage INTEGER,"
+            "                                        timeout INTEGER);"
             // abandoned session ids that must never be written again
             "CREATE TABLE IF NOT EXISTS dead(sid TEXT PRIMARY KEY, until REAL);"
             // app-level markers (e.g. the Application_OnStart claim), kept out
@@ -544,6 +721,7 @@ sqlite3* stateDb() {
         // older databases predate the lcid/codepage columns
         sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN lcid INTEGER;", nullptr, nullptr, nullptr);
         sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN codepage INTEGER;", nullptr, nullptr, nullptr);
+        sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN timeout INTEGER;", nullptr, nullptr, nullptr);
         return d;
     }();
     return db;
@@ -555,7 +733,39 @@ sqlite3* stateDb() {
 
 // app rows are namespaced by the ASP application (script name) so independent
 // sites sharing one database do not collide
-std::string appKey(const std::string& k) { return g_appNs + "|" + k; }
+// The namespace prefix "<ns>|" with '%' and '|' percent-escaped in <ns>, so
+// the first '|' always ends the namespace: an app directory containing '|'
+// can no longer alias (or prefix-match in Count/RemoveAll) another app's
+// keys. Ordinary paths are unchanged, so existing Application rows and the
+// onstart marker keep their keys.
+std::string nsPrefix() {
+    std::string out;
+    for (char c : g_appNs) {
+        if (c == '%') out += "%25";
+        else if (c == '|') out += "%7C";
+        else out += c;
+    }
+    return out + "|";
+}
+std::string appKey(const std::string& k) { return nsPrefix() + k; }
+
+// session rows are keyed by application too: a session id issued by one app
+// is unknown to every other app sharing the state database
+std::string sessKey(const std::string& sid) { return nsPrefix() + sid; }
+void bindSid(sqlite3_stmt* st, int idx, const std::string& sid) {
+    std::string k = sessKey(sid);
+    sqlite3_bind_text(st, idx, k.data(), (int)k.size(), SQLITE_TRANSIENT);
+}
+
+// per-application session cookie name (like IIS's ASPSESSIONIDxxxxxxxx), so
+// apps on one host never overwrite each other's session cookie
+std::string sessionCookieName() {
+    uint32_t h = 2166136261u; // FNV-1a of the app namespace
+    for (unsigned char c : g_appNs) { h ^= c; h *= 16777619u; }
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%08x", h);
+    return std::string("MScriptSessionID_") + buf;
+}
 
 // an abandoned session id is dead: reads see nothing and writes are dropped,
 // so an in-flight request holding the old id cannot recreate its state
@@ -565,7 +775,7 @@ bool sessionIsDead(const std::string& sid) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "SELECT 1 FROM dead WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
         return false;
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     bool dead = sqlite3_step(st) == SQLITE_ROW;
     sqlite3_finalize(st);
     return dead;
@@ -578,7 +788,7 @@ void sessionMarkDead(const std::string& sid) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO dead(sid, until) VALUES(?1, ?2)", -1, &st, nullptr) != SQLITE_OK)
         stateFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     sqlite3_bind_double(st, 2, (double)std::time(nullptr) + 86400.0);
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("mark dead");
     sqlite3_finalize(st);
@@ -594,7 +804,7 @@ std::string stateGet(bool isSession, const std::string& sid, const std::string& 
         : "SELECT v FROM app WHERE k=?1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) return "";
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
     } else {
         std::string ak = appKey(k);
@@ -619,7 +829,7 @@ void stateSet(bool isSession, const std::string& sid, const std::string& k, cons
         : "INSERT OR REPLACE INTO app(k, v) VALUES(?1, ?2)";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, v.data(), (int)v.size(), SQLITE_TRANSIENT);
     } else {
@@ -638,12 +848,12 @@ void stateRemoveAll(const std::string& sid) {
     // interpolated into SQL text
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
     if (sqlite3_prepare_v2(db, "DELETE FROM session_meta WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
@@ -658,7 +868,7 @@ void stateRemove(bool isSession, const std::string& sid, const std::string& k) {
         : "DELETE FROM app WHERE k=?1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
     } else {
         std::string ak = appKey(k);
@@ -678,9 +888,9 @@ long long stateCount(bool isSession, const std::string& sid) {
         : "SELECT COUNT(*) FROM app WHERE instr(k, ?1)=1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
     } else {
-        std::string ns = g_appNs + "|";
+        std::string ns = nsPrefix();
         sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
     }
     long long n = 0;
@@ -701,9 +911,9 @@ void stateRemoveAllKeys(bool isSession, const std::string& sid) {
         : "DELETE FROM app WHERE instr(k, ?1)=1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
     } else {
-        std::string ns = g_appNs + "|";
+        std::string ns = nsPrefix();
         sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
     }
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("removeall");
@@ -720,50 +930,93 @@ void sessionTouch(const std::string& sid) {
             "INSERT INTO session_meta(sid, last) VALUES(?1, ?2) "
             "ON CONFLICT(sid) DO UPDATE SET last=?2", -1, &st, nullptr) != SQLITE_OK)
         stateFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     sqlite3_bind_double(st, 2, (double)std::time(nullptr));
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("touch");
     sqlite3_finalize(st);
 }
 
-// atomically check expiry and, when expired, delete contents+meta in the same
-// write transaction, so a concurrent touch cannot resurrect the session
-// between the check and the delete. Returns true when the session was expired.
-bool sessionExpireIfNeeded(const std::string& sid, long long timeoutMin) {
+constexpr long long DEFAULT_SESSION_TIMEOUT = 20; // minutes, as IIS
+
+enum class SessState {
+    Live,    // exists, not expired: touched
+    Expired, // existed and timed out: claimed by this process (meta row
+             // deleted, contents kept for Session_OnEnd; sessionFinishEnd
+             // removes them)
+    Invalid, // unknown, abandoned, or already claimed by another request
+};
+
+// One write transaction: the expiry check uses the session's own persisted
+// timeout, and the claim (deleting the meta row) means at most one process
+// ever fires Session_OnEnd for a session; a concurrent touch can neither
+// resurrect it nor race the claim. *timeoutOut receives the session timeout.
+SessState sessionCheck(const std::string& sid, long long* timeoutOut) {
     sqlite3* db = stateDb();
-    if (!db || timeoutMin <= 0) return false;
-    if (sessionIsDead(sid)) return true;
-    // the check and the delete must share one write transaction; never fall
-    // back to autocommit (a concurrent touch could then resurrect the session)
+    if (!db) stateFail("database unavailable");
+    if (timeoutOut) *timeoutOut = DEFAULT_SESSION_TIMEOUT;
+    if (sessionIsDead(sid)) return SessState::Invalid;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
         stateFail("begin");
     auto rollbackFail = [db](const char* what) {
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         stateFail(what);
     };
-    bool expired = true; // no metadata row counts as expired
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT last FROM session_meta WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db, "SELECT last, timeout FROM session_meta WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
         rollbackFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     int rc = sqlite3_step(st);
+    SessState state = SessState::Invalid; // no metadata row: never issued (or already ended)
     if (rc == SQLITE_ROW) {
         double last = sqlite3_column_double(st, 0);
-        expired = (std::time(nullptr) - (time_t)last) > timeoutMin * 60;
+        long long tmo = sqlite3_column_type(st, 1) == SQLITE_NULL ? DEFAULT_SESSION_TIMEOUT
+                                                                   : sqlite3_column_int64(st, 1);
+        if (tmo < 1) tmo = DEFAULT_SESSION_TIMEOUT;
+        if (timeoutOut) *timeoutOut = tmo;
+        state = ((double)std::time(nullptr) - last) > (double)tmo * 60.0 ? SessState::Expired
+                                                                         : SessState::Live;
     }
     sqlite3_finalize(st);
     if (rc != SQLITE_ROW && rc != SQLITE_DONE) rollbackFail("expiry check");
-    if (expired) {
-        for (const char* sql : {"DELETE FROM sessions WHERE sid=?1", "DELETE FROM session_meta WHERE sid=?1"}) {
-            if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) rollbackFail("prepare");
-            sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
-            rc = sqlite3_step(st);
-            sqlite3_finalize(st);
-            if (rc != SQLITE_DONE) rollbackFail("expire");
-        }
+    const char* sql = state == SessState::Expired ? "DELETE FROM session_meta WHERE sid=?1"
+                    : state == SessState::Live    ? "UPDATE session_meta SET last=?2 WHERE sid=?1"
+                                                  : nullptr;
+    if (sql) {
+        if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) rollbackFail("prepare");
+        bindSid(st, 1, sid);
+        if (state == SessState::Live) sqlite3_bind_double(st, 2, (double)std::time(nullptr));
+        rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) rollbackFail("expire");
     }
     if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) rollbackFail("commit");
-    return expired;
+    return state;
+}
+
+// Opportunistic cleanup (about 1 request in 64): sessions past their own
+// timeout, contents left without a meta row (a crash between claim and
+// cleanup), and expired abandoned-id markers. Each CGI request is its own
+// process, so there is no timer: Session_OnEnd fires only when an expired
+// session's cookie comes back. Never fails the request.
+void sessionGc() {
+    unsigned char r = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t got = read(fd, &r, 1);
+    close(fd);
+    if (got != 1 || (r & 63) != 0) return;
+    sqlite3* db = stateDb();
+    if (!db) return;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) return;
+    const char* sql =
+        "DELETE FROM session_meta WHERE last < CAST(strftime('%s','now') AS REAL)"
+        "  - 60.0 * COALESCE(NULLIF(timeout, 0), 20);"
+        "DELETE FROM sessions WHERE sid NOT IN (SELECT sid FROM session_meta);"
+        "DELETE FROM dead WHERE until < CAST(strftime('%s','now') AS REAL);";
+    if (sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK)
+        sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+    else
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
 }
 
 // persisted per-session settings (lcid/codepage); col is an internal constant
@@ -774,7 +1027,7 @@ void sessionSetProp(const std::string& sid, const char* col, long long v) {
                       "ON CONFLICT(sid) DO UPDATE SET " + col + "=?3";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     sqlite3_bind_double(st, 2, (double)std::time(nullptr));
     sqlite3_bind_int64(st, 3, v);
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("set prop");
@@ -787,7 +1040,7 @@ long long sessionGetProp(const std::string& sid, const char* col, long long dflt
     std::string sql = std::string("SELECT ") + col + " FROM session_meta WHERE sid=?1";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return dflt;
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     long long out = dflt;
     if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
         out = sqlite3_column_int64(st, 0);
@@ -813,15 +1066,10 @@ bool metaClaim(const std::string& k) {
 // cross-process lock for Application.Lock/Unlock (flock on a file next to the db)
 int appLockFd() {
     static int fd = []() -> int {
-        std::string path = stateDbPath() + ".lock";
-        int f = open(path.c_str(), O_RDWR | O_CREAT, 0600);
-        if (f < 0) {
-            std::string dir = "/tmp/mscript-asp-" + std::to_string((long long)getuid());
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-            f = open((dir + "/asp-state.lock").c_str(), O_RDWR | O_CREAT, 0600);
-        }
-        return f;
+        if (!stateDb() || g_dbPath.empty()) return -1;
+        // next to the db actually in use; never follow a planted symlink
+        std::string path = g_dbPath + ".lock";
+        return open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     }();
     return fd;
 }
@@ -1035,9 +1283,9 @@ Variant fromJsonText(const std::string& s) {
 // whenever the request arrived over TLS
 void setSessionCookie(const std::string& sid) {
     if (!g_resp) return;
-    auto ck = std::make_shared<MapObject>();
-    ck->kind = "Cookie";
-    ck->props["value"] = Variant::mkStr(sid);
+    const std::string name = sessionCookieName();
+    auto ck = std::make_shared<CookieObj>(lower(name));
+    ck->value = sid;
     ck->props["path"] = Variant::mkStr("/");
     ck->props["httponly"] = Variant::mkBool(true);
     ck->props["samesite"] = Variant::mkStr("Lax");
@@ -1046,11 +1294,11 @@ void setSessionCookie(const std::string& sid) {
         ck->props["secure"] = Variant::mkBool(true);
     // replace any same-named (case-insensitive) entry
     for (auto it = g_resp->outCookies.begin(); it != g_resp->outCookies.end();) {
-        if (lower(it->first) == "mscriptsessionid") it = g_resp->outCookies.erase(it);
+        if (lower(it->first) == lower(name)) it = g_resp->outCookies.erase(it);
         else ++it;
     }
-    g_resp->outCookies["MScriptSessionID"] = ck;
-    g_resp->dirtyCookies.insert("mscriptsessionid");
+    g_resp->outCookies[name] = ck;
+    g_resp->dirtyCookies.insert(lower(name));
 }
 
 // cryptographic session ids from the OS CSPRNG
@@ -1143,6 +1391,16 @@ struct SessionObj : MapObject {
             sessionSetProp(*sid, "codepage", codePage);
             return;
         }
+        if (n == "timeout") {
+            // minutes, 1..1440 as in IIS; persisted so later requests expire
+            // the session on its own timeout (0 used to mean "never expires")
+            long long t = toInt64(v);
+            if (t < 1 || t > 1440) throwErr(5, errDesc(5));
+            sessionSetProp(*sid, "timeout", t);
+            MapObject::setMember(n, Variant::mkLong(t));
+            return;
+        }
+        if (n == "sessionid") throwErr(438, errDesc(438)); // read-only
         MapObject::setMember(n, v);
     }
 };
@@ -1152,67 +1410,110 @@ struct SessionObj : MapObject {
 struct RespObj : MapObject {
     void setMember(const std::string& n, const Variant& v) override {
         if (n == "isclientconnected") throwErr(438, errDesc(438));
+        // properties that only reach the client as headers
+        static const std::set<std::string> headerProps = {
+            "status", "contenttype", "charset", "cachecontrol", "expires", "expiresabsolute", "pics"};
+        if (headerProps.count(n)) requireHeadersUnsent();
         MapObject::setMember(n, v);
     }
 };
 
+// per-request session state shared by the Session object, Abandon, the
+// request-start expiry check and the global.asa hooks
+struct SessCtx {
+    Interp* ip = nullptr;
+    MapObject* sess = nullptr;
+    std::shared_ptr<std::string> sid;
+    std::string pendingEnd; // expired session claimed at request start
+    bool inOnEnd = false;   // Session_OnEnd running: no expiry checks/touches
+    bool ended = false;     // Session_OnEnd already fired this request
+};
+SessCtx g_sess;
+
+// Fire Session_OnEnd for a session this process claimed (or is abandoning),
+// with that session's contents still readable through Session, then destroy
+// it. Request/Response are hidden during the hook, as in IIS, so it can
+// neither write into nor redirect/end the current visitor's response; its
+// errors (and End) are swallowed so they cannot break the visitor's request.
+void runSessionOnEnd(const std::string& oldSid) {
+    SessCtx& c = g_sess;
+    if (c.ip && c.sid && !c.ended) {
+        c.ended = true;
+        std::string cur = *c.sid;
+        *c.sid = oldSid;
+        if (c.sess) c.sess->props["sessionid"] = Variant::mkStr(oldSid);
+        auto& gv = c.ip->global.vars;
+        std::vector<std::pair<std::string, Variant>> hidden;
+        for (const char* k : {"request", "response"}) {
+            auto it = gv.find(k);
+            if (it != gv.end()) { hidden.emplace_back(k, it->second); gv.erase(it); }
+        }
+        c.inOnEnd = true;
+        g_suppressOutput = true;
+        try {
+            c.ip->callGlobalProc("session_onend");
+        } catch (VBSError&) {
+        } catch (EndSig&) {
+        }
+        g_suppressOutput = false;
+        c.inOnEnd = false;
+        for (auto& [k, v] : hidden) gv[k] = v;
+        *c.sid = cur;
+        if (c.sess) c.sess->props["sessionid"] = Variant::mkStr(cur);
+    }
+    stateRemoveAll(oldSid);
+    sessionMarkDead(oldSid); // in-flight requests with the old id cannot write it back
+}
+
+// replace the current session with a brand-new id (expired or abandoned)
+void rotateSession() {
+    SessCtx& c = g_sess;
+    *c.sid = newSessionId();
+    if (c.sess) c.sess->props["sessionid"] = Variant::mkStr(*c.sid);
+    if (c.sess) c.sess->props["timeout"] = Variant::mkLong(DEFAULT_SESSION_TIMEOUT);
+    setSessionCookie(*c.sid);
+}
+
 // stateful collection object backed by the sqlite store
-void fillStateColl(Interp& ip, MapObject* c, bool isSession,
-                   std::shared_ptr<std::string> sid, std::shared_ptr<bool> ended) {
+void fillStateColl(Interp& ip, MapObject* c, bool isSession, std::shared_ptr<std::string> sid) {
     c->kind = isSession ? "Session" : "Application";
     if (isSession) c->props["sessionid"] = Variant::mkStr(*sid);
-    auto timeoutOf = [c]() -> long long {
-        auto it = c->props.find("timeout");
-        return it == c->props.end() ? 20 : toInt64(it->second);
-    };
-    if (isSession) c->props["timeout"] = Variant::mkLong(20);
+    if (isSession) c->props["timeout"] = Variant::mkLong(DEFAULT_SESSION_TIMEOUT);
     c->props["contents"] = Variant::mkObj(makeContentsColl(isSession, sid));
-    c->onInvoke = [c, isSession, sid, timeoutOf, &ip, ended](MapObject*, std::vector<Variant>& a) -> Variant {
+    c->onInvoke = [isSession, sid](MapObject*, std::vector<Variant>& a) -> Variant {
         std::string k = stateKeyOf(a);
         if (isSession) {
-            if (sessionExpireIfNeeded(*sid, timeoutOf())) {
-                // OnEnd fires at most once per request, even if the hook
-                // itself (or the page afterwards) touches Session again
-                if (ended && !*ended) {
-                    *ended = true;
-                    ip.callGlobalProc("session_onend");
-                }
-                // the replacement session starts fresh under a NEW id: an
-                // expired id is never revived
-                *sid = newSessionId();
-                c->props["sessionid"] = Variant::mkStr(*sid);
-                setSessionCookie(*sid);
+            // inside Session_OnEnd the (claimed) old session is read as-is:
+            // checking or touching it would resurrect it
+            if (g_sess.inOnEnd) return fromJsonText(stateGet(true, *sid, k));
+            SessState st = sessionCheck(*sid, nullptr);
+            if (st != SessState::Live) {
+                // expired (or ended elsewhere) while this request ran: the
+                // replacement session starts fresh under a NEW id
+                std::string old = *sid;
+                if (st == SessState::Expired) runSessionOnEnd(old);
+                rotateSession();
                 sessionTouch(*sid);
                 return Variant();
             }
-            sessionTouch(*sid);
             return fromJsonText(stateGet(true, *sid, k));
         }
         return fromJsonText(stateGet(false, "", k));
     };
     c->onAssignInvoke = [isSession, sid](MapObject*, std::vector<Variant>& a, const Variant& v) {
         std::string k = stateKeyOf(a);
-        if (isSession) sessionTouch(*sid);
+        if (isSession && !g_sess.inOnEnd) sessionTouch(*sid);
         stateSet(isSession, isSession ? *sid : "", k, toJsonText(v));
     };
     if (isSession) {
-        c->methods["abandon"] = [c, sid, &ip, ended](MapObject*, std::vector<Variant>&) -> Variant {
-            if (ended && !*ended) {
-                *ended = true;
-                try {
-                    ip.callGlobalProc("session_onend");
-                } catch (...) {
-                    // a failing/ending Session_OnEnd must not block abandonment
-                }
-            }
-            stateRemoveAll(*sid);
-            sessionMarkDead(*sid); // in-flight requests with the old id cannot write it back
+        c->methods["abandon"] = [&ip](MapObject*, std::vector<Variant>&) -> Variant {
+            if (g_sess.inOnEnd) return Variant(); // the session is already ending
+            std::string old = *g_sess.sid;
+            runSessionOnEnd(old);
             // rotate: the abandoned id must not be reused; the replacement is
             // a new session and gets Session_OnStart
-            *sid = newSessionId();
+            rotateSession();
             ip.aspNewSession = true;
-            c->props["sessionid"] = Variant::mkStr(*sid);
-            setSessionCookie(*sid);
             return Variant();
         };
     } else {
@@ -1271,12 +1572,14 @@ void registerAspObjects(Interp& ip, bool cgi) {
     resp->methods["binarywrite"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         for (auto& v : a) {
             if (v.t == VT::Array && v.arr) {
-                for (auto& e : v.arr->data) {
-                    // each element is a raw byte, not decimal text
-                    responseBody(std::string(1, (char)(unsigned char)toInt64(e)));
-                }
+                // each element is a raw byte, not decimal text; binary output
+                // bypasses the code-page transcoding
+                std::string bytes;
+                bytes.reserve(v.arr->data.size());
+                for (auto& e : v.arr->data) bytes += (char)(unsigned char)toInt64(e);
+                responseBody(bytes, true);
             } else {
-                responseBody(toStr(v));
+                responseBody(toStr(v), true);
             }
         }
         return Variant();
@@ -1284,10 +1587,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
     resp->methods["flush"] = [](MapObject*, std::vector<Variant>&) -> Variant {
         if (g_resp) {
             syncRespProps();
-            ensureHeaders();
-            std::fwrite(g_resp->body.data(), 1, g_resp->body.size(), stdout);
-            std::fflush(stdout);
-            g_resp->body.clear();
+            flushBody(); // same transcoding as the final flush
         }
         return Variant();
     };
@@ -1301,15 +1601,28 @@ void registerAspObjects(Interp& ip, bool cgi) {
     };
     resp->methods["redirect"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
+        requireHeadersUnsent();
         if (g_resp) {
-            g_resp->status = "302 Found";
-            g_resp->headers.push_back({"Location", cleanHeaderText(toStr(a[0]), "redirect URL")});
+            std::string url = cleanHeaderText(toStr(a[0]), "redirect URL");
+            // the status must also go into the property: syncRespProps
+            // re-reads Response.Status at header time
+            g_resp->status = "302 Object moved";
+            if (g_respObj) g_respObj->props["status"] = Variant::mkStr(g_resp->status);
+            g_resp->headers.push_back({"Location", url});
+            // like IIS, discard the buffered page: content written before a
+            // redirect (often what an unauthenticated user must not see)
+            // is never sent
+            g_resp->body.clear();
+            g_resp->body.push_back({"<head><title>Object moved</title></head>\r\n<body><h1>Object Moved</h1>"
+                                    "This object may be found <a HREF=\"" + htmlEncode(url) +
+                                    "\">here</a>.</body>\r\n", false});
             g_resp->ended = true;
         }
         throw EndSig{};
     };
     resp->methods["addheader"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.size() < 2) throwErr(450, errDesc(450));
+        requireHeadersUnsent();
         if (g_resp)
             g_resp->headers.push_back({cleanHeaderText(toStr(a[0]), "header name"),
                                        cleanHeaderText(toStr(a[1]), "header value")});
@@ -1323,26 +1636,13 @@ void registerAspObjects(Interp& ip, bool cgi) {
     cookies->kind = "Cookies";
     auto reqCookies = parseCookies(std::getenv("HTTP_COOKIE") ? std::getenv("HTTP_COOKIE") : "");
     // keys keep the original casing; lookup is case-insensitive
-    auto cookieFor = [](const std::string& name) -> std::shared_ptr<MapObject> {
+    auto cookieFor = [](const std::string& name) -> std::shared_ptr<CookieObj> {
         if (!g_resp) return nullptr;
-        std::string disp = cleanHeaderText(name, "cookie name");
+        std::string disp = cleanCookieName(name);
         std::string k = lower(disp);
         for (auto& [existing, ck] : g_resp->outCookies)
             if (lower(existing) == k) return ck;
-        auto ck = std::make_shared<MapObject>();
-        ck->kind = "Cookie";
-        ck->props["value"] = Variant::mkStr("");
-        // Response.Cookies("n")("path") = "/" and reads of the same form;
-        // any assignment marks the cookie dirty so it gets a Set-Cookie
-        ck->onInvoke = [](MapObject* self, std::vector<Variant>& a) -> Variant {
-            if (a.empty()) throwErr(450, errDesc(450));
-            auto it = self->props.find(lower(toStr(a[0])));
-            return it == self->props.end() ? Variant() : it->second;
-        };
-        ck->onAssignInvoke = [k](MapObject* self, std::vector<Variant>& a, const Variant& v) {
-            if (!a.empty()) self->props[lower(toStr(a[0]))] = v;
-            if (g_resp) g_resp->dirtyCookies.insert(k);
-        };
+        auto ck = std::make_shared<CookieObj>(k);
         g_resp->outCookies[disp] = ck;
         return ck;
     };
@@ -1352,12 +1652,14 @@ void registerAspObjects(Interp& ip, bool cgi) {
         if (!ck) throwErr(5, errDesc(5));
         return Variant::mkObj(ck);
     };
+    // Response.Cookies("n") = v sets the scalar value (dropping any sub-keys)
     cookies->onAssignInvoke = [cookieFor](MapObject*, std::vector<Variant>& a, const Variant& v) {
-        if (a.empty()) return;
+        if (a.empty()) throwErr(450, errDesc(450));
         auto ck = cookieFor(toStr(a[0]));
         if (ck) {
-            ck->props["value"] = v;
-            if (g_resp) g_resp->dirtyCookies.insert(lower(toStr(a[0])));
+            ck->value = toStr(v);
+            ck->subkeys.clear();
+            ck->markDirty();
         }
     };
     resp->props["cookies"] = Variant::mkObj(cookies);
@@ -1452,51 +1754,71 @@ void registerAspObjects(Interp& ip, bool cgi) {
     };
     srv->methods["htmlencode"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) return Variant::mkStr("");
-        std::string s = toStr(a[0]), out;
-        for (char c : s) {
-            switch (c) {
-                case '&': out += "&amp;"; break;
-                case '<': out += "&lt;"; break;
-                case '>': out += "&gt;"; break;
-                case '"': out += "&quot;"; break;
-                default: out += c;
-            }
-        }
-        return Variant::mkStr(out);
+        return Variant::mkStr(htmlEncode(toStr(a[0])));
     };
     srv->methods["urlencode"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) return Variant::mkStr("");
         return Variant::mkStr(urlEncode(toStr(a[0])));
     };
-    srv->methods["mappath"] = [&ip](MapObject*, std::vector<Variant>& a) -> Variant {
+    // Virtual-path resolution shared by MapPath and Execute/Transfer:
+    //   "/x"  -> DOCUMENT_ROOT/x (the app root when DOCUMENT_ROOT is unset)
+    //   "x"   -> relative to the page's own directory
+    // The result must stay inside DOCUMENT_ROOT (absolute virtual paths) or
+    // the application root (relative paths); ".." escaping it is refused like
+    // IIS's default "parent paths disabled" (ASP 0131).
+    struct VPath { std::filesystem::path full, root; };
+    auto resolveVirtual = [&ip](const std::string& p) -> VPath {
+        std::error_code ec;
+        if (p.find('\0') != std::string::npos) throwErr(5, errDesc(5));
+        std::filesystem::path scriptDir = std::filesystem::absolute(ip.scriptFullName, ec).parent_path();
+        std::filesystem::path appRoot = std::filesystem::path(aspAppRootOf(ip.scriptFullName));
+        VPath r;
+        if (!p.empty() && (p[0] == '/' || p[0] == '\\')) {
+            const char* dr = std::getenv("DOCUMENT_ROOT");
+            r.root = (dr && *dr) ? std::filesystem::absolute(dr, ec) : appRoot;
+            r.full = r.root / p.substr(1);
+        } else {
+            r.root = appRoot;
+            r.full = scriptDir / p;
+        }
+        r.root = r.root.lexically_normal();
+        r.full = r.full.lexically_normal();
+        std::string rs = r.root.string(), fs = r.full.string();
+        while (rs.size() > 1 && rs.back() == '/') rs.pop_back();
+        while (fs.size() > 1 && fs.back() == '/') fs.pop_back();
+        if (fs != rs && fs.rfind(rs == "/" ? rs : rs + "/", 0) != 0)
+            throw VBSError((int)0x80004005,
+                           "Server object error 'ASP 0131 : 80004005': Disallowed Parent Path. "
+                           "The path '" + p + "' is outside the application.");
+        r.full = fs;
+        r.root = rs;
+        return r;
+    };
+    srv->methods["mappath"] = [resolveVirtual](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
-        std::error_code ec;
-        std::filesystem::path base = std::filesystem::path(ip.scriptFullName).parent_path();
-        std::string p = toStr(a[0]);
-        std::filesystem::path full = (p.empty() || p[0] == '/') ? base / p.substr(p[0] == '/' ? 1 : 0) : base / p;
-        return Variant::mkStr(full.lexically_normal().string());
+        return Variant::mkStr(resolveVirtual(toStr(a[0])).full.string());
     };
-    // resolve and confine to the script's directory (no traversal, no absolute escape)
-    auto resolveConfined = [&ip](const std::string& p) -> std::string {
+    // Execute/Transfer: only .asp pages, and the confinement is re-checked on
+    // the canonical (symlink-resolved) paths of both sides, so a symlink in
+    // the app cannot point outside it and a symlinked app root still works
+    auto doExecute = [&ip, resolveVirtual](const std::string& rel) {
+        VPath v = resolveVirtual(rel);
+        std::string ext = v.full.extension().string();
+        if (lower(ext) != ".asp")
+            throwErr(5, "ASP Server.Execute/Transfer: only .asp pages can be executed");
         std::error_code ec;
-        std::filesystem::path base = std::filesystem::absolute(ip.scriptFullName, ec).parent_path();
-        std::filesystem::path full = (p.empty() || p[0] == '/') ? base / p.substr(p[0] == '/' ? 1 : 0) : base / p;
-        full = full.lexically_normal();
-        std::string bs = base.lexically_normal().string();
-        std::string fs = full.string();
-        if (fs != bs && fs.rfind(bs + "/", 0) != 0)
-            throwErr(5, "ASP Server.Execute/Transfer: path outside the script directory");
-        return fs;
-    };
-    auto doExecute = [&ip, resolveConfined](const std::string& rel) {
-        std::string path = resolveConfined(rel);
-        std::ifstream in(path, std::ios::binary);
-        if (!in) throwErr(53, "File not found: " + path);
+        std::filesystem::path real = std::filesystem::canonical(v.full, ec);
+        if (ec) throwErr(53, "File not found: " + v.full.string());
+        std::filesystem::path realRoot = std::filesystem::canonical(v.root, ec);
+        if (ec) throwErr(53, "File not found: " + v.root.string());
+        std::string rs = realRoot.string(), fs = real.string();
+        if (fs.rfind(rs == "/" ? rs : rs + "/", 0) != 0)
+            throwErr(5, "ASP Server.Execute/Transfer: path outside the application");
+        std::ifstream in(real, std::ios::binary);
+        if (!in) throwErr(53, "File not found: " + v.full.string());
         std::ostringstream ss;
         ss << in.rdbuf();
-        std::string code = ss.str();
-        if (path.size() >= 4 && lower(path.substr(path.size() - 4)) == ".asp") code = aspToVbs(code);
-        ip.executeString(code, true);
+        ip.executeString(aspToVbs(ss.str()), true);
     };
     srv->methods["execute"] = [doExecute](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
@@ -1511,31 +1833,38 @@ void registerAspObjects(Interp& ip, bool cgi) {
 
     // ---- Session / Application (SQLite-backed) ----
     auto sid = std::make_shared<std::string>();
-    auto ended = std::make_shared<bool>(false); // Session_OnEnd fired this request
+    long long timeout = DEFAULT_SESSION_TIMEOUT;
+    g_sess = SessCtx{};
+    g_sess.ip = &ip;
+    g_sess.sid = sid;
     {
-        auto it = reqCookies.find("mscriptsessionid");
+        auto it = reqCookies.find(lower(sessionCookieName()));
         // only reuse an id this server issued that is still live: a
         // malformed, unknown (client-chosen), expired or abandoned id is
         // replaced with a fresh one, so an attacker cannot fix a victim's
-        // session id in advance. sessionExpireIfNeeded returns false only for
-        // an existing, unexpired, non-dead session (and cleans up otherwise).
+        // session id in advance
         if (it != reqCookies.end() && validSessionId(it->second)) {
-            if (!sessionExpireIfNeeded(it->second, 20)) {
-                *sid = it->second;
-            } else if (!*ended) {
-                *ended = true;
-                ip.callGlobalProc("session_onend");
+            switch (sessionCheck(it->second, &timeout)) {
+                case SessState::Live: *sid = it->second; break;
+                // Session_OnEnd runs from aspGlobalAsaHooks, once global.asa
+                // is loaded (it is not yet, here)
+                case SessState::Expired: g_sess.pendingEnd = it->second; break;
+                case SessState::Invalid: break;
             }
         }
     }
     if (sid->empty()) {
         *sid = newSessionId();
+        timeout = DEFAULT_SESSION_TIMEOUT;
         ip.aspNewSession = true;
         setSessionCookie(*sid);
     }
     sessionTouch(*sid);
+    sessionGc();
     auto session = std::make_shared<SessionObj>(ip, sid);
-    fillStateColl(ip, session.get(), true, sid, ended);
+    g_sess.sess = session.get();
+    fillStateColl(ip, session.get(), true, sid);
+    session->props["timeout"] = Variant::mkLong(timeout);
     // restore persisted session settings
     {
         long long lcid = sessionGetProp(*sid, "lcid", 0);
@@ -1544,7 +1873,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
         g_sessionCodePage = session->codePage;
     }
     auto app = std::make_shared<MapObject>();
-    fillStateColl(ip, app.get(), false, sid, nullptr);
+    fillStateColl(ip, app.get(), false, sid);
 
     ip.global.vars["request"] = Variant::mkObj(req);
     ip.global.vars["response"] = Variant::mkObj(resp);
@@ -1561,7 +1890,13 @@ void aspGlobalAsaHooks(Interp& ip) {
     // requests must not both run Application_OnStart, and a hook error must
     // not leave the marker unset (the claim lives in the separate meta table,
     // never visible through Application.Contents)
-    if (metaClaim(g_appNs + "|onstart")) ip.callGlobalProc("application_onstart");
+    if (metaClaim(nsPrefix() + "onstart")) ip.callGlobalProc("application_onstart");
+    // the visitor's expired session ends before its replacement starts
+    if (!g_sess.pendingEnd.empty()) {
+        std::string old = std::move(g_sess.pendingEnd);
+        g_sess.pendingEnd.clear();
+        runSessionOnEnd(old);
+    }
     if (ip.aspNewSession) ip.callGlobalProc("session_onstart");
 }
 
@@ -1575,11 +1910,5 @@ void flushAspResponse(Interp& ip) {
     (void)ip;
     if (!g_resp) return;
     syncRespProps();
-    if (!g_resp->headersSent) ensureHeaders();
-    if (!g_resp->body.empty()) {
-        std::string out = encodeOut(g_resp->body);
-        std::fwrite(out.data(), 1, out.size(), stdout);
-        std::fflush(stdout);
-        g_resp->body.clear();
-    }
+    flushBody();
 }

@@ -3,8 +3,10 @@ Cache-Control: no-cache
 PICS-Label: (PICS-1.1 mscript)
 Expires: Tue, 01 Jan 2030 00:00:00 GMT
 Set-Cookie: MixedCase=v
+Set-Cookie: old=; expires=Sat, 01 Jan 2000 00:00:00 GMT
 Set-Cookie: pref=x%3D1; httponly
 Set-Cookie: theme=dark; path=/app; expires=Sun, 01 Jun 2031 12:00:00 GMT
+Set-Cookie: user=name=bob%20b&domain=evil.example
 
 ro-err=438
 req-name=mscript
@@ -22,4 +24,7 @@ lcid=1033
 lcid2=2057
 codepage=1252
 connected=True
+haskeys=True:False
+subkey=bob b
+badname-err=5
 

@@ -1,0 +1,10 @@
+<script language="VBScript" runat="server">
+Sub Session_OnEnd()
+    ' the ending session's contents are readable here
+    Application("ended_" & Session("name")) = Session.SessionID
+    Application("endcount_" & Session("name")) = Application("endcount_" & Session("name")) + 1
+    ' Response is unavailable in Session_OnEnd (as in IIS): nothing may reach
+    ' the visitor whose request triggered the cleanup
+    Response.Write "LEAK"
+End Sub
+</script>

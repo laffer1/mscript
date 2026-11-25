@@ -59,6 +59,21 @@ is set (CGI), the
 and
 .Qq Set-Cookie
 headers are emitted before the body.
+Sessions are per application (the nearest directory containing a
+.Pa global.asa ) :
+the session cookie is
+.Qq MScriptSessionID_ Ns Ar hash ,
+marked HttpOnly and SameSite=Lax (and Secure under HTTPS), and only live,
+server-issued session ids are accepted.
+.Dv Session_OnEnd
+runs when an expired session's cookie returns or on
+.Dv Session.Abandon .
+.Dv Server.Execute
+and
+.Dv Server.Transfer
+run only
+.Pa .asp
+pages inside the application.
 .Pp
 The interpreter implements Variant semantics (Empty, Null, Boolean, Byte,
 Integer, Long, Single, Double, Currency, Date, String, arrays and objects), the
