@@ -149,6 +149,7 @@ struct Interp {
     bool optionExplicit = false;
     int optionBase = 0;
     bool compareText = false;
+    Variant localeId = Variant::mkInt(1033);   // GetLocale/SetLocale; default en-US
 
     std::shared_ptr<VBObject> errObj;
     std::shared_ptr<VBObject> wscriptObj;

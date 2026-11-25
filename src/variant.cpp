@@ -1096,6 +1096,152 @@ Variant opCompare(const std::string& op, const Variant& a0, const Variant& b0, b
     return Variant::mkBool(r);
 }
 
+namespace {
+
+// decode one UTF-8 code point at bytePos
+unsigned likeCpAt(const std::string& s, size_t bytePos, size_t* adv) {
+    unsigned char c = (unsigned char)s[bytePos];
+    if (c < 0x80) { *adv = 1; return c; }
+    if ((c & 0xE0) == 0xC0 && bytePos + 1 < s.size()) {
+        *adv = 2;
+        return ((c & 0x1F) << 6) | ((unsigned char)s[bytePos + 1] & 0x3F);
+    }
+    if ((c & 0xF0) == 0xE0 && bytePos + 2 < s.size()) {
+        *adv = 3;
+        return ((c & 0x0F) << 12) | (((unsigned char)s[bytePos + 1] & 0x3F) << 6) |
+               ((unsigned char)s[bytePos + 2] & 0x3F);
+    }
+    if ((c & 0xF8) == 0xF0 && bytePos + 3 < s.size()) {
+        *adv = 4;
+        return ((c & 0x07) << 18) | (((unsigned char)s[bytePos + 1] & 0x3F) << 12) |
+               (((unsigned char)s[bytePos + 2] & 0x3F) << 6) | ((unsigned char)s[bytePos + 3] & 0x3F);
+    }
+    *adv = 1;
+    return c;
+}
+
+// VBScript Like pattern token
+struct LikeTok {
+    enum K { Lit, Any, Digit, List, Star } k = Lit;
+    unsigned cp = 0;                 // Lit
+    std::vector<unsigned> list;      // List
+    bool neg = false;                // List
+};
+
+// tokenize a Like pattern (over code points); invalid patterns raise error 93
+std::vector<LikeTok> likeTokenize(const std::vector<unsigned>& p) {
+    std::vector<LikeTok> out;
+    size_t pi = 0;
+    while (pi < p.size()) {
+        unsigned pc = p[pi];
+        if (pc == '*') { out.push_back({LikeTok::Star, 0, {}, false}); pi++; continue; }
+        if (pc == '?') { out.push_back({LikeTok::Any, 0, {}, false}); pi++; continue; }
+        if (pc == '#') { out.push_back({LikeTok::Digit, 0, {}, false}); pi++; continue; }
+        if (pc == '[') {
+            size_t j = pi + 1;
+            bool neg = false;
+            if (j < p.size() && p[j] == '!') { neg = true; j++; }
+            size_t firstPos = j; // ']' immediately after '[' or '[!' is a literal member
+            LikeTok t; t.k = LikeTok::List; t.neg = neg;
+            bool closed = false;
+            while (j < p.size()) {
+                unsigned c = p[j];
+                if (c == ']' && j != firstPos) { j++; closed = true; break; }
+                if (j + 2 < p.size() && p[j + 1] == '-' && p[j + 2] != ']') {
+                    unsigned lo = c, hi = p[j + 2];
+                    if (lo > hi) throwErr(93, errDesc(93)); // descending range: invalid pattern
+                    for (unsigned k = lo; k <= hi; k++) t.list.push_back(k);
+                    j += 3;
+                } else {
+                    t.list.push_back(c);
+                    j++;
+                }
+            }
+            if (!closed) throwErr(93, errDesc(93)); // unterminated '[': invalid pattern
+            out.push_back(std::move(t));
+            pi = j;
+            continue;
+        }
+        out.push_back({LikeTok::Lit, pc, {}, false});
+        pi++;
+    }
+    return out;
+}
+
+bool likeTokMatch(const LikeTok& t, unsigned c) {
+    switch (t.k) {
+        case LikeTok::Lit: return t.cp == c;
+        case LikeTok::Any: return true;
+        case LikeTok::Digit: return c >= '0' && c <= '9';
+        case LikeTok::List: {
+            bool f = false;
+            for (unsigned k : t.list) if (k == c) { f = true; break; }
+            return f != t.neg;
+        }
+        default: return false;
+    }
+}
+
+// iterative glob match with single-star backtracking: O(len(s) * len(p)) worst
+// case, constant stack (the naive recursive retry was exponential on patterns
+// with several '*' and could stall or overflow the stack)
+bool likeMatch(const std::vector<unsigned>& s, const std::vector<LikeTok>& p) {
+    const size_t npos = std::numeric_limits<size_t>::max();
+    size_t si = 0, pi = 0, starP = npos, starS = 0;
+    while (si < s.size()) {
+        if (pi < p.size() && p[pi].k == LikeTok::Star) {
+            starP = pi; starS = si; // remember the last '*' for backtracking
+            pi++;
+            continue;
+        }
+        if (pi < p.size() && likeTokMatch(p[pi], s[si])) {
+            si++; pi++;
+            continue;
+        }
+        if (starP != npos) {
+            pi = starP + 1;
+            si = ++starS;
+            continue;
+        }
+        return false;
+    }
+    while (pi < p.size() && p[pi].k == LikeTok::Star) pi++;
+    return pi == p.size();
+}
+
+} // namespace
+
+// case fold used for Option Compare Text / vbTextCompare: ASCII, Latin-1,
+// Latin Extended-A, Greek and Cyrillic uppercase pairs
+unsigned vbsFoldCase(unsigned cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + 32;
+    if (cp >= 0xC0 && cp <= 0xDE && cp != 0xD7) return cp + 32;          // Latin-1 supplement
+    if (cp >= 0x100 && cp <= 0x137 && (cp & 1) == 0) return cp + 1;     // Latin Ext-A
+    if (cp >= 0x139 && cp <= 0x148 && (cp & 1) == 0) return cp + 1;
+    if (cp >= 0x14A && cp <= 0x177 && (cp & 1) == 0) return cp + 1;
+    if (cp >= 0x179 && cp <= 0x17E && (cp & 1) == 0) return cp + 1;
+    if (cp >= 0x391 && cp <= 0x3A9) return cp + 32;                     // Greek
+    if (cp >= 0x410 && cp <= 0x42F) return cp + 32;                     // Cyrillic
+    return cp;
+}
+
+bool opLike(const std::string& str, const std::string& pattern, bool compareText) {
+    std::vector<unsigned> s, p;
+    for (size_t i = 0; i < str.size();) {
+        size_t adv;
+        unsigned c = likeCpAt(str, i, &adv);
+        s.push_back(compareText ? vbsFoldCase(c) : c);
+        i += adv;
+    }
+    for (size_t i = 0; i < pattern.size();) {
+        size_t adv;
+        unsigned c = likeCpAt(pattern, i, &adv);
+        p.push_back(compareText ? vbsFoldCase(c) : c);
+        i += adv;
+    }
+    return likeMatch(s, likeTokenize(p));
+}
+
 bool objSame(const Variant& a, const Variant& b) {
     if (a.t == VT::Object && b.t == VT::Object) return a.obj == b.obj;
     // "x Is Nothing" on an Empty/Null variant is legal and simply False/Null

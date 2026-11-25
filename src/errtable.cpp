@@ -70,6 +70,7 @@ constexpr ErrText kErrText[] = {
     {76,   "Path not found"},                                // [VBA]
     {91,   "Object variable not set"},                       // [VBS]
     {92,   "For loop not initialized"},                      // [VBS]
+    {93,   "Invalid pattern string"},                        // [VBS]
     {94,   "Invalid use of Null"},                           // [VBS]
     {322,  "Can't create necessary temporary file"},         // [VBA]
     {424,  "Object required"},                               // [VBS]

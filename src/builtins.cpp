@@ -68,8 +68,8 @@ static std::vector<std::string> cpv(const std::string& s, bool fold) {
     while (i < s.size()) {
         size_t adv = 0;
         unsigned c = cpAt(s, i, &adv);
-        std::string u = cpToUtf8(c);
-        out.push_back(fold ? asciiCase(u, false) : u);
+        // Unicode-aware fold (shared with the Like operator), not ASCII-only
+        out.push_back(fold ? cpToUtf8(vbsFoldCase(c)) : cpToUtf8(c));
         i += adv;
     }
     return out;
@@ -214,7 +214,7 @@ static Variant dateDiffImpl(const std::string& unit, double d1, double d2) {
     throwErr(5, errDesc(5));
 }
 
-static Variant datePartImpl(const std::string& unit, double date) {
+static Variant datePartImpl(const std::string& unit, double date, long long firstDay = 1) {
     long long y; unsigned m, d; int hh, mm, ss;
     splitSerial(date, y, m, d, hh, mm, ss);
     if (unit == "yyyy") return Variant::mkLong(y);
@@ -222,7 +222,7 @@ static Variant datePartImpl(const std::string& unit, double date) {
     if (unit == "m") return Variant::mkLong(m);
     if (unit == "y") return Variant::mkLong((long long)std::floor(date) - (daysFromCivil(y, 1, 1) + VB_EPOCH_OFF) + 1);
     if (unit == "d") return Variant::mkLong(d);
-    if (unit == "w") return Variant::mkLong(weekdayOf(date));
+    if (unit == "w") return Variant::mkLong(((weekdayOf(date) - (int)firstDay) % 7 + 7) % 7 + 1);
     if (unit == "ww") {
         long long doy = (long long)std::floor(date) - (daysFromCivil(y, 1, 1) + VB_EPOCH_OFF) + 1;
         int jan1 = weekdayOf(makeSerial(y, 1, 1, 0, 0, 0));
@@ -251,8 +251,13 @@ static std::string fmtNum(double v, const std::string& pattern) {
         }
     }
     bool comma = pattern.find(',') != std::string::npos;
-    char buf[128];
-    std::snprintf(buf, sizeof buf, "%.*f", decimals, v);
+    // size the buffer dynamically: huge values or many decimals overflowed the
+    // fixed buffer and snprintf silently truncated the result
+    int need = std::snprintf(nullptr, 0, "%.*f", decimals, v);
+    if (need < 0) throwErr(5, errDesc(5));
+    std::string buf((size_t)need + 1, '\0');
+    std::snprintf(buf.data(), buf.size(), "%.*f", decimals, v);
+    buf.resize((size_t)need);
     std::string s = buf;
     if (comma) {
         // insert thousands separators into integer part
@@ -271,6 +276,69 @@ static std::string fmtNum(double v, const std::string& pattern) {
     }
     if (percent) s += "%";
     return s;
+}
+
+// ---------- locales (GetLocale/SetLocale, FormatCurrency, first day of week) ----------
+
+struct LocaleInfo {
+    long long lcid;
+    const char* name;   // short name accepted by SetLocale
+    const char* sym;    // currency symbol
+    char dec, grp;      // decimal / thousands separator
+    int firstDay;       // system first day of week (1=Sunday..7=Saturday)
+    bool symTrailing;   // symbol after the amount (de-DE: 1.234,50 €)
+};
+static const LocaleInfo kLocales[] = {
+    {1033, "en-us", "$", '.', ',', 1, false},
+    {2057, "en-gb", "£", '.', ',', 2, false},
+    {1031, "de-de", "€", ',', '.', 2, true},
+    {1036, "fr-fr", "€", ',', ' ', 2, true},
+    {3082, "es-es", "€", ',', '.', 2, true},
+    {1041, "ja-jp", "¥", '.', ',', 1, false},
+    {2052, "zh-cn", "¥", '.', ',', 1, false},
+    {1042, "ko-kr", "₩", '.', ',', 1, false},
+    {1049, "ru-ru", "₽", ',', ' ', 2, true},
+};
+static const LocaleInfo* localeInfoFor(long long lcid) {
+    for (auto& L : kLocales) if (L.lcid == lcid) return &L;
+    return &kLocales[0]; // unknown numeric LCIDs format as en-US
+}
+// vbUseSystemDayOfWeek (1, the same value as vbSunday) means the system
+// setting, which here follows the selected locale
+static long long resolveFirstDayOfWeek(Interp& ip, long long first) {
+    if (first == 1) return localeInfoFor(toInt64(ip.localeId))->firstDay;
+    if (first < 1 || first > 7) throwErr(5, errDesc(5));
+    return first;
+}
+// locale-aware currency formatting with a dynamically sized buffer
+static std::string fmtCurrency(double v, long long digits, bool lead, bool par, bool grp,
+                               const LocaleInfo* L) {
+    int need = std::snprintf(nullptr, 0, "%.*f", (int)digits, std::fabs(v));
+    if (need < 0) throwErr(5, errDesc(5));
+    std::string buf((size_t)need + 1, '\0');
+    std::snprintf(buf.data(), buf.size(), "%.*f", (int)digits, std::fabs(v));
+    buf.resize((size_t)need);
+    auto dot = buf.find('.');
+    std::string ip = dot == std::string::npos ? buf : buf.substr(0, dot);
+    std::string fp = dot == std::string::npos ? "" : buf.substr(dot + 1);
+    if (grp && ip.size() > 3) {
+        std::string g;
+        int cnt = 0;
+        for (auto it = ip.rbegin(); it != ip.rend(); ++it) {
+            g = *it + g;
+            if (++cnt % 3 == 0 && it + 1 != ip.rend()) g = L->grp + g;
+        }
+        ip = g;
+    }
+    if (!lead && ip == "0") ip.clear(); // $0.50 -> $.50
+    std::string num = ip + (dot == std::string::npos ? "" : std::string(1, L->dec) + fp);
+    std::string sym = L->sym;
+    if (L->symTrailing) {
+        if (v < 0) return par ? "(" + num + " " + sym + ")" : "-" + num + " " + sym;
+        return num + " " + sym;
+    }
+    if (v < 0) return par ? "(" + sym + num + ")" : "-" + sym + num;
+    return sym + num;
 }
 
 // ---------- registration ----------
@@ -298,6 +366,7 @@ void registerConstants(Interp& ip) {
     add("vbFriday", Variant::mkInt(6));
     add("vbSaturday", Variant::mkInt(7));
     add("vbUseSystem", Variant::mkInt(0));
+    add("vbUseSystemDayOfWeek", Variant::mkInt(1));
     add("vbFirstJan1", Variant::mkInt(1));
     add("vbFirstFourDays", Variant::mkInt(2));
     add("vbFirstFullWeek", Variant::mkInt(3));
@@ -974,10 +1043,9 @@ void registerBuiltins(Interp& ip) {
     mkDatePart("h");
     mkDatePart("n");
     mkDatePart("s");
-    reg("Weekday", 1, 2, [](Interp&, std::vector<Variant>& a) -> Variant {
+    reg("Weekday", 1, 2, [](Interp& ip, std::vector<Variant>& a) -> Variant {
         double d = dateArg(a, 0);
-        long long first = a.size() >= 2 ? toInt64(A(a, 1)) : 1;
-        if (first < 1 || first > 7) throwErr(5, errDesc(5));
+        long long first = resolveFirstDayOfWeek(ip, a.size() >= 2 ? toInt64(A(a, 1)) : 1);
         int wd = weekdayOf(d); // 1=Sun..7=Sat
         return Variant::mkInt(((wd - (int)first) % 7 + 7) % 7 + 1);
     });
@@ -1020,10 +1088,11 @@ void registerBuiltins(Interp& ip) {
         double d1 = dateArg(a, 1), d2 = dateArg(a, 2);
         return dateDiffImpl(unit, d1, d2);
     });
-    reg("DatePart", 2, 4, [](Interp&, std::vector<Variant>& a) -> Variant {
+    reg("DatePart", 2, 4, [](Interp& ip, std::vector<Variant>& a) -> Variant {
         std::string unit = lower(toStr(A(a, 0)));
         double d = dateArg(a, 1);
-        return datePartImpl(unit, d);
+        long long first = resolveFirstDayOfWeek(ip, a.size() >= 3 ? toInt64(A(a, 2)) : 1);
+        return datePartImpl(unit, d, first);
     });
     reg("MonthName", 1, 2, [](Interp&, std::vector<Variant>& a) -> Variant {
         static const char* full[] = {"", "January","February","March","April","May","June","July","August","September","October","November","December"};
@@ -1033,12 +1102,12 @@ void registerBuiltins(Interp& ip) {
         if (m < 1 || m > 12) return Variant::mkStr("");
         return Variant::mkStr(abbrev ? ab[m] : full[m]);
     });
-    reg("WeekdayName", 1, 3, [](Interp&, std::vector<Variant>& a) -> Variant {
+    reg("WeekdayName", 1, 3, [](Interp& ip, std::vector<Variant>& a) -> Variant {
         static const char* full[] = {"", "Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
         static const char* ab[] = {"", "Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
         long long w = toInt64(A(a, 0));
         bool abbrev = a.size() >= 2 ? toBool(A(a, 1)) : false;
-        long long first = a.size() >= 3 ? toInt64(A(a, 2)) : 1;
+        long long first = resolveFirstDayOfWeek(ip, a.size() >= 3 ? toInt64(A(a, 2)) : 1);
         if (w < 1 || w > 7) return Variant::mkStr("");
         long long idx = ((w + (int)first - 2) % 7 + 7) % 7 + 1;
         return Variant::mkStr(abbrev ? ab[idx] : full[idx]);
@@ -1105,6 +1174,90 @@ void registerBuiltins(Interp& ip) {
         std::string pat = "%";
         if (digits >= 0) pat = "0." + std::string((size_t)digits, '0') + "%";
         return Variant::mkStr(fmtNum(v, pat));
+    });
+
+    // Filter(sourcearray, string [, include [, compare]]): 1-D string array subset.
+    // No matches -> uninitialized array (UBound on it raises 9), as in MS VBScript.
+    reg("Filter", 2, 4, [](Interp&, std::vector<Variant>& a) -> Variant {
+        const Variant& src = A(a, 0);
+        if (src.t != VT::Array || !src.arr || !src.arr->allocated || src.arr->dims.size() != 1)
+            throwErr(13, errDesc(13));
+        std::string match = toStr(A(a, 1));
+        bool include = a.size() >= 3 ? toBool(A(a, 2)) : true;
+        long long cmp = a.size() >= 4 ? toInt64(A(a, 3)) : 0;
+        if (cmp != 0 && cmp != 1) throwErr(5, errDesc(5));
+        auto needle = cpv(match, cmp == 1);
+        std::vector<Variant> out;
+        for (auto& e : src.arr->data) {
+            auto hay = cpv(toStr(e), cmp == 1);
+            bool found = needle.empty(); // InStr(x, "") is always found
+            for (size_t i = 0; !found && i + needle.size() <= hay.size(); i++) {
+                bool ok = true;
+                for (size_t j = 0; j < needle.size(); j++)
+                    if (hay[i + j] != needle[j]) { ok = false; break; }
+                if (ok) found = true;
+            }
+            if (found == include) out.push_back(Variant::mkStr(toStr(e)));
+        }
+        if (out.empty()) {
+            // no matches: an uninitialized array (UBound errors, ReDim works)
+            auto e = std::make_shared<VArray>();
+            e->allocated = false;
+            return Variant::mkArr(e);
+        }
+        auto arr = std::make_shared<VArray>();
+        arr->alloc({(long long)out.size()}, 0, false);
+        for (size_t i = 0; i < out.size(); i++) arr->data[i] = std::move(out[i]);
+        return Variant::mkArr(arr);
+    });
+
+    // FormatCurrency(expr [, digits [, leadingdigit [, parens [, groupdigits]]]])
+    // tri-state args: -1 vbTrue, 0 vbFalse, -2 vbUseDefault; anything else is
+    // error 5. Symbol/separators follow the locale selected with SetLocale
+    // (en-US defaults: 2 digits, leading zero shown, parens for negatives,
+    // thousands grouping).
+    reg("FormatCurrency", 1, 5, [](Interp& ip, std::vector<Variant>& a) -> Variant {
+        double v = toDouble(A(a, 0));
+        long long digits = a.size() >= 2 ? toInt64(A(a, 1)) : -1;
+        if (digits != -1 && digits != -2 && (digits < 0 || digits > 99))
+            throwErr(5, errDesc(5));
+        if (digits < 0) digits = 2; // locale default
+        auto tri = [&](size_t idx) -> bool {
+            if (a.size() <= idx) return true; // omitted -> UseDefault
+            long long x = toInt64(A(a, idx));
+            if (x != -2 && x != -1 && x != 0) throwErr(5, errDesc(5));
+            return x != 0; // -1 true, 0 false, -2 default(true)
+        };
+        bool lead = tri(2), par = tri(3), grp = tri(4);
+        const LocaleInfo* L = localeInfoFor(toInt64(ip.localeId));
+        return Variant::mkStr(fmtCurrency(v, digits, lead, par, grp, L));
+    });
+
+    // GetLocale/SetLocale: the current locale as a numeric LCID, default 1033
+    // (en-US). SetLocale accepts an LCID number or a short name ("en-gb") and
+    // returns the previous locale id, per MS docs. Unknown names are error 5.
+    reg("GetLocale", 0, 0, [](Interp& ip, std::vector<Variant>&) -> Variant {
+        return ip.localeId;
+    });
+    reg("SetLocale", 1, 1, [](Interp& ip, std::vector<Variant>& a) -> Variant {
+        Variant v = A(a, 0);
+        long long lcid;
+        if (v.isNum()) {
+            lcid = toInt64(v);
+            if (lcid < 0 || lcid > 0x7FFFFFFFLL) throwErr(5, errDesc(5)); // LCIDs are 32-bit
+        } else if (v.t == VT::String) {
+            std::string nm = lower(v.s);
+            for (auto& c : nm) if (c == '_') c = '-';
+            lcid = -1;
+            for (auto& L : kLocales)
+                if (nm == L.name) { lcid = L.lcid; break; }
+            if (lcid < 0) throwErr(5, "Invalid locale name: " + v.s);
+        } else {
+            throwErr(5, errDesc(5));
+        }
+        Variant prev = ip.localeId;
+        ip.localeId = Variant::mkLong(lcid); // canonical numeric LCID
+        return prev;
     });
 
     // ---- host interaction ----

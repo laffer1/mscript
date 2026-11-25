@@ -208,5 +208,7 @@ Variant opNeg(const Variant& a);
 Variant opNot(const Variant& a);                       // bitwise for ints, logical otherwise
 Variant opLogic(const std::string& op, const Variant& a, const Variant& b); // and or xor eqv imp
 Variant opCompare(const std::string& op, const Variant& a, const Variant& b, bool compareText);
+bool opLike(const std::string& str, const std::string& pattern, bool compareText); // Like operator
+unsigned vbsFoldCase(unsigned cp);                  // Unicode-aware case fold for text compare
 bool variantIsTrue(const Variant& v);                  // == toBool but Null -> Null handled by caller
 bool objSame(const Variant& a, const Variant& b);      // for Is

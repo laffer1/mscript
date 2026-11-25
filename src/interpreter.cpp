@@ -1040,7 +1040,9 @@ void Interp::execStmt(Stmt& s, Frame& f) {
                 if (n < -1) throwErr(5, errDesc(5)); // ReDim x(-1) is an empty array
                 dims.push_back(n + 1);
             }
-            if (cell->t != VT::Array || !cell->arr) {
+            if (cell->t != VT::Array || !cell->arr || !cell->arr->allocated) {
+                // not an array, or an uninitialized one (e.g. Filter with no
+                // matches): ReDim initializes it fresh, even with Preserve
                 auto fresh = std::make_shared<VArray>();
                 fresh->allocated = false;
                 fresh->alloc(dims, optionBase, false);
@@ -1419,6 +1421,10 @@ Variant Interp::evalExpr(Expr& e, Frame& f) {
         if (op == "and" || op == "or" || op == "xor" || op == "eqv" || op == "imp")
             return opLogic(op, l, r);
         if (op == "is") return Variant::mkBool(objSame(l, r));
+        if (op == "like") {
+            if (l.isNull() || r.isNull()) return Variant::mkNull(); // Null propagates like other comparisons
+            return Variant::mkBool(opLike(toStr(l), toStr(r), compareText));
+        }
         return opCompare(op, l, r, compareText);
     }
     case Expr::Member: {
