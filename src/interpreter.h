@@ -153,6 +153,11 @@ struct Interp {
     std::shared_ptr<VBObject> errObj;
     std::shared_ptr<VBObject> wscriptObj;
     std::shared_ptr<VBObject> globalThis;   // Me at global scope
+    bool aspMode = false;                   // running an .asp template
+    std::shared_ptr<VBObject> responseObj;  // ASP Response object, if any
+    double aspStart = 0;                     // epoch seconds when the ASP script started; 0 = no timeout
+    std::shared_ptr<VBObject> serverObj;     // ASP Server object (live ScriptTimeout), if any
+    unsigned stmtTick = 0;                   // statement counter for the deadline check
     std::vector<std::string> scriptArgs;
     std::string scriptFullName;
     int exitCode = 0;
