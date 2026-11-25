@@ -1600,14 +1600,30 @@ Variant Interp::instantiateClass(const std::string& name, std::vector<Expr*>& ar
 
 // ---------- Eval / Execute ----------
 
+// a syntax error in Eval/Execute code is a runtime error of the caller
+// (catchable with On Error, as in VBScript), not a fatal ParseError
+[[noreturn]] static void dynamicSyntaxError(const ParseError& pe) {
+    throwErr(1002, "Syntax error: " + pe.msg);
+}
+
 Variant Interp::evalString(const std::string& code) {
-    ExprPtr e = Parser::parseExpressionString(code);
+    ExprPtr e;
+    try {
+        e = Parser::parseExpressionString(code);
+    } catch (ParseError& pe) {
+        dynamicSyntaxError(pe);
+    }
     Frame& f = *cur;
     return evalExpr(*e, f);
 }
 
 void Interp::executeString(const std::string& code, bool globalScope) {
-    auto prog = std::make_unique<Program>(Parser::parseStatementsString(code));
+    std::unique_ptr<Program> prog;
+    try {
+        prog = std::make_unique<Program>(Parser::parseStatementsString(code));
+    } catch (ParseError& pe) {
+        dynamicSyntaxError(pe);
+    }
     std::vector<Stmt*> list;
     for (auto& st : prog->stmts) list.push_back(st.get());
     ownedPrograms.push_back(std::move(prog));

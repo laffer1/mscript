@@ -180,7 +180,9 @@ HttpResponse httpRaw(const std::string& method, const std::string& url,
     // honor http_proxy / HTTP_PROXY (connect to the proxy, send absolute URI)
     std::string connectHost = u.host, connectPort = u.port, target = u.doc;
     const char* proxy = std::getenv("http_proxy");
-    if (!proxy) proxy = std::getenv("HTTP_PROXY");
+    // under CGI, HTTP_PROXY is the client's "Proxy:" request header (httpoxy):
+    // only the lowercase form, which no request header can produce, counts
+    if (!proxy && !std::getenv("REQUEST_METHOD")) proxy = std::getenv("HTTP_PROXY");
     if (proxy && *proxy) {
         std::string ps = proxy;
         validateUrl(ps);

@@ -287,6 +287,55 @@ ASP
     asp_check servervars_enum_no_secret nomatch 'names=.*SECRET_TOKEN' tests/aspsec/servervars.asp $sv_env
     # shellcheck disable=SC2086
     asp_check servervars_enum match 'names=.*HTTP_X_TEST,.*REMOTE_USER,' tests/aspsec/servervars.asp $sv_env
+    # httpoxy: a client "Proxy:" header (HTTP_PROXY under CGI) must not proxy
+    # the page's outgoing XMLHTTP requests (here: through the local test
+    # server, which would answer; going direct to port 1 fails)
+    if [ -n "$SRV_PID" ]; then
+        asp_check httpoxy match 'xh-err=True|sv=http://127.0.0.1:18099' tests/aspsec/httpoxy.asp \
+            HTTP_PROXY=http://127.0.0.1:18099
+    fi
+    # a bad cookie attribute fails at the assignment; the header block is
+    # still emitted, and request data never becomes headers
+    asp_check cookieattr_err match 'path-err=5|Location' tests/aspsec/cookieattr.asp \
+        'QUERY_STRING=p=;&x=Location:%20https://evil.example/%0d%0a%0d%0a'
+    asp_check cookieattr_headers match '^Content-Type: text/html' tests/aspsec/cookieattr.asp \
+        'QUERY_STRING=p=;&x=Location:%20https://evil.example/%0d%0a%0d%0a'
+    asp_check cookieattr_noinject nomatch '^Location: https://evil' tests/aspsec/cookieattr.asp \
+        'QUERY_STRING=p=;&x=Location:%20https://evil.example/%0d%0a%0d%0a'
+    asp_check cookieattr_nul match 'path-err=5' tests/aspsec/cookieattr.asp 'QUERY_STRING=p=/%00'
+    # form field cap, and form parsing only when the page uses it
+    awk 'BEGIN { for (i = 0; i < 10001; i++) printf "k%d=v&", i }' >"$tmp.body"
+    env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \
+        CONTENT_TYPE=application/x-www-form-urlencoded CONTENT_LENGTH=$(($(wc -c <"$tmp.body"))) \
+        "$BIN" tests/aspsec/formcap.asp <"$tmp.body" >"$tmp" 2>&1
+    if grep -aq 'form-err=5' "$tmp"; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "FAIL aspsec_form_field_cap"; head -5 "$tmp"; echo; fi
+    # BinaryRead returns a byte string usable with LenB/MidB/AscB/InStrB
+    printf 'a\377b' >"$tmp.body"
+    env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \
+        CONTENT_TYPE=application/octet-stream CONTENT_LENGTH=3 \
+        "$BIN" tests/aspsec/binread.asp <"$tmp.body" >"$tmp" 2>&1
+    if grep -aq 'String:3:255:2' "$tmp"; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "FAIL aspsec_binaryread_bytes"; head -5 "$tmp"; echo; fi
+    # an over-long multipart boundary (RFC 2046: max 70) is not parsed
+    long_b=$(awk 'BEGIN { for (i = 0; i < 200; i++) printf "x" }')
+    printf -- "--%s\r\nContent-Disposition: form-data; name=\"k1\"\r\n\r\nv\r\n--%s--\r\n" "$long_b" "$long_b" >"$tmp.body"
+    env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \
+        CONTENT_TYPE="multipart/form-data; boundary=$long_b" CONTENT_LENGTH=$(($(wc -c <"$tmp.body"))) \
+        "$BIN" tests/aspsec/formcap.asp <"$tmp.body" >"$tmp" 2>&1
+    if grep -aq 'form-err=0\[0\]' "$tmp"; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "FAIL aspsec_multipart_long_boundary"; head -5 "$tmp"; echo; fi
+    # multipart: filename="x" is not the field name; media type is case-insensitive
+    printf -- '--B\r\nContent-Disposition: form-data; filename="k1"; name="real"\r\n\r\nv\r\n--B--\r\n' >"$tmp.body"
+    env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \
+        CONTENT_TYPE='Multipart/Form-Data; Boundary=B' CONTENT_LENGTH=$(($(wc -c <"$tmp.body"))) \
+        "$BIN" tests/aspsec/formcap.asp <"$tmp.body" >"$tmp" 2>&1
+    if grep -aq 'form-err=0\[1\]' "$tmp"; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "FAIL aspsec_multipart_name_param"; head -5 "$tmp"; echo; fi
+    # Server.Execute nesting is limited (it used to crash the process)
+    asp_check execute_depth match 'depth-err=28' tests/aspsec/recapp/rec.asp
+    # syntax errors in Execute/Eval/Server.Execute code are catchable runtime errors
+    asp_check dynamic_syntax match 'exec=1002|eval=1002|server=1002' tests/aspsec/dynsyntax.asp
     # LF-only multipart: no crash, value intact
     printf -- '--B\nContent-Disposition: form-data; name="a"\n\n--B\nContent-Disposition: form-data; name="b"\n\nhello\n--B--' >"$tmp.body"
     env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \

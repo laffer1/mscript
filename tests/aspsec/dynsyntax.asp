@@ -1,0 +1,1 @@
+<% On Error Resume Next : Execute "If x" : Response.Write "exec=" & Err.Number : Err.Clear : y = Eval("1 +") : Response.Write "|eval=" & Err.Number : Err.Clear : Server.Execute "badsyntax.asp" : Response.Write "|server=" & Err.Number %>

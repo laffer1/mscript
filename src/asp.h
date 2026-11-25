@@ -14,6 +14,13 @@
 
 struct Interp;
 
+// CGI only: move the request headers that the HTTP client stack (libfetch and
+// our XMLHTTP) would read as its own configuration out of the environment.
+// A client sending "Proxy: http://evil" otherwise sets HTTP_PROXY and every
+// outgoing request the page makes goes through the attacker ("httpoxy").
+// Request.ServerVariables still reports the original header values.
+void cgiSanitizeEnv();
+
 // Transform an .asp template into plain VBScript: HTML text becomes
 // Response.Write statements, <%= expr %> becomes Response.Write (expr),
 // <% code %> is passed through, <%@ directives %> are dropped, and
