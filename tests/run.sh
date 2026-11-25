@@ -44,10 +44,15 @@ for t in tests/*.vbs tests/*.asp; do
         export MScript_ASP_STATE_DB
         QUERY_STRING="name=mscript&n=42"
         export QUERY_STRING
-        # 39_* exercises CGI headers/cookies: run as GET with a fixed valid
-        # session id so the Set-Cookie line is deterministic
+        # 39_* exercises CGI headers/cookies: run as GET with a fixed session
+        # id, registered as a live session first (unknown ids are rotated to
+        # block session fixation) so no session Set-Cookie line is emitted
         case "$name" in
         39_*)
+            command -v sqlite3 >/dev/null 2>&1 || { echo "SKIP $name (no sqlite3)"; continue; }
+            sqlite3 "$MScript_ASP_STATE_DB" \
+                "CREATE TABLE IF NOT EXISTS session_meta(sid TEXT PRIMARY KEY, last REAL, lcid INTEGER, codepage INTEGER);
+                 INSERT OR REPLACE INTO session_meta(sid, last) VALUES('0123456789abcdef0123456789abcdef', strftime('%s','now'));" || continue
             REQUEST_METHOD=GET
             export REQUEST_METHOD
             HTTP_COOKIE="MScriptSessionID=0123456789abcdef0123456789abcdef; theme=dark"
@@ -117,6 +122,62 @@ if [ -f tests/aspapp/page.asp ]; then
         diff "$exp" "$tmp" | head -20
     fi
 fi
+# ASP security regressions (tests/aspsec): each check runs a page as CGI and
+# greps the raw response
+if [ -d tests/aspsec ]; then
+    sdb="$tmp.sec.db"
+    asp_check() { # name, expect(match|nomatch), pattern, page, [env...]
+        cname=$1 mode=$2 pat=$3 page=$4
+        shift 4
+        env -u HTTP_COOKIE -u QUERY_STRING REQUEST_METHOD=GET MScript_ASP_STATE_DB="$sdb" "$@" \
+            "$BIN" "$page" >"$tmp" 2>&1 </dev/null
+        crc=$?
+        if LC_ALL=C grep -aq -- "$pat" "$tmp"; then found=match; else found=nomatch; fi
+        if [ "$crc" -eq 0 ] && [ "$found" = "$mode" ]; then
+            pass=$((pass + 1))
+        else
+            fail=$((fail + 1))
+            echo "FAIL aspsec_$cname (rc=$crc)"
+            head -10 "$tmp"
+        fi
+    }
+    # overlong / truncated UTF-8 must not decode to markup after HTMLEncode
+    asp_check overlong nomatch '<script>' tests/aspsec/encode.asp \
+        'QUERY_STRING=a=%C0%BCscript%C0%BE&b='
+    asp_check quote_swallow match 'title="x?" href=" onmouseover' tests/aspsec/encode.asp \
+        'QUERY_STRING=a=x%C3&b=%20onmouseover%3Dalert(1)'
+    asp_check utf8_valid match 'caf.!' tests/aspsec/encode.asp 'QUERY_STRING=a=caf%C3%A9!&b='
+    # a client-chosen (never issued) session id is replaced, with a hardened cookie
+    asp_check fixation nomatch 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' tests/aspsec/sid.asp \
+        'HTTP_COOKIE=MScriptSessionID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    asp_check cookie_flags match 'MScriptSessionID=[0-9a-f]*; path=/; httponly; samesite=Lax' tests/aspsec/sid.asp
+    asp_check cookie_secure match '; secure; httponly' tests/aspsec/sid.asp HTTPS=on
+    # huge Response.Expires must not crash (gmtime NULL)
+    asp_check expires_huge match 'Expires: .* 9999 ' tests/aspsec/expires.asp
+    # Response.Redirect inside Session_OnStart ends the request cleanly
+    asp_check onstart_redirect match 'Location: /login' tests/aspsec/app/page.asp
+    # LF-only multipart: no crash, value intact
+    printf -- '--B\nContent-Disposition: form-data; name="a"\n\n--B\nContent-Disposition: form-data; name="b"\n\nhello\n--B--' >"$tmp.body"
+    env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \
+        CONTENT_TYPE='multipart/form-data; boundary=B' CONTENT_LENGTH=$(($(wc -c <"$tmp.body"))) \
+        "$BIN" tests/aspsec/form.asp <"$tmp.body" >"$tmp" 2>&1
+    if [ $? -eq 0 ] && grep -aq '\[\]\[hello\]' "$tmp"; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "FAIL aspsec_multipart_lf"; head -10 "$tmp"; fi
+    # concurrent writers wait on the lock instead of failing with SQLITE_BUSY
+    # (wait on these pids only: a bare `wait` would block on the test server)
+    i=0; pids=; : >"$tmp.err"
+    while [ $i -lt 16 ]; do
+        env -u HTTP_COOKIE REQUEST_METHOD=GET MScript_ASP_STATE_DB="$sdb" \
+            "$BIN" tests/aspsec/write.asp >/dev/null 2>>"$tmp.err" &
+        pids="$pids $!"
+        i=$((i + 1))
+    done
+    for p in $pids; do wait "$p"; done
+    if [ ! -s "$tmp.err" ]; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "FAIL aspsec_concurrency"; sort "$tmp.err" | uniq -c | head -5; fi
+    rm -f "$sdb" "$sdb-wal" "$sdb-shm" "$sdb.lock" "$tmp.body" "$tmp.err"
+fi
+
 rm -f "$tmp" "$tmp.db"
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

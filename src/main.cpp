@@ -111,18 +111,28 @@ int main(int argc, char** argv) {
         Interp ip;
         ip.scriptFullName = srcName;
         initWScript(ip, srcName, srcName, scriptArgs);
-        if (aspMode) {
-            ip.aspMode = true;
-            registerAspObjects(ip, std::getenv("REQUEST_METHOD") != nullptr);
-            // arm the Server.ScriptTimeout wall-clock check (read live in execStmtList)
-            ip.aspStart = (double)std::time(nullptr);
-        }
-        ip.load(prog, srcName);
+        if (aspMode) ip.aspMode = true;
         try {
-            // inside the VBSError handler so hook errors get the normal ASP
-            // error report + response flush
-            if (aspMode) aspGlobalAsaHooks(ip);
-            ip.run();
+            // ASP setup (session/state db) and the global.asa hooks run inside
+            // the VBSError handler so their errors get the normal ASP error
+            // report + response flush instead of no CGI response at all
+            if (aspMode) {
+                registerAspObjects(ip, std::getenv("REQUEST_METHOD") != nullptr);
+                // arm the Server.ScriptTimeout wall-clock check (read live in execStmtList)
+                ip.aspStart = (double)std::time(nullptr);
+            }
+            ip.load(prog, srcName);
+            bool endedInHook = false;
+            if (aspMode) {
+                try {
+                    aspGlobalAsaHooks(ip);
+                } catch (EndSig&) {
+                    // Response.End / Redirect / Server.Transfer in
+                    // Application_OnStart or Session_OnStart ends the request
+                    endedInHook = true;
+                }
+            }
+            if (!endedInHook) ip.run();
         } catch (VBSError& e) {
             // small positive codes are VB errors shown as &H800Axxxx; a full
             // HRESULT (negative int32) is displayed as-is
