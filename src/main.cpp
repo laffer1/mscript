@@ -87,6 +87,27 @@ int main(int argc, char** argv) {
 
         Program prog = Parser(lex(code)).parseProgram();
 
+        // ASP extension: a global.asa next to the script contributes its
+        // declarations (Application_OnStart / Session_OnStart / ...) ahead
+        // of the page's own statements
+        if (aspMode) {
+            std::error_code ec;
+            // global.asa lives at the application root, so pages in
+            // subdirectories get the same hooks
+            std::filesystem::path gasa =
+                std::filesystem::path(aspAppRootOf(srcName)) / "global.asa";
+            if (std::filesystem::exists(gasa, ec)) {
+                std::ifstream gin(gasa, std::ios::binary);
+                std::ostringstream gss;
+                gss << gin.rdbuf();
+                Program g = Parser(lex(aspToVbs(gss.str(), true))).parseProgram();
+                std::vector<StmtPtr> merged;
+                for (auto& st : g.stmts) merged.push_back(std::move(st));
+                for (auto& st : prog.stmts) merged.push_back(std::move(st));
+                prog.stmts = std::move(merged);
+            }
+        }
+
         Interp ip;
         ip.scriptFullName = srcName;
         initWScript(ip, srcName, srcName, scriptArgs);
@@ -98,6 +119,9 @@ int main(int argc, char** argv) {
         }
         ip.load(prog, srcName);
         try {
+            // inside the VBSError handler so hook errors get the normal ASP
+            // error report + response flush
+            if (aspMode) aspGlobalAsaHooks(ip);
             ip.run();
         } catch (VBSError& e) {
             // small positive codes are VB errors shown as &H800Axxxx; a full

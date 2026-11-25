@@ -1,0 +1,25 @@
+Content-Type: text/html; charset=utf-8
+Cache-Control: no-cache
+PICS-Label: (PICS-1.1 mscript)
+Expires: Tue, 01 Jan 2030 00:00:00 GMT
+Set-Cookie: MixedCase=v
+Set-Cookie: pref=x%3D1; httponly
+Set-Cookie: theme=dark; path=/app; expires=Sun, 01 Jun 2031 12:00:00 GMT
+
+ro-err=438
+req-name=mscript
+req-cookie=dark
+req-sv=name=mscript&n=42
+qs-count=2
+qs-item=42
+sv-item=name=mscript&n=42
+sv-count>0=True
+cc=no-cache
+cp-charset-ok
+contents=2:admin
+after-remove=1
+lcid=1033
+lcid2=2057
+codepage=1252
+connected=True
+

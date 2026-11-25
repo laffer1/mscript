@@ -1,0 +1,13 @@
+<script language="VBScript" runat="server">
+Sub Application_OnStart()
+    Application("started") = "yes"
+End Sub
+
+Sub Session_OnStart()
+    Session("welcomed") = "yes"
+End Sub
+
+Sub Session_OnEnd()
+    ' no persistent side effect needed for the test
+End Sub
+</script>

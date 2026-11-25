@@ -155,6 +155,7 @@ struct Interp {
     std::shared_ptr<VBObject> wscriptObj;
     std::shared_ptr<VBObject> globalThis;   // Me at global scope
     bool aspMode = false;                   // running an .asp template
+    bool aspNewSession = false;             // ASP: a fresh session id was issued this request
     std::shared_ptr<VBObject> responseObj;  // ASP Response object, if any
     double aspStart = 0;                     // epoch seconds when the ASP script started; 0 = no timeout
     std::shared_ptr<VBObject> serverObj;     // ASP Server object (live ScriptTimeout), if any
@@ -173,6 +174,8 @@ struct Interp {
     Interp(const Interp&) = delete;
     Interp& operator=(const Interp&) = delete;
     void load(Program& prog, const std::string& srcName);
+    // call a global procedure by name if it exists (global.asa hooks); false if absent
+    bool callGlobalProc(const std::string& name);
     void hoistDecls(Stmt& st); // procs/classes/consts are compile-time
     void run();
     // End of script: release script-level variables, Static locals and the

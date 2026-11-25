@@ -16,13 +16,24 @@ struct Interp;
 
 // Transform an .asp template into plain VBScript: HTML text becomes
 // Response.Write statements, <%= expr %> becomes Response.Write (expr),
-// <% code %> is passed through, <%@ directives %> are dropped.
+// <% code %> is passed through, <%@ directives %> are dropped, and
+// <script runat="server"> blocks are treated as code. dropText keeps only
+// the code blocks (used for global.asa, whose markup is never rendered).
 // Newlines are preserved so error line numbers still match the .asp file.
-std::string aspToVbs(const std::string& src);
+std::string aspToVbs(const std::string& src, bool dropText = false);
+
+// The ASP application root for a script: the nearest ancestor directory
+// containing a global.asa, else the script's own directory.
+std::string aspAppRootOf(const std::string& scriptFullName);
 
 // Register the ASP globals (request/response/server/session/application).
 // cgi=true when running under a web server (REQUEST_METHOD is set).
 void registerAspObjects(Interp& ip, bool cgi);
+
+// Run global.asa hooks after the program is loaded: Application_OnStart
+// (once per application, guarded in the state db) and Session_OnStart for
+// newly issued sessions. Call only in ASP mode.
+void aspGlobalAsaHooks(Interp& ip);
 
 // Route WScript.Echo output into the Response body in ASP mode.
 // Returns true if the output was consumed by the Response object.
