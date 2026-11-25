@@ -167,6 +167,20 @@ WScript.Echo "sum = " & total        ' sum = 5050
   as JSON) stored in `/var/db/mscript/asp-state.db` (override with `MScript_ASP_STATE_DB`).
   Under a web server (`REQUEST_METHOD` set) the CGI headers are emitted automatically.
   With Apache `mod_cgi`: `AddHandler cgi-script .asp` + `#!/usr/local/bin/mscript`.
+  - An application is the nearest directory with a `global.asa` (else the page's own
+    directory). Sessions belong to one application: the cookie is
+    `MScriptSessionID_<8 hex>` (per app, `HttpOnly; SameSite=Lax`, plus `Secure` under
+    HTTPS), and only ids the server issued and that are still live are accepted.
+    `Session.Timeout` (1–1440 minutes) persists across requests. `Session_OnEnd` runs when an
+    expired session's cookie comes back, or on `Session.Abandon`; there is no timer between
+    CGI requests, and `Request`/`Response` are not available inside it.
+  - `Response.Cookies("n") = v` sets a value, `Response.Cookies("n")("k") = v` sets a
+    sub-key (`n=k=v&k2=v2`), and attributes are properties (`.Path`, `.Domain`, `.Expires`,
+    `.Secure`, `.HttpOnly`, `.SameSite`). `Response.Redirect` discards the buffered page.
+    Changing headers after they were sent raises `ASP 0156`.
+  - `Server.Execute`/`Transfer` run `.asp` pages inside the application only, checked on
+    the real (symlink-resolved) path. `Server.MapPath("/x")` maps to `DOCUMENT_ROOT`, and
+    `..` that leaves the document or application root raises `ASP 0131`.
 - **Dynamic code** — `Eval`, `Execute`, `ExecuteGlobal`
 - **Source conveniences** — `'` and `Rem` comments, `_` line continuation, `:` statement
   separators, `&H`/`&O` literals, `""` escapes, bracketed identifiers `[my var]`,
