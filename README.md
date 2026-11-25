@@ -176,7 +176,15 @@ WScript.Echo "sum = " & total        ' sum = 5050
     CGI requests, and `Request`/`Response` are not available inside it.
   - `Response.Cookies("n") = v` sets a value, `Response.Cookies("n")("k") = v` sets a
     sub-key (`n=k=v&k2=v2`), and attributes are properties (`.Path`, `.Domain`, `.Expires`,
-    `.Secure`, `.HttpOnly`, `.SameSite`). `Response.Redirect` discards the buffered page.
+    `.Secure`, `.HttpOnly`, `.SameSite`). `Request.Cookies("n")` reads as the decoded value
+    and exposes sub-keys the same way (`Request.Cookies("n")("k")`, `.HasKeys`).
+    `Response.Redirect` discards the buffered page.
+  - `Request.ServerVariables` (and the `Request("name")` fallback) expose only request
+    metadata: the CGI variables, request headers (`HTTP_*`), TLS details (`SSL_*`, `HTTPS`),
+    common server extras (`DOCUMENT_ROOT`, `REQUEST_URI`, ...) and the IIS names derived
+    from them (`ALL_HTTP`, `ALL_RAW`, `URL`, `AUTH_USER`, `LOGON_USER`, `LOCAL_ADDR`,
+    `SERVER_PORT_SECURE`, `APPL_PHYSICAL_PATH`). The rest of the process environment is
+    not reachable through them.
     Changing headers after they were sent raises `ASP 0156`.
   - `Server.Execute`/`Transfer` run `.asp` pages inside the application only, checked on
     the real (symlink-resolved) path. `Server.MapPath("/x")` maps to `DOCUMENT_ROOT`, and

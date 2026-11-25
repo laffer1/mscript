@@ -264,6 +264,29 @@ ASP
     else
         echo "SKIP aspsec session expiry checks (no sqlite3)"
     fi
+    # Request.Cookies: sub-keys split before decoding (an encoded '&' survives),
+    # the decoded whole value as the default property, HasKeys/Count/For Each
+    rc_cookie='HTTP_COOKIE=user=name=bob%20b&lang=en%26x; theme=dark%3Dx; plain=a%20b'
+    asp_check reqcookie_subkeys match \
+        'name=bob b|lang=en&x|haskeys=True:False|count=2|whole=name=bob b&lang=en&x' \
+        tests/aspsec/reqcookie.asp "$rc_cookie"
+    asp_check reqcookie_scalar match \
+        '|theme=dark=x|eq=True|plain=a b|missing=\[\]|req=dark=x|keys=lang,name,' \
+        tests/aspsec/reqcookie.asp "$rc_cookie"
+    # ServerVariables / Request() expose request metadata only, never the
+    # rest of the process environment
+    sv_env='SECRET_TOKEN=s3cr3t HTTP_X_TEST=hi REMOTE_USER=alice SCRIPT_NAME=/app/p.asp HTTPS=on'
+    # shellcheck disable=SC2086
+    asp_check servervars_no_env match 'secret=\[\]\[\]|statedb=\[\]|path=\[\]' \
+        tests/aspsec/servervars.asp $sv_env
+    # shellcheck disable=SC2086
+    asp_check servervars_cgi match \
+        '|hdr=hi:hi|auth=alice|url=/app/p.asp|secure=1|raw=.*X-Test: hi;' \
+        tests/aspsec/servervars.asp $sv_env
+    # shellcheck disable=SC2086
+    asp_check servervars_enum_no_secret nomatch 'names=.*SECRET_TOKEN' tests/aspsec/servervars.asp $sv_env
+    # shellcheck disable=SC2086
+    asp_check servervars_enum match 'names=.*HTTP_X_TEST,.*REMOTE_USER,' tests/aspsec/servervars.asp $sv_env
     # LF-only multipart: no crash, value intact
     printf -- '--B\nContent-Disposition: form-data; name="a"\n\n--B\nContent-Disposition: form-data; name="b"\n\nhello\n--B--' >"$tmp.body"
     env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \

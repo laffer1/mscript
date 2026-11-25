@@ -74,6 +74,12 @@ and
 run only
 .Pa .asp
 pages inside the application.
+.Dv Request.ServerVariables
+exposes only request metadata (CGI variables,
+.Ev HTTP_*
+headers,
+.Ev SSL_*
+and the IIS-derived names), not the rest of the process environment.
 .Pp
 The interpreter implements Variant semantics (Empty, Null, Boolean, Byte,
 Integer, Long, Single, Double, Currency, Date, String, arrays and objects), the
