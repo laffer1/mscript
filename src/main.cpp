@@ -31,6 +31,7 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+    cgiSanitizeEnv(); // first: before anything can read the client-set HTTP_* config vars
     std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty()) { usage(); return 2; }
 

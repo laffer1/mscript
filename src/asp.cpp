@@ -26,6 +26,8 @@
 #include <fstream>
 #include <format>
 #include <map>
+#include <optional>
+#include <functional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -159,13 +161,23 @@ std::string urlEncode(const std::string& s) {
 
 // parse "k=v&k2=v2" (query string / urlencoded form). Repeated keys are joined
 // with commas, as classic ASP does for Request.QueryString("k").
+// Request collections hold at most this many fields (like PHP's max_input_vars
+// or IIS's request limits): a 16 MiB body of k=v&k=v... otherwise cost
+// hundreds of MB of map nodes and seconds of CPU before the page even ran
+constexpr size_t MAX_FIELDS = 10000;
+
+[[noreturn]] void tooManyFields() {
+    throwErr(5, "ASP Request: too many form/query fields (limit " + std::to_string(MAX_FIELDS) + ")");
+}
+
 std::map<std::string, std::string> parsePairs(const std::string& s) {
     std::map<std::string, std::string> m;
-    size_t pos = 0;
+    size_t pos = 0, fields = 0;
     while (pos <= s.size()) {
         size_t amp = s.find('&', pos);
         std::string pair = s.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
         if (!pair.empty()) {
+            if (++fields > MAX_FIELDS) tooManyFields();
             size_t eq = pair.find('=');
             std::string k = lower(urlDecode(eq == std::string::npos ? pair : pair.substr(0, eq)));
             std::string v = eq == std::string::npos ? "" : urlDecode(pair.substr(eq + 1));
@@ -208,9 +220,43 @@ std::map<std::string, std::string> parseCookies(const std::string& s) {
 }
 
 // basic multipart/form-data parsing: returns field name -> value
+// the name="..." parameter of a part's Content-Disposition header. Parsed as
+// parameters, so filename="x" (which contains name=") is never mistaken for
+// the field name, and header/parameter names are case-insensitive.
+bool multipartFieldName(const std::string& headers, std::string& name) {
+    size_t pos = 0;
+    while (pos < headers.size()) {
+        size_t eol = headers.find('\n', pos);
+        std::string line = headers.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        pos = eol == std::string::npos ? headers.size() : eol + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos || lower(trim(line.substr(0, colon))) != "content-disposition") continue;
+        std::string rest = line.substr(colon + 1);
+        size_t i = 0;
+        while (i < rest.size()) {
+            size_t semi = i;
+            bool inq = false;
+            while (semi < rest.size() && (inq || rest[semi] != ';')) {
+                if (rest[semi] == '"') inq = !inq;
+                semi++;
+            }
+            std::string param = trim(rest.substr(i, semi - i));
+            i = semi + 1;
+            size_t eq = param.find('=');
+            if (eq == std::string::npos || lower(trim(param.substr(0, eq))) != "name") continue;
+            std::string v = trim(param.substr(eq + 1));
+            if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+            name = v;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::map<std::string, std::string> parseMultipart(const std::string& body, const std::string& contentType) {
     std::map<std::string, std::string> m;
-    size_t bpos = contentType.find("boundary=");
+    size_t bpos = lower(contentType).find("boundary=");
     if (bpos == std::string::npos) return m;
     std::string boundary = contentType.substr(bpos + 9);
     if (!boundary.empty() && boundary.front() == '"') {
@@ -220,7 +266,10 @@ std::map<std::string, std::string> parseMultipart(const std::string& body, const
         boundary = boundary.substr(0, boundary.find(';')); // drop trailing parameters
         while (!boundary.empty() && (boundary.back() == ' ' || boundary.back() == '\t')) boundary.pop_back();
     }
-    if (boundary.empty()) return m;
+    // RFC 2046: 1..70 characters. A huge boundary made every delimiter search
+    // O(body * boundary)
+    if (boundary.empty() || boundary.size() > 70) return m;
+    size_t parts = 0;
     std::string delim = "--" + boundary;
     size_t pos = body.find(delim);
     while (pos != std::string::npos) {
@@ -239,15 +288,13 @@ std::map<std::string, std::string> parseMultipart(const std::string& body, const
         // strip trailing CRLF before the next boundary
         if (value.size() >= 2 && value.compare(value.size() - 2, 2, "\r\n") == 0) value.resize(value.size() - 2);
         else if (!value.empty() && value.back() == '\n') value.pop_back();
-        size_t npos = headers.find("name=\"");
-        if (npos != std::string::npos) {
-            size_t nend = headers.find('"', npos + 6);
-            if (nend != std::string::npos) {
-                std::string name = lower(headers.substr(npos + 6, nend - (npos + 6)));
-                auto it = m.find(name);
-                if (it == m.end()) m[name] = value;
-                else it->second += "," + value;
-            }
+        std::string name;
+        if (multipartFieldName(headers, name)) {
+            if (++parts > MAX_FIELDS) tooManyFields();
+            name = lower(name);
+            auto it = m.find(name);
+            if (it == m.end()) m[name] = value;
+            else it->second += "," + value;
         }
         pos = next;
     }
@@ -394,8 +441,8 @@ void syncRespProps() {
 // extra directives) or CR/LF
 std::string cleanCookieAttr(const std::string& s, const char* what) {
     if (s.find(';') != std::string::npos || s.find('\r') != std::string::npos ||
-        s.find('\n') != std::string::npos)
-        throwErr(5, std::string("ASP cookie: ';' and CR/LF not allowed in ") + what);
+        s.find('\n') != std::string::npos || s.find('\0') != std::string::npos)
+        throwErr(5, std::string("ASP cookie: ';', CR/LF and NUL not allowed in ") + what);
     return s;
 }
 
@@ -475,6 +522,10 @@ Variant CookieObj::getMember(const std::string& n) {
 void CookieObj::setMember(const std::string& n, const Variant& v) {
     if (n == "haskeys") throwErr(438, errDesc(438)); // read-only
     if (!cookieAttrNames().count(n)) throwErr(438, errDesc(438));
+    // validate text attributes now, at the assignment (a bad value must
+    // never reach header generation, where it would abort the header block)
+    if ((n == "path" || n == "domain" || n == "samesite" || n == "expires") && v.t != VT::Date)
+        cleanCookieAttr(toStr(v), n.c_str());
     MapObject::setMember(n, v);
     markDirty(); // e.g. .Expires = <past date> alone deletes a cookie
 }
@@ -513,8 +564,11 @@ std::string encodeOut(const std::string& s) {
 
 void ensureHeaders() {
     if (!g_resp || g_resp->headersSent) return;
-    g_resp->headersSent = true;
-    if (!std::getenv("REQUEST_METHOD")) return; // local run: body only
+    if (!std::getenv("REQUEST_METHOD")) { g_resp->headersSent = true; return; } // local run: body only
+    // headersSent is set only once the whole header block has been built: if
+    // building it throws, nothing (in particular no body) has been written,
+    // and the next attempt or the final flush still emits headers. Setting
+    // it first let the body be written as the header block.
     syncRespProps();
     // Session.CodePage drives the output charset when the page did not set one
     if (g_resp->charset.empty()) {
@@ -563,6 +617,7 @@ void ensureHeaders() {
     }
     for (auto& kv : g_resp->headers) h += kv.first + ": " + kv.second + "\r\n";
     h += "\r\n";
+    g_resp->headersSent = true;
     std::fwrite(h.data(), 1, h.size(), stdout);
 }
 
@@ -623,6 +678,8 @@ const std::string& requestBody() {
 }
 
 std::string g_appRoot; // the application root dir (original case), for APPL_PHYSICAL_PATH
+// request headers held back from the environment by cgiSanitizeEnv
+std::map<std::string, std::string> g_heldHeaders;
 
 // ---------- Request.Cookies ----------
 
@@ -735,6 +792,7 @@ std::vector<std::string> exposedEnvNames() {
         std::string name = kv.substr(0, eq);
         if (exposedEnvName(name)) out.push_back(name);
     }
+    for (auto& kv : g_heldHeaders) out.push_back(kv.first);
     std::sort(out.begin(), out.end());
     return out;
 }
@@ -770,12 +828,70 @@ bool serverVariable(const std::string& name, std::string& out) {
     if (up == "APPL_PHYSICAL_PATH") { out = g_appRoot + "/"; return true; }
     if (!exposedEnvName(up)) return false;
     const char* v = std::getenv(up.c_str());
-    if (!v) return false;
+    if (!v) {
+        auto it = g_heldHeaders.find(up);
+        if (it == g_heldHeaders.end()) return false;
+        out = it->second;
+        return true;
+    }
     out = v;
     return true;
 }
 
+} // namespace
+
+void cgiSanitizeEnv() {
+    if (!std::getenv("REQUEST_METHOD")) return; // not CGI: these are the user's own settings
+    // Proxy:, Proxy-Auth:, Auth:, Accept:, Referer:, User-Agent: request headers
+    // land in variables that fetch(3) and XMLHTTP read as client configuration
+    static const char* const vars[] = {"HTTP_PROXY", "HTTP_PROXY_AUTH", "HTTP_AUTH",
+                                       "HTTP_ACCEPT", "HTTP_REFERER", "HTTP_USER_AGENT"};
+    for (const char* v : vars) {
+        if (const char* val = std::getenv(v)) {
+            g_heldHeaders[v] = val;
+            unsetenv(v);
+        }
+    }
+}
+
+namespace {
+
 // ---------- key/value collection (Request.QueryString, Form, ...) ----------
+
+// Request.Form: parsed on first use (pages that never read the form never
+// pay for parsing it), shared by Request.Form and Request("name")
+struct LazyFields {
+    std::function<std::map<std::string, std::string>()> load;
+    std::optional<std::map<std::string, std::string>> data;
+    const std::map<std::string, std::string>& get() {
+        if (!data) data = load();
+        return *data;
+    }
+};
+
+struct LazyColl : MapObject {
+    std::shared_ptr<LazyFields> f;
+    explicit LazyColl(std::shared_ptr<LazyFields> fields, const std::string& k) : f(std::move(fields)) {
+        kind = k;
+        onInvoke = [f = f](MapObject*, std::vector<Variant>& a) -> Variant {
+            if (a.empty()) throwErr(450, errDesc(450));
+            auto& d = f->get();
+            auto it = d.find(lower(toStr(a[0])));
+            return Variant::mkStr(it == d.end() ? "" : it->second);
+        };
+        methods["item"] = onInvoke;
+        onEnum = [f = f](MapObject*) -> std::vector<Variant> {
+            std::vector<Variant> out;
+            for (auto& kv : f->get()) out.push_back(Variant::mkStr(kv.first));
+            return out;
+        };
+    }
+    bool hasMember(const std::string& n) const override { return n == "count" || MapObject::hasMember(n); }
+    Variant getMember(const std::string& n) override {
+        if (n == "count") return Variant::mkLong((long long)f->get().size());
+        return MapObject::getMember(n);
+    }
+};
 
 std::shared_ptr<MapObject> makeColl(std::map<std::string, std::string> data, const std::string& kind) {
     auto c = std::make_shared<MapObject>();
@@ -1571,7 +1687,12 @@ struct RespObj : MapObject {
         // properties that only reach the client as headers
         static const std::set<std::string> headerProps = {
             "status", "contenttype", "charset", "cachecontrol", "expires", "expiresabsolute", "pics"};
-        if (headerProps.count(n)) requireHeadersUnsent();
+        if (headerProps.count(n)) {
+            requireHeadersUnsent();
+            // validate at the assignment, not at header time
+            if (n == "expires") (void)toInt64(v);
+            else if (!(n == "expiresabsolute" && v.t == VT::Date)) cleanHeaderText(toStr(v), n.c_str());
+        }
         MapObject::setMember(n, v);
     }
 };
@@ -1828,19 +1949,22 @@ void registerAspObjects(Interp& ip, bool cgi) {
     req->kind = "Request";
     auto qs = parsePairs(std::getenv("QUERY_STRING") ? std::getenv("QUERY_STRING") : "");
     req->props["querystring"] = Variant::mkObj(makeColl(qs, "QueryString"));
-    std::map<std::string, std::string> form;
-    {
+    auto form = std::make_shared<LazyFields>();
+    form->load = [] {
+        std::map<std::string, std::string> m;
         const char* rm = std::getenv("REQUEST_METHOD");
         const char* ct = std::getenv("CONTENT_TYPE");
         if (rm && !strcmp(rm, "POST") && ct) {
+            std::string lct = lower(ct); // media types are case-insensitive
             const std::string& body = requestBody(); // read once, capped
-            if (strncmp(ct, "application/x-www-form-urlencoded", 33) == 0)
-                form = parsePairs(body);
-            else if (strncmp(ct, "multipart/form-data", 19) == 0)
-                form = parseMultipart(body, ct);
+            if (lct.rfind("application/x-www-form-urlencoded", 0) == 0)
+                m = parsePairs(body);
+            else if (lct.rfind("multipart/form-data", 0) == 0)
+                m = parseMultipart(body, ct);
         }
-    }
-    req->props["form"] = Variant::mkObj(makeColl(form, "Form"));
+        return m;
+    };
+    req->props["form"] = Variant::mkObj(std::make_shared<LazyColl>(form, "Form"));
     req->props["cookies"] = Variant::mkObj(makeReqCookies(reqCookies));
     // Request("name"): combined lookup in the documented order —
     // QueryString, Form, Cookies, ServerVariables
@@ -1849,8 +1973,9 @@ void registerAspObjects(Interp& ip, bool cgi) {
         std::string k = lower(toStr(a[0]));
         auto it = qs.find(k);
         if (it != qs.end()) return Variant::mkStr(it->second);
-        it = form.find(k);
-        if (it != form.end()) return Variant::mkStr(it->second);
+        auto& fd = form->get();
+        it = fd.find(k);
+        if (it != fd.end()) return Variant::mkStr(it->second);
         it = reqCookies.find(k);
         if (it != reqCookies.end()) return Variant::mkStr(urlDecode(it->second));
         std::string v;
@@ -1890,13 +2015,13 @@ void registerAspObjects(Interp& ip, bool cgi) {
         const std::string& body = requestBody();
         if (len < 0 || (size_t)len > body.size() - g_reqBodyPos) len = (long long)(body.size() - g_reqBodyPos);
         if (len > MAX_BODY) len = MAX_BODY;
-        if (len <= 0) return Variant::mkArr(std::make_shared<VArray>());
-        auto arr = std::make_shared<VArray>();
-        arr->alloc({len}, 0, false);
-        for (long long i = 0; i < len; i++)
-            arr->data[(size_t)i] = Variant::mkByte((unsigned char)body[g_reqBodyPos + (size_t)i]);
+        if (len <= 0) return Variant::mkStr("");
+        // a byte string, as ASP pages consume it (LenB/MidB/InStrB/AscB):
+        // one byte per byte, where a Variant array took ~90 bytes per byte
+        // (1.5 GB for a 16 MiB upload)
+        std::string out = body.substr(g_reqBodyPos, (size_t)len);
         g_reqBodyPos += (size_t)len;
-        return Variant::mkArr(arr);
+        return Variant::mkStr(std::move(out));
     };
 
     // ---- Server ----
@@ -1972,11 +2097,25 @@ void registerAspObjects(Interp& ip, bool cgi) {
         std::string rs = realRoot.string(), fs = real.string();
         if (fs.rfind(rs == "/" ? rs : rs + "/", 0) != 0)
             throwErr(5, "ASP Server.Execute/Transfer: path outside the application");
-        std::ifstream in(real, std::ios::binary);
-        if (!in) throwErr(53, "File not found: " + v.full.string());
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        ip.executeString(aspToVbs(ss.str()), true);
+        // nesting limit: a page that executes itself (e.g. via
+        // Server.Execute Request("page")) used to recurse until the stack
+        // overflowed and the process died with no response
+        static int depth = 0;
+        constexpr int MAX_EXECUTE_DEPTH = 32;
+        if (depth >= MAX_EXECUTE_DEPTH)
+            throwErr(28, "Out of stack space: Server.Execute/Transfer nested too deeply");
+        std::string code;
+        {
+            // read and close before running: an open stream per nesting level
+            // used to exhaust file descriptors
+            std::ifstream in(real, std::ios::binary);
+            if (!in) throwErr(53, "File not found: " + v.full.string());
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            code = ss.str();
+        }
+        struct DepthGuard { DepthGuard() { depth++; } ~DepthGuard() { depth--; } } guard;
+        ip.executeString(aspToVbs(code), true);
     };
     srv->methods["execute"] = [doExecute](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
@@ -2068,6 +2207,21 @@ bool aspResponseWrite(Interp& ip, const std::string& s) {
 void flushAspResponse(Interp& ip) {
     (void)ip;
     if (!g_resp) return;
-    syncRespProps();
-    flushBody();
+    try {
+        syncRespProps();
+        flushBody();
+    } catch (VBSError& e) {
+        // the response cannot be built (e.g. an invalid header value): send
+        // a clean 500 rather than nothing, and never the page body headerless
+        std::fprintf(stderr, "mscript: ASP response error: %s\n", e.what());
+        if (!g_resp->headersSent && std::getenv("REQUEST_METHOD")) {
+            static const char err[] = "Status: 500 Internal Server Error\r\n"
+                                      "Content-Type: text/plain\r\n\r\n"
+                                      "Internal Server Error\n";
+            std::fwrite(err, 1, sizeof err - 1, stdout);
+            g_resp->headersSent = true;
+        }
+        g_resp->body.clear();
+        std::fflush(stdout);
+    }
 }

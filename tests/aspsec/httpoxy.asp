@@ -1,0 +1,1 @@
+<% On Error Resume Next : Set x = Server.CreateObject("MSXML2.XMLHTTP") : x.open "GET", "http://127.0.0.1:1/never", False : x.send : Response.Write "xh-err=" & (Err.Number <> 0) & "|sv=" & Request.ServerVariables("HTTP_PROXY") %>

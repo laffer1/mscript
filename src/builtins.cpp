@@ -774,6 +774,27 @@ void registerBuiltins(Interp& ip) {
         if (s.empty()) throwErr(5, errDesc(5));
         return Variant::mkLong((long long)cpAt(s, 0));
     });
+    // byte-string functions (classic ASP upload parsing over Request.BinaryRead)
+    reg1("AscB", 1, 1, [](std::vector<Variant>& a) -> Variant {
+        std::string s = toStr(A(a, 0));
+        if (s.empty()) throwErr(5, errDesc(5));
+        return Variant::mkInt((unsigned char)s[0]);
+    });
+    reg1("ChrB", 1, 1, [](std::vector<Variant>& a) -> Variant {
+        long long n = toInt64(A(a, 0));
+        if (n < 0 || n > 255) throwErr(5, errDesc(5));
+        return Variant::mkStr(std::string(1, (char)(unsigned char)n));
+    });
+    reg1("InStrB", 2, 3, [](std::vector<Variant>& a) -> Variant {
+        long long start = 1; std::string h, nd;
+        if (a.size() == 3) { start = toInt64(A(a, 0)); h = toStr(A(a, 1)); nd = toStr(A(a, 2)); }
+        else { h = toStr(A(a, 0)); nd = toStr(A(a, 1)); }
+        if (start < 1) throwErr(5, errDesc(5));
+        if (nd.empty()) return Variant::mkLong(start <= (long long)h.size() + 1 ? start : 0);
+        if ((size_t)start > h.size()) return Variant::mkLong(0);
+        size_t p = h.find(nd, (size_t)start - 1);
+        return Variant::mkLong(p == std::string::npos ? 0 : (long long)p + 1);
+    });
     reg1("AscW", 1, 1, [](std::vector<Variant>& a) -> Variant {
         std::string s = toStr(A(a, 0));
         if (s.empty()) throwErr(5, errDesc(5));

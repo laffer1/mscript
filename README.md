@@ -184,7 +184,13 @@ WScript.Echo "sum = " & total        ' sum = 5050
     common server extras (`DOCUMENT_ROOT`, `REQUEST_URI`, ...) and the IIS names derived
     from them (`ALL_HTTP`, `ALL_RAW`, `URL`, `AUTH_USER`, `LOGON_USER`, `LOCAL_ADDR`,
     `SERVER_PORT_SECURE`, `APPL_PHYSICAL_PATH`). The rest of the process environment is
-    not reachable through them.
+    not reachable through them. Under CGI, the `Proxy:`, `Auth:`, `Proxy-Auth:`, `Accept:`,
+    `Referer:` and `User-Agent:` request headers are removed from the process environment at
+    startup (still visible in `ServerVariables`), so the HTTP client never mistakes them for
+    its own configuration ("httpoxy"); only lowercase `http_proxy` sets a proxy.
+  - `Request.Form` is parsed on first use and holds at most 10000 fields.
+    `Request.BinaryRead` returns a byte string for `LenB`/`MidB`/`InStrB`/`AscB`/`ChrB`.
+    `Server.Execute` nests at most 32 deep.
     Changing headers after they were sent raises `ASP 0156`.
   - `Server.Execute`/`Transfer` run `.asp` pages inside the application only, checked on
     the real (symlink-resolved) path. `Server.MapPath("/x")` maps to `DOCUMENT_ROOT`, and
