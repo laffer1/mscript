@@ -189,6 +189,39 @@ if [ -d tests/aspsec ]; then
     # header changes after Flush raise ASP 0156 instead of being dropped
     asp_check after_flush match 'add=80004005|cookie=80004005|status=80004005|redirect=80004005' \
         tests/aspsec/afterflush.asp
+    # Server.Execute/Transfer/MapPath confinement (built in a scratch tree)
+    xd="$tmp.x"
+    mkdir -p "$xd/app/sub" "$xd/outside"
+    : >"$xd/app/global.asa"
+    printf 'inc-ok' >"$xd/app/inc.asp"
+    printf 'ESCAPED' >"$xd/outside/evil.asp"
+    printf 'Dim x : x = "TXT-RAN"' >"$xd/app/notes.txt"
+    ln -s "$xd/outside" "$xd/app/link"
+    ln -s "$xd/app" "$xd/applink"
+    cat >"$xd/app/sub/page.asp" <<'ASP'
+<%
+On Error Resume Next
+Server.Execute "../inc.asp"
+Response.Write "|up=" & Hex(Err.Number) : Err.Clear
+Server.Execute "../link/evil.asp"
+Response.Write "|symlink=" & Hex(Err.Number) : Err.Clear
+Server.Execute "../notes.txt"
+Response.Write "|txt=" & Hex(Err.Number) : Err.Clear
+Server.Execute "../../outside/evil.asp"
+Response.Write "|parent=" & Hex(Err.Number) : Err.Clear
+p = Server.MapPath("../../../../etc/passwd")
+Response.Write "|mapparent=" & Hex(Err.Number) : Err.Clear
+Response.Write "|map=" & Server.MapPath("/sub/x.txt")
+%>
+ASP
+    # through a symlinked path to the app (like /home -> /usr/home)
+    for pg in "$xd/app/sub/page.asp" "$xd/applink/sub/page.asp"; do
+        asp_check "exec_confine_$(basename "$(dirname "$(dirname "$pg")")")" match \
+            'inc-ok|up=0|symlink=5|txt=5|parent=80004005|mapparent=80004005|map=.*/sub/x.txt' "$pg"
+        asp_check "exec_noescape_$(basename "$(dirname "$(dirname "$pg")")")" nomatch 'ESCAPED' "$pg"
+    done
+    asp_check mappath_docroot match '|map=/srv/www/sub/x.txt' "$xd/app/sub/page.asp" DOCUMENT_ROOT=/srv/www
+    rm -rf "$xd"
     # LF-only multipart: no crash, value intact
     printf -- '--B\nContent-Disposition: form-data; name="a"\n\n--B\nContent-Disposition: form-data; name="b"\n\nhello\n--B--' >"$tmp.body"
     env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \

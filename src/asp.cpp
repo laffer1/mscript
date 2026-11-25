@@ -1665,35 +1665,65 @@ void registerAspObjects(Interp& ip, bool cgi) {
         if (a.empty()) return Variant::mkStr("");
         return Variant::mkStr(urlEncode(toStr(a[0])));
     };
-    srv->methods["mappath"] = [&ip](MapObject*, std::vector<Variant>& a) -> Variant {
+    // Virtual-path resolution shared by MapPath and Execute/Transfer:
+    //   "/x"  -> DOCUMENT_ROOT/x (the app root when DOCUMENT_ROOT is unset)
+    //   "x"   -> relative to the page's own directory
+    // The result must stay inside DOCUMENT_ROOT (absolute virtual paths) or
+    // the application root (relative paths); ".." escaping it is refused like
+    // IIS's default "parent paths disabled" (ASP 0131).
+    struct VPath { std::filesystem::path full, root; };
+    auto resolveVirtual = [&ip](const std::string& p) -> VPath {
+        std::error_code ec;
+        if (p.find('\0') != std::string::npos) throwErr(5, errDesc(5));
+        std::filesystem::path scriptDir = std::filesystem::absolute(ip.scriptFullName, ec).parent_path();
+        std::filesystem::path appRoot = std::filesystem::path(aspAppRootOf(ip.scriptFullName));
+        VPath r;
+        if (!p.empty() && (p[0] == '/' || p[0] == '\\')) {
+            const char* dr = std::getenv("DOCUMENT_ROOT");
+            r.root = (dr && *dr) ? std::filesystem::absolute(dr, ec) : appRoot;
+            r.full = r.root / p.substr(1);
+        } else {
+            r.root = appRoot;
+            r.full = scriptDir / p;
+        }
+        r.root = r.root.lexically_normal();
+        r.full = r.full.lexically_normal();
+        std::string rs = r.root.string(), fs = r.full.string();
+        while (rs.size() > 1 && rs.back() == '/') rs.pop_back();
+        while (fs.size() > 1 && fs.back() == '/') fs.pop_back();
+        if (fs != rs && fs.rfind(rs == "/" ? rs : rs + "/", 0) != 0)
+            throw VBSError((int)0x80004005,
+                           "Server object error 'ASP 0131 : 80004005': Disallowed Parent Path. "
+                           "The path '" + p + "' is outside the application.");
+        r.full = fs;
+        r.root = rs;
+        return r;
+    };
+    srv->methods["mappath"] = [resolveVirtual](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
-        std::error_code ec;
-        std::filesystem::path base = std::filesystem::path(ip.scriptFullName).parent_path();
-        std::string p = toStr(a[0]);
-        std::filesystem::path full = (p.empty() || p[0] == '/') ? base / p.substr(p[0] == '/' ? 1 : 0) : base / p;
-        return Variant::mkStr(full.lexically_normal().string());
+        return Variant::mkStr(resolveVirtual(toStr(a[0])).full.string());
     };
-    // resolve and confine to the script's directory (no traversal, no absolute escape)
-    auto resolveConfined = [&ip](const std::string& p) -> std::string {
+    // Execute/Transfer: only .asp pages, and the confinement is re-checked on
+    // the canonical (symlink-resolved) paths of both sides, so a symlink in
+    // the app cannot point outside it and a symlinked app root still works
+    auto doExecute = [&ip, resolveVirtual](const std::string& rel) {
+        VPath v = resolveVirtual(rel);
+        std::string ext = v.full.extension().string();
+        if (lower(ext) != ".asp")
+            throwErr(5, "ASP Server.Execute/Transfer: only .asp pages can be executed");
         std::error_code ec;
-        std::filesystem::path base = std::filesystem::absolute(ip.scriptFullName, ec).parent_path();
-        std::filesystem::path full = (p.empty() || p[0] == '/') ? base / p.substr(p[0] == '/' ? 1 : 0) : base / p;
-        full = full.lexically_normal();
-        std::string bs = base.lexically_normal().string();
-        std::string fs = full.string();
-        if (fs != bs && fs.rfind(bs + "/", 0) != 0)
-            throwErr(5, "ASP Server.Execute/Transfer: path outside the script directory");
-        return fs;
-    };
-    auto doExecute = [&ip, resolveConfined](const std::string& rel) {
-        std::string path = resolveConfined(rel);
-        std::ifstream in(path, std::ios::binary);
-        if (!in) throwErr(53, "File not found: " + path);
+        std::filesystem::path real = std::filesystem::canonical(v.full, ec);
+        if (ec) throwErr(53, "File not found: " + v.full.string());
+        std::filesystem::path realRoot = std::filesystem::canonical(v.root, ec);
+        if (ec) throwErr(53, "File not found: " + v.root.string());
+        std::string rs = realRoot.string(), fs = real.string();
+        if (fs.rfind(rs == "/" ? rs : rs + "/", 0) != 0)
+            throwErr(5, "ASP Server.Execute/Transfer: path outside the application");
+        std::ifstream in(real, std::ios::binary);
+        if (!in) throwErr(53, "File not found: " + v.full.string());
         std::ostringstream ss;
         ss << in.rdbuf();
-        std::string code = ss.str();
-        if (path.size() >= 4 && lower(path.substr(path.size() - 4)) == ".asp") code = aspToVbs(code);
-        ip.executeString(code, true);
+        ip.executeString(aspToVbs(ss.str()), true);
     };
     srv->methods["execute"] = [doExecute](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
