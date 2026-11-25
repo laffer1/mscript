@@ -222,6 +222,47 @@ ASP
     done
     asp_check mappath_docroot match '|map=/srv/www/sub/x.txt' "$xd/app/sub/page.asp" DOCUMENT_ROOT=/srv/www
     rm -rf "$xd"
+    # Session.Timeout persistence and Session_OnEnd (sessions are aged in the
+    # db with the sqlite3 CLI; skipped without it)
+    asp_check timeout_range match 't0=5|t1441=5' tests/aspsec/endapp/badtimeout.asp
+    if command -v sqlite3 >/dev/null 2>&1; then
+        ename=$(sess_cookie tests/aspsec/endapp/show.asp)
+        # issue a session (in local mode, so stdout is just the id)
+        new_sess() { # query string -> session id
+            env -u HTTP_COOKIE -u REQUEST_METHOD MScript_ASP_STATE_DB="$sdb" QUERY_STRING="$1" \
+                "$BIN" tests/aspsec/endapp/set.asp 2>/dev/null </dev/null | tr -d '\r\n'
+        }
+        age() { # session id, seconds
+            sqlite3 "$sdb" "UPDATE session_meta SET last = last - $2 WHERE sid LIKE '%|$1';"
+        }
+        # a 5-minute timeout is enforced on later requests (was always 20)
+        s5=$(new_sess "n=five&t=5"); age "$s5" 600
+        asp_check timeout_short_expires match '{}' tests/aspsec/endapp/show.asp \
+            "HTTP_COOKIE=$ename=$s5" "QUERY_STRING=n=x"
+        # a 60-minute timeout keeps the session alive past 20 minutes
+        s60=$(new_sess "n=sixty&t=60"); age "$s60" 1800
+        asp_check timeout_long_survives match '{sixty}' tests/aspsec/endapp/show.asp \
+            "HTTP_COOKIE=$ename=$s60" "QUERY_STRING=n=x"
+        # expiry fires Session_OnEnd once, with the old contents, and without
+        # touching the visitor's response
+        sa=$(new_sess "n=alice"); age "$sa" 1800
+        asp_check onend_fires match "^\[$sa\]{}#1" tests/aspsec/endapp/show.asp \
+            "HTTP_COOKIE=$ename=$sa" "QUERY_STRING=n=alice"
+        asp_check onend_no_leak nomatch 'LEAK' tests/aspsec/endapp/show.asp \
+            "HTTP_COOKIE=$ename=$sa" "QUERY_STRING=n=alice"
+        asp_check onend_once match "#1" tests/aspsec/endapp/show.asp \
+            "HTTP_COOKIE=$ename=$sa" "QUERY_STRING=n=alice"
+        # a brand-new visitor or an unknown id does not fire OnEnd
+        # (a spurious OnEnd would count under the empty name: endcount_)
+        asp_check onend_not_new nomatch '#[0-9]' tests/aspsec/endapp/show.asp "QUERY_STRING=n="
+        asp_check onend_not_unknown nomatch '#[0-9]' tests/aspsec/endapp/show.asp \
+            "HTTP_COOKIE=$ename=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "QUERY_STRING=n="
+        # Abandon fires OnEnd with the abandoned session's contents
+        asp_check abandon_onend match '^\[[0-9a-f]\{32\}\]' tests/aspsec/endapp/abandon.asp
+        asp_check abandon_no_leak nomatch 'LEAK' tests/aspsec/endapp/abandon.asp
+    else
+        echo "SKIP aspsec session expiry checks (no sqlite3)"
+    fi
     # LF-only multipart: no crash, value intact
     printf -- '--B\nContent-Disposition: form-data; name="a"\n\n--B\nContent-Disposition: form-data; name="b"\n\nhello\n--B--' >"$tmp.body"
     env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \

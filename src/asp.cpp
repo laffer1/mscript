@@ -315,6 +315,7 @@ std::string httpDate(double serial) {
 // one interpreter per CGI process
 std::shared_ptr<AspResponse> g_resp;
 MapObject* g_respObj = nullptr;   // for property sync (Response.X = v)
+bool g_suppressOutput = false;    // Session_OnEnd running: it has no Response (as in IIS)
 struct SessionObj;
 long long g_sessionCodePage = 1252; // Session.CodePage -> output charset
 
@@ -580,7 +581,7 @@ void flushBody() {
 }
 
 void responseBody(const std::string& s, bool binary = false) {
-    if (!g_resp || g_resp->ended) return;
+    if (!g_resp || g_resp->ended || g_suppressOutput) return;
     syncRespProps();
     if (g_resp->buffer) {
         if (!g_resp->body.empty() && g_resp->body.back().binary == binary)
@@ -709,7 +710,8 @@ sqlite3* stateDb() {
             "CREATE TABLE IF NOT EXISTS app(k TEXT PRIMARY KEY, v TEXT);"
             "CREATE TABLE IF NOT EXISTS sessions(sid TEXT, k TEXT, v TEXT, PRIMARY KEY(sid, k));"
             "CREATE TABLE IF NOT EXISTS session_meta(sid TEXT PRIMARY KEY, last REAL,"
-            "                                        lcid INTEGER, codepage INTEGER);"
+            "                                        lcid INTEGER, codepage INTEGER,"
+            "                                        timeout INTEGER);"
             // abandoned session ids that must never be written again
             "CREATE TABLE IF NOT EXISTS dead(sid TEXT PRIMARY KEY, until REAL);"
             // app-level markers (e.g. the Application_OnStart claim), kept out
@@ -719,6 +721,7 @@ sqlite3* stateDb() {
         // older databases predate the lcid/codepage columns
         sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN lcid INTEGER;", nullptr, nullptr, nullptr);
         sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN codepage INTEGER;", nullptr, nullptr, nullptr);
+        sqlite3_exec(d, "ALTER TABLE session_meta ADD COLUMN timeout INTEGER;", nullptr, nullptr, nullptr);
         return d;
     }();
     return db;
@@ -933,44 +936,87 @@ void sessionTouch(const std::string& sid) {
     sqlite3_finalize(st);
 }
 
-// atomically check expiry and, when expired, delete contents+meta in the same
-// write transaction, so a concurrent touch cannot resurrect the session
-// between the check and the delete. Returns true when the session was expired.
-bool sessionExpireIfNeeded(const std::string& sid, long long timeoutMin) {
+constexpr long long DEFAULT_SESSION_TIMEOUT = 20; // minutes, as IIS
+
+enum class SessState {
+    Live,    // exists, not expired: touched
+    Expired, // existed and timed out: claimed by this process (meta row
+             // deleted, contents kept for Session_OnEnd; sessionFinishEnd
+             // removes them)
+    Invalid, // unknown, abandoned, or already claimed by another request
+};
+
+// One write transaction: the expiry check uses the session's own persisted
+// timeout, and the claim (deleting the meta row) means at most one process
+// ever fires Session_OnEnd for a session; a concurrent touch can neither
+// resurrect it nor race the claim. *timeoutOut receives the session timeout.
+SessState sessionCheck(const std::string& sid, long long* timeoutOut) {
     sqlite3* db = stateDb();
-    if (!db || timeoutMin <= 0) return false;
-    if (sessionIsDead(sid)) return true;
-    // the check and the delete must share one write transaction; never fall
-    // back to autocommit (a concurrent touch could then resurrect the session)
+    if (!db) stateFail("database unavailable");
+    if (timeoutOut) *timeoutOut = DEFAULT_SESSION_TIMEOUT;
+    if (sessionIsDead(sid)) return SessState::Invalid;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
         stateFail("begin");
     auto rollbackFail = [db](const char* what) {
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         stateFail(what);
     };
-    bool expired = true; // no metadata row counts as expired
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT last FROM session_meta WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db, "SELECT last, timeout FROM session_meta WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
         rollbackFail("prepare");
     bindSid(st, 1, sid);
     int rc = sqlite3_step(st);
+    SessState state = SessState::Invalid; // no metadata row: never issued (or already ended)
     if (rc == SQLITE_ROW) {
         double last = sqlite3_column_double(st, 0);
-        expired = (std::time(nullptr) - (time_t)last) > timeoutMin * 60;
+        long long tmo = sqlite3_column_type(st, 1) == SQLITE_NULL ? DEFAULT_SESSION_TIMEOUT
+                                                                   : sqlite3_column_int64(st, 1);
+        if (tmo < 1) tmo = DEFAULT_SESSION_TIMEOUT;
+        if (timeoutOut) *timeoutOut = tmo;
+        state = ((double)std::time(nullptr) - last) > (double)tmo * 60.0 ? SessState::Expired
+                                                                         : SessState::Live;
     }
     sqlite3_finalize(st);
     if (rc != SQLITE_ROW && rc != SQLITE_DONE) rollbackFail("expiry check");
-    if (expired) {
-        for (const char* sql : {"DELETE FROM sessions WHERE sid=?1", "DELETE FROM session_meta WHERE sid=?1"}) {
-            if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) rollbackFail("prepare");
-            bindSid(st, 1, sid);
-            rc = sqlite3_step(st);
-            sqlite3_finalize(st);
-            if (rc != SQLITE_DONE) rollbackFail("expire");
-        }
+    const char* sql = state == SessState::Expired ? "DELETE FROM session_meta WHERE sid=?1"
+                    : state == SessState::Live    ? "UPDATE session_meta SET last=?2 WHERE sid=?1"
+                                                  : nullptr;
+    if (sql) {
+        if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) rollbackFail("prepare");
+        bindSid(st, 1, sid);
+        if (state == SessState::Live) sqlite3_bind_double(st, 2, (double)std::time(nullptr));
+        rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) rollbackFail("expire");
     }
     if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) rollbackFail("commit");
-    return expired;
+    return state;
+}
+
+// Opportunistic cleanup (about 1 request in 64): sessions past their own
+// timeout, contents left without a meta row (a crash between claim and
+// cleanup), and expired abandoned-id markers. Each CGI request is its own
+// process, so there is no timer: Session_OnEnd fires only when an expired
+// session's cookie comes back. Never fails the request.
+void sessionGc() {
+    unsigned char r = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t got = read(fd, &r, 1);
+    close(fd);
+    if (got != 1 || (r & 63) != 0) return;
+    sqlite3* db = stateDb();
+    if (!db) return;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) return;
+    const char* sql =
+        "DELETE FROM session_meta WHERE last < CAST(strftime('%s','now') AS REAL)"
+        "  - 60.0 * COALESCE(NULLIF(timeout, 0), 20);"
+        "DELETE FROM sessions WHERE sid NOT IN (SELECT sid FROM session_meta);"
+        "DELETE FROM dead WHERE until < CAST(strftime('%s','now') AS REAL);";
+    if (sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK)
+        sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+    else
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
 }
 
 // persisted per-session settings (lcid/codepage); col is an internal constant
@@ -1345,6 +1391,16 @@ struct SessionObj : MapObject {
             sessionSetProp(*sid, "codepage", codePage);
             return;
         }
+        if (n == "timeout") {
+            // minutes, 1..1440 as in IIS; persisted so later requests expire
+            // the session on its own timeout (0 used to mean "never expires")
+            long long t = toInt64(v);
+            if (t < 1 || t > 1440) throwErr(5, errDesc(5));
+            sessionSetProp(*sid, "timeout", t);
+            MapObject::setMember(n, Variant::mkLong(t));
+            return;
+        }
+        if (n == "sessionid") throwErr(438, errDesc(438)); // read-only
         MapObject::setMember(n, v);
     }
 };
@@ -1362,63 +1418,102 @@ struct RespObj : MapObject {
     }
 };
 
+// per-request session state shared by the Session object, Abandon, the
+// request-start expiry check and the global.asa hooks
+struct SessCtx {
+    Interp* ip = nullptr;
+    MapObject* sess = nullptr;
+    std::shared_ptr<std::string> sid;
+    std::string pendingEnd; // expired session claimed at request start
+    bool inOnEnd = false;   // Session_OnEnd running: no expiry checks/touches
+    bool ended = false;     // Session_OnEnd already fired this request
+};
+SessCtx g_sess;
+
+// Fire Session_OnEnd for a session this process claimed (or is abandoning),
+// with that session's contents still readable through Session, then destroy
+// it. Request/Response are hidden during the hook, as in IIS, so it can
+// neither write into nor redirect/end the current visitor's response; its
+// errors (and End) are swallowed so they cannot break the visitor's request.
+void runSessionOnEnd(const std::string& oldSid) {
+    SessCtx& c = g_sess;
+    if (c.ip && c.sid && !c.ended) {
+        c.ended = true;
+        std::string cur = *c.sid;
+        *c.sid = oldSid;
+        if (c.sess) c.sess->props["sessionid"] = Variant::mkStr(oldSid);
+        auto& gv = c.ip->global.vars;
+        std::vector<std::pair<std::string, Variant>> hidden;
+        for (const char* k : {"request", "response"}) {
+            auto it = gv.find(k);
+            if (it != gv.end()) { hidden.emplace_back(k, it->second); gv.erase(it); }
+        }
+        c.inOnEnd = true;
+        g_suppressOutput = true;
+        try {
+            c.ip->callGlobalProc("session_onend");
+        } catch (VBSError&) {
+        } catch (EndSig&) {
+        }
+        g_suppressOutput = false;
+        c.inOnEnd = false;
+        for (auto& [k, v] : hidden) gv[k] = v;
+        *c.sid = cur;
+        if (c.sess) c.sess->props["sessionid"] = Variant::mkStr(cur);
+    }
+    stateRemoveAll(oldSid);
+    sessionMarkDead(oldSid); // in-flight requests with the old id cannot write it back
+}
+
+// replace the current session with a brand-new id (expired or abandoned)
+void rotateSession() {
+    SessCtx& c = g_sess;
+    *c.sid = newSessionId();
+    if (c.sess) c.sess->props["sessionid"] = Variant::mkStr(*c.sid);
+    if (c.sess) c.sess->props["timeout"] = Variant::mkLong(DEFAULT_SESSION_TIMEOUT);
+    setSessionCookie(*c.sid);
+}
+
 // stateful collection object backed by the sqlite store
-void fillStateColl(Interp& ip, MapObject* c, bool isSession,
-                   std::shared_ptr<std::string> sid, std::shared_ptr<bool> ended) {
+void fillStateColl(Interp& ip, MapObject* c, bool isSession, std::shared_ptr<std::string> sid) {
     c->kind = isSession ? "Session" : "Application";
     if (isSession) c->props["sessionid"] = Variant::mkStr(*sid);
-    auto timeoutOf = [c]() -> long long {
-        auto it = c->props.find("timeout");
-        return it == c->props.end() ? 20 : toInt64(it->second);
-    };
-    if (isSession) c->props["timeout"] = Variant::mkLong(20);
+    if (isSession) c->props["timeout"] = Variant::mkLong(DEFAULT_SESSION_TIMEOUT);
     c->props["contents"] = Variant::mkObj(makeContentsColl(isSession, sid));
-    c->onInvoke = [c, isSession, sid, timeoutOf, &ip, ended](MapObject*, std::vector<Variant>& a) -> Variant {
+    c->onInvoke = [isSession, sid](MapObject*, std::vector<Variant>& a) -> Variant {
         std::string k = stateKeyOf(a);
         if (isSession) {
-            if (sessionExpireIfNeeded(*sid, timeoutOf())) {
-                // OnEnd fires at most once per request, even if the hook
-                // itself (or the page afterwards) touches Session again
-                if (ended && !*ended) {
-                    *ended = true;
-                    ip.callGlobalProc("session_onend");
-                }
-                // the replacement session starts fresh under a NEW id: an
-                // expired id is never revived
-                *sid = newSessionId();
-                c->props["sessionid"] = Variant::mkStr(*sid);
-                setSessionCookie(*sid);
+            // inside Session_OnEnd the (claimed) old session is read as-is:
+            // checking or touching it would resurrect it
+            if (g_sess.inOnEnd) return fromJsonText(stateGet(true, *sid, k));
+            SessState st = sessionCheck(*sid, nullptr);
+            if (st != SessState::Live) {
+                // expired (or ended elsewhere) while this request ran: the
+                // replacement session starts fresh under a NEW id
+                std::string old = *sid;
+                if (st == SessState::Expired) runSessionOnEnd(old);
+                rotateSession();
                 sessionTouch(*sid);
                 return Variant();
             }
-            sessionTouch(*sid);
             return fromJsonText(stateGet(true, *sid, k));
         }
         return fromJsonText(stateGet(false, "", k));
     };
     c->onAssignInvoke = [isSession, sid](MapObject*, std::vector<Variant>& a, const Variant& v) {
         std::string k = stateKeyOf(a);
-        if (isSession) sessionTouch(*sid);
+        if (isSession && !g_sess.inOnEnd) sessionTouch(*sid);
         stateSet(isSession, isSession ? *sid : "", k, toJsonText(v));
     };
     if (isSession) {
-        c->methods["abandon"] = [c, sid, &ip, ended](MapObject*, std::vector<Variant>&) -> Variant {
-            if (ended && !*ended) {
-                *ended = true;
-                try {
-                    ip.callGlobalProc("session_onend");
-                } catch (...) {
-                    // a failing/ending Session_OnEnd must not block abandonment
-                }
-            }
-            stateRemoveAll(*sid);
-            sessionMarkDead(*sid); // in-flight requests with the old id cannot write it back
+        c->methods["abandon"] = [&ip](MapObject*, std::vector<Variant>&) -> Variant {
+            if (g_sess.inOnEnd) return Variant(); // the session is already ending
+            std::string old = *g_sess.sid;
+            runSessionOnEnd(old);
             // rotate: the abandoned id must not be reused; the replacement is
             // a new session and gets Session_OnStart
-            *sid = newSessionId();
+            rotateSession();
             ip.aspNewSession = true;
-            c->props["sessionid"] = Variant::mkStr(*sid);
-            setSessionCookie(*sid);
             return Variant();
         };
     } else {
@@ -1738,31 +1833,38 @@ void registerAspObjects(Interp& ip, bool cgi) {
 
     // ---- Session / Application (SQLite-backed) ----
     auto sid = std::make_shared<std::string>();
-    auto ended = std::make_shared<bool>(false); // Session_OnEnd fired this request
+    long long timeout = DEFAULT_SESSION_TIMEOUT;
+    g_sess = SessCtx{};
+    g_sess.ip = &ip;
+    g_sess.sid = sid;
     {
         auto it = reqCookies.find(lower(sessionCookieName()));
         // only reuse an id this server issued that is still live: a
         // malformed, unknown (client-chosen), expired or abandoned id is
         // replaced with a fresh one, so an attacker cannot fix a victim's
-        // session id in advance. sessionExpireIfNeeded returns false only for
-        // an existing, unexpired, non-dead session (and cleans up otherwise).
+        // session id in advance
         if (it != reqCookies.end() && validSessionId(it->second)) {
-            if (!sessionExpireIfNeeded(it->second, 20)) {
-                *sid = it->second;
-            } else if (!*ended) {
-                *ended = true;
-                ip.callGlobalProc("session_onend");
+            switch (sessionCheck(it->second, &timeout)) {
+                case SessState::Live: *sid = it->second; break;
+                // Session_OnEnd runs from aspGlobalAsaHooks, once global.asa
+                // is loaded (it is not yet, here)
+                case SessState::Expired: g_sess.pendingEnd = it->second; break;
+                case SessState::Invalid: break;
             }
         }
     }
     if (sid->empty()) {
         *sid = newSessionId();
+        timeout = DEFAULT_SESSION_TIMEOUT;
         ip.aspNewSession = true;
         setSessionCookie(*sid);
     }
     sessionTouch(*sid);
+    sessionGc();
     auto session = std::make_shared<SessionObj>(ip, sid);
-    fillStateColl(ip, session.get(), true, sid, ended);
+    g_sess.sess = session.get();
+    fillStateColl(ip, session.get(), true, sid);
+    session->props["timeout"] = Variant::mkLong(timeout);
     // restore persisted session settings
     {
         long long lcid = sessionGetProp(*sid, "lcid", 0);
@@ -1771,7 +1873,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
         g_sessionCodePage = session->codePage;
     }
     auto app = std::make_shared<MapObject>();
-    fillStateColl(ip, app.get(), false, sid, nullptr);
+    fillStateColl(ip, app.get(), false, sid);
 
     ip.global.vars["request"] = Variant::mkObj(req);
     ip.global.vars["response"] = Variant::mkObj(resp);
@@ -1789,6 +1891,12 @@ void aspGlobalAsaHooks(Interp& ip) {
     // not leave the marker unset (the claim lives in the separate meta table,
     // never visible through Application.Contents)
     if (metaClaim(nsPrefix() + "onstart")) ip.callGlobalProc("application_onstart");
+    // the visitor's expired session ends before its replacement starts
+    if (!g_sess.pendingEnd.empty()) {
+        std::string old = std::move(g_sess.pendingEnd);
+        g_sess.pendingEnd.clear();
+        runSessionOnEnd(old);
+    }
     if (ip.aspNewSession) ip.callGlobalProc("session_onstart");
 }
 
