@@ -160,6 +160,13 @@ if [ -d tests/aspsec ]; then
     asp_check binarywrite match "$(printf '\377\330\351')" tests/aspsec/binwrite.asp
     # Response.Flush transcodes like the final flush (é -> one 0xE9 byte, both sides)
     asp_check flush_transcode match "$(printf 'caf\351|caf\351.')" tests/aspsec/flush.asp
+    # Redirect sends a real 302, drops the buffered page and escapes the URL
+    asp_check redirect_status match '^Status: 302 Object moved' tests/aspsec/redirect.asp
+    asp_check redirect_nobody nomatch 'SECRET DATA' tests/aspsec/redirect.asp
+    asp_check redirect_escaped match 'HREF="/login?a=1&amp;b=&quot;x"' tests/aspsec/redirect.asp
+    # header changes after Flush raise ASP 0156 instead of being dropped
+    asp_check after_flush match 'add=80004005|cookie=80004005|status=80004005|redirect=80004005' \
+        tests/aspsec/afterflush.asp
     # LF-only multipart: no crash, value intact
     printf -- '--B\nContent-Disposition: form-data; name="a"\n\n--B\nContent-Disposition: form-data; name="b"\n\nhello\n--B--' >"$tmp.body"
     env -u HTTP_COOKIE REQUEST_METHOD=POST MScript_ASP_STATE_DB="$sdb" \

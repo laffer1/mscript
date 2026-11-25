@@ -319,9 +319,34 @@ long long g_sessionCodePage = 1252; // Session.CodePage -> output charset
 
 // reject CR/LF in header names/values (response splitting)
 std::string cleanHeaderText(const std::string& s, const char* what) {
-    if (s.find('\r') != std::string::npos || s.find('\n') != std::string::npos)
-        throwErr(5, std::string("ASP response: CR/LF not allowed in ") + what);
+    if (s.find('\r') != std::string::npos || s.find('\n') != std::string::npos ||
+        s.find('\0') != std::string::npos)
+        throwErr(5, std::string("ASP response: CR/LF/NUL not allowed in ") + what);
     return s;
+}
+
+// header changes after the headers went out cannot take effect: raise the
+// IIS error instead of silently dropping them (ASP 0156, E_FAIL)
+void requireHeadersUnsent() {
+    if (g_resp && g_resp->headersSent)
+        throw VBSError((int)0x80004005,
+                       "Response object error 'ASP 0156 : 80004005': Header Error. "
+                       "The HTTP headers are already written to the client browser.");
+}
+
+std::string htmlEncode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            default: out += c;
+        }
+    }
+    return out;
 }
 
 // pull Response.X = v property writes into the live response state
@@ -410,6 +435,7 @@ CookieObj::CookieObj(std::string k) : key(std::move(k)) {
 }
 
 void CookieObj::markDirty() {
+    requireHeadersUnsent();
     if (g_resp) g_resp->dirtyCookies.insert(key);
 }
 
@@ -1276,6 +1302,10 @@ struct SessionObj : MapObject {
 struct RespObj : MapObject {
     void setMember(const std::string& n, const Variant& v) override {
         if (n == "isclientconnected") throwErr(438, errDesc(438));
+        // properties that only reach the client as headers
+        static const std::set<std::string> headerProps = {
+            "status", "contenttype", "charset", "cachecontrol", "expires", "expiresabsolute", "pics"};
+        if (headerProps.count(n)) requireHeadersUnsent();
         MapObject::setMember(n, v);
     }
 };
@@ -1424,15 +1454,28 @@ void registerAspObjects(Interp& ip, bool cgi) {
     };
     resp->methods["redirect"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) throwErr(450, errDesc(450));
+        requireHeadersUnsent();
         if (g_resp) {
-            g_resp->status = "302 Found";
-            g_resp->headers.push_back({"Location", cleanHeaderText(toStr(a[0]), "redirect URL")});
+            std::string url = cleanHeaderText(toStr(a[0]), "redirect URL");
+            // the status must also go into the property: syncRespProps
+            // re-reads Response.Status at header time
+            g_resp->status = "302 Object moved";
+            if (g_respObj) g_respObj->props["status"] = Variant::mkStr(g_resp->status);
+            g_resp->headers.push_back({"Location", url});
+            // like IIS, discard the buffered page: content written before a
+            // redirect (often what an unauthenticated user must not see)
+            // is never sent
+            g_resp->body.clear();
+            g_resp->body.push_back({"<head><title>Object moved</title></head>\r\n<body><h1>Object Moved</h1>"
+                                    "This object may be found <a HREF=\"" + htmlEncode(url) +
+                                    "\">here</a>.</body>\r\n", false});
             g_resp->ended = true;
         }
         throw EndSig{};
     };
     resp->methods["addheader"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.size() < 2) throwErr(450, errDesc(450));
+        requireHeadersUnsent();
         if (g_resp)
             g_resp->headers.push_back({cleanHeaderText(toStr(a[0]), "header name"),
                                        cleanHeaderText(toStr(a[1]), "header value")});
@@ -1564,17 +1607,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
     };
     srv->methods["htmlencode"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) return Variant::mkStr("");
-        std::string s = toStr(a[0]), out;
-        for (char c : s) {
-            switch (c) {
-                case '&': out += "&amp;"; break;
-                case '<': out += "&lt;"; break;
-                case '>': out += "&gt;"; break;
-                case '"': out += "&quot;"; break;
-                default: out += c;
-            }
-        }
-        return Variant::mkStr(out);
+        return Variant::mkStr(htmlEncode(toStr(a[0])));
     };
     srv->methods["urlencode"] = [](MapObject*, std::vector<Variant>& a) -> Variant {
         if (a.empty()) return Variant::mkStr("");
