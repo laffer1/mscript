@@ -1,0 +1,5 @@
+<script runat="server">
+Sub Session_OnStart
+    Response.Redirect "/login"
+End Sub
+</script>

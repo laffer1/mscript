@@ -190,7 +190,10 @@ std::map<std::string, std::string> parseCookies(const std::string& s) {
             size_t eq = pair.find('=');
             std::string k = lower(urlDecode(eq == std::string::npos ? pair : pair.substr(0, eq)));
             std::string v = eq == std::string::npos ? "" : urlDecode(pair.substr(eq + 1));
-            m[k] = v;
+            // first occurrence wins: browsers send the most specific
+            // (longest path) cookie first, so a cookie tossed in from a
+            // broader path or a parent domain cannot override it
+            m.emplace(k, v);
         }
         if (sep == std::string::npos) break;
         pos = sep + 1;
@@ -204,7 +207,14 @@ std::map<std::string, std::string> parseMultipart(const std::string& body, const
     size_t bpos = contentType.find("boundary=");
     if (bpos == std::string::npos) return m;
     std::string boundary = contentType.substr(bpos + 9);
-    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
+    if (!boundary.empty() && boundary.front() == '"') {
+        size_t q = boundary.find('"', 1);
+        boundary = boundary.substr(1, q == std::string::npos ? std::string::npos : q - 1);
+    } else {
+        boundary = boundary.substr(0, boundary.find(';')); // drop trailing parameters
+        while (!boundary.empty() && (boundary.back() == ' ' || boundary.back() == '\t')) boundary.pop_back();
+    }
+    if (boundary.empty()) return m;
     std::string delim = "--" + boundary;
     size_t pos = body.find(delim);
     while (pos != std::string::npos) {
@@ -215,10 +225,11 @@ std::map<std::string, std::string> parseMultipart(const std::string& body, const
         std::string part = body.substr(start, next - start);
         // headers end at the first blank line
         size_t hdrEnd = part.find("\r\n\r\n");
-        if (hdrEnd == std::string::npos) hdrEnd = part.find("\n\n");
+        size_t sepLen = 4;
+        if (hdrEnd == std::string::npos) { hdrEnd = part.find("\n\n"); sepLen = 2; }
         if (hdrEnd == std::string::npos) { pos = next; continue; }
         std::string headers = part.substr(0, hdrEnd);
-        std::string value = part.substr(hdrEnd + (part[hdrEnd] == '\r' ? 4 : 3));
+        std::string value = part.substr(std::min(hdrEnd + sepLen, part.size()));
         // strip trailing CRLF before the next boundary
         if (value.size() >= 2 && value.compare(value.size() - 2, 2, "\r\n") == 0) value.resize(value.size() - 2);
         else if (!value.empty() && value.back() == '\n') value.pop_back();
@@ -259,9 +270,19 @@ struct AspResponse {
 
 // format a VB date serial as an HTTP date (RFC 1123)
 std::string httpDate(double serial) {
-    time_t t = (time_t)((serial - 25569.0) * 86400.0); // 1899-12-30 -> unix epoch
+    double secs = (serial - 25569.0) * 86400.0; // 1899-12-30 -> unix epoch
+    // clamp to years 1..9999 before the time_t cast (an out-of-range double
+    // cast is UB, and gmtime returns NULL for years past INT_MAX)
+    constexpr double MIN_SECS = -62135596800.0; // 0001-01-01T00:00:00Z
+    constexpr double MAX_SECS = 253402300799.0; // 9999-12-31T23:59:59Z
+    if (!std::isfinite(secs) || secs < MIN_SECS) secs = MIN_SECS;
+    if (secs > MAX_SECS) secs = MAX_SECS;
+    time_t t = (time_t)secs;
+    struct tm tmv;
+    if (!gmtime_r(&t, &tmv)) return "Thu, 01 Jan 1970 00:00:00 GMT";
     char buf[64];
-    std::strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", std::gmtime(&t));
+    if (std::strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", &tmv) == 0)
+        return "Thu, 01 Jan 1970 00:00:00 GMT";
     return buf;
 }
 
@@ -292,7 +313,10 @@ void syncRespProps() {
     it = g_respObj->props.find("expires");
     if (it != g_respObj->props.end() && it->second.t != VT::Empty && !g_resp->expiresConsumed) {
         g_resp->expiresConsumed = true;
-        g_resp->expiresAbs = httpDate((double)std::time(nullptr) + (double)(toInt64(it->second) * 60) / 86400.0 + 25569.0);
+        // minutes from now; computed in double so a huge value cannot
+        // overflow (httpDate clamps the result)
+        double mins = (double)toInt64(it->second);
+        g_resp->expiresAbs = httpDate((double)std::time(nullptr) / 86400.0 + mins / 1440.0 + 25569.0);
     }
     auto take = [&](const char* prop, std::string& field, const char* what) {
         auto i2 = g_respObj->props.find(prop);
@@ -321,22 +345,31 @@ std::string cleanCookieAttr(const std::string& s, const char* what) {
 // transcode UTF-8 output to Latin-1 when the session code page asks for it
 std::string encodeOut(const std::string& s) {
     if (!g_resp || (g_resp->outCp != 1252 && g_resp->outCp != 28591)) return s;
+    // strict UTF-8 decoding: overlong forms, surrogates, out-of-range code
+    // points and non-continuation trail bytes are invalid. An invalid sequence
+    // becomes '?' and only its lead byte is consumed, so a crafted lead byte
+    // can never decode to markup ('<', '"', ...) or swallow the next character
+    // (both would bypass Server.HTMLEncode)
     std::string out;
-    for (size_t i = 0; i < s.size();) {
+    out.reserve(s.size());
+    const size_t n = s.size();
+    auto cont = [&](size_t j) { return j < n && ((unsigned char)s[j] & 0xC0) == 0x80; };
+    for (size_t i = 0; i < n;) {
         unsigned char c = (unsigned char)s[i];
-        unsigned cp; size_t adv;
-        if (c < 0x80) { cp = c; adv = 1; }
-        else if ((c & 0xE0) == 0xC0 && i + 1 < s.size()) {
-            cp = ((c & 0x1F) << 6) | ((unsigned char)s[i + 1] & 0x3F); adv = 2;
-        } else if ((c & 0xF0) == 0xE0 && i + 2 < s.size()) {
-            cp = ((c & 0x0F) << 12) | (((unsigned char)s[i + 1] & 0x3F) << 6) |
-                 ((unsigned char)s[i + 2] & 0x3F); adv = 3;
-        } else if ((c & 0xF8) == 0xF0 && i + 3 < s.size()) {
-            cp = ((c & 0x07) << 18) | (((unsigned char)s[i + 1] & 0x3F) << 12) |
-                 (((unsigned char)s[i + 2] & 0x3F) << 6) | ((unsigned char)s[i + 3] & 0x3F); adv = 4;
-        } else { cp = c; adv = 1; }
+        if (c < 0x80) { out += (char)c; i++; continue; }
+        unsigned cp = 0; size_t len = 0; unsigned minCp = 0;
+        if (c >= 0xC2 && c <= 0xDF) { len = 2; cp = c & 0x1F; minCp = 0x80; }
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0F; minCp = 0x800; }
+        else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07; minCp = 0x10000; }
+        bool ok = len != 0;
+        for (size_t k = 1; ok && k < len; k++) {
+            if (!cont(i + k)) ok = false;
+            else cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+        }
+        if (ok && (cp < minCp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))) ok = false;
+        if (!ok) { out += '?'; i++; continue; }
         out += (cp <= 0xFF) ? (char)cp : '?';
-        i += adv;
+        i += len;
     }
     return out;
 }
@@ -388,6 +421,8 @@ void ensureHeaders() {
         if (sit != ck->props.end() && toBool(sit->second)) c += "; secure";
         auto hit = ck->props.find("httponly");
         if (hit != ck->props.end() && toBool(hit->second)) c += "; httponly";
+        std::string ss = attr("samesite");
+        if (!ss.empty()) c += "; samesite=" + cleanCookieAttr(ss, "samesite");
         h += "Set-Cookie: " + c + "\r\n";
     }
     for (auto& kv : g_resp->headers) h += kv.first + ": " + kv.second + "\r\n";
@@ -491,6 +526,9 @@ sqlite3* stateDb() {
             }
         }
         chmod(path.c_str(), 0600);
+        // concurrent CGI requests share this file: wait for a competing
+        // writer instead of failing immediately with SQLITE_BUSY
+        sqlite3_busy_timeout(d, 10000);
         sqlite3_exec(d,
             "PRAGMA journal_mode=WAL;"
             "CREATE TABLE IF NOT EXISTS app(k TEXT PRIMARY KEY, v TEXT);"
@@ -695,30 +733,36 @@ bool sessionExpireIfNeeded(const std::string& sid, long long timeoutMin) {
     sqlite3* db = stateDb();
     if (!db || timeoutMin <= 0) return false;
     if (sessionIsDead(sid)) return true;
-    sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
+    // the check and the delete must share one write transaction; never fall
+    // back to autocommit (a concurrent touch could then resurrect the session)
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
+        stateFail("begin");
+    auto rollbackFail = [db](const char* what) {
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        stateFail(what);
+    };
     bool expired = true; // no metadata row counts as expired
     sqlite3_stmt* st = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT last FROM session_meta WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            double last = sqlite3_column_double(st, 0);
-            expired = (std::time(nullptr) - (time_t)last) > timeoutMin * 60;
-        }
-        sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db, "SELECT last FROM session_meta WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
+        rollbackFail("prepare");
+    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        double last = sqlite3_column_double(st, 0);
+        expired = (std::time(nullptr) - (time_t)last) > timeoutMin * 60;
     }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) rollbackFail("expiry check");
     if (expired) {
-        if (sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
+        for (const char* sql : {"DELETE FROM sessions WHERE sid=?1", "DELETE FROM session_meta WHERE sid=?1"}) {
+            if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) rollbackFail("prepare");
             sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
-            sqlite3_step(st);
+            rc = sqlite3_step(st);
             sqlite3_finalize(st);
-        }
-        if (sqlite3_prepare_v2(db, "DELETE FROM session_meta WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
-            sqlite3_step(st);
-            sqlite3_finalize(st);
+            if (rc != SQLITE_DONE) rollbackFail("expire");
         }
     }
-    sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+    if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) rollbackFail("commit");
     return expired;
 }
 
@@ -987,6 +1031,28 @@ Variant fromJsonText(const std::string& s) {
     }
 }
 
+// the session cookie: HttpOnly (no script access), SameSite=Lax, and Secure
+// whenever the request arrived over TLS
+void setSessionCookie(const std::string& sid) {
+    if (!g_resp) return;
+    auto ck = std::make_shared<MapObject>();
+    ck->kind = "Cookie";
+    ck->props["value"] = Variant::mkStr(sid);
+    ck->props["path"] = Variant::mkStr("/");
+    ck->props["httponly"] = Variant::mkBool(true);
+    ck->props["samesite"] = Variant::mkStr("Lax");
+    const char* https = std::getenv("HTTPS");
+    if (https && (lower(https) == "on" || std::string(https) == "1"))
+        ck->props["secure"] = Variant::mkBool(true);
+    // replace any same-named (case-insensitive) entry
+    for (auto it = g_resp->outCookies.begin(); it != g_resp->outCookies.end();) {
+        if (lower(it->first) == "mscriptsessionid") it = g_resp->outCookies.erase(it);
+        else ++it;
+    }
+    g_resp->outCookies["MScriptSessionID"] = ck;
+    g_resp->dirtyCookies.insert("mscriptsessionid");
+}
+
 // cryptographic session ids from the OS CSPRNG
 std::string newSessionId() {
     unsigned char buf[16];
@@ -1101,7 +1167,7 @@ void fillStateColl(Interp& ip, MapObject* c, bool isSession,
     };
     if (isSession) c->props["timeout"] = Variant::mkLong(20);
     c->props["contents"] = Variant::mkObj(makeContentsColl(isSession, sid));
-    c->onInvoke = [isSession, sid, timeoutOf, &ip, ended](MapObject*, std::vector<Variant>& a) -> Variant {
+    c->onInvoke = [c, isSession, sid, timeoutOf, &ip, ended](MapObject*, std::vector<Variant>& a) -> Variant {
         std::string k = stateKeyOf(a);
         if (isSession) {
             if (sessionExpireIfNeeded(*sid, timeoutOf())) {
@@ -1111,7 +1177,12 @@ void fillStateColl(Interp& ip, MapObject* c, bool isSession,
                     *ended = true;
                     ip.callGlobalProc("session_onend");
                 }
-                sessionTouch(*sid); // the replacement session starts fresh
+                // the replacement session starts fresh under a NEW id: an
+                // expired id is never revived
+                *sid = newSessionId();
+                c->props["sessionid"] = Variant::mkStr(*sid);
+                setSessionCookie(*sid);
+                sessionTouch(*sid);
                 return Variant();
             }
             sessionTouch(*sid);
@@ -1141,14 +1212,7 @@ void fillStateColl(Interp& ip, MapObject* c, bool isSession,
             *sid = newSessionId();
             ip.aspNewSession = true;
             c->props["sessionid"] = Variant::mkStr(*sid);
-            if (g_resp) {
-                auto ck = std::make_shared<MapObject>();
-                ck->kind = "Cookie";
-                ck->props["value"] = Variant::mkStr(*sid);
-                ck->props["path"] = Variant::mkStr("/");
-                g_resp->outCookies["MScriptSessionID"] = ck;
-                g_resp->dirtyCookies.insert("mscriptsessionid");
-            }
+            setSessionCookie(*sid);
             return Variant();
         };
     } else {
@@ -1450,29 +1514,24 @@ void registerAspObjects(Interp& ip, bool cgi) {
     auto ended = std::make_shared<bool>(false); // Session_OnEnd fired this request
     {
         auto it = reqCookies.find("mscriptsessionid");
-        // only accept well-formed ids; a client-chosen garbage id is replaced
-        if (it != reqCookies.end() && validSessionId(it->second)) *sid = it->second;
+        // only reuse an id this server issued that is still live: a
+        // malformed, unknown (client-chosen), expired or abandoned id is
+        // replaced with a fresh one, so an attacker cannot fix a victim's
+        // session id in advance. sessionExpireIfNeeded returns false only for
+        // an existing, unexpired, non-dead session (and cleans up otherwise).
+        if (it != reqCookies.end() && validSessionId(it->second)) {
+            if (!sessionExpireIfNeeded(it->second, 20)) {
+                *sid = it->second;
+            } else if (!*ended) {
+                *ended = true;
+                ip.callGlobalProc("session_onend");
+            }
+        }
     }
     if (sid->empty()) {
         *sid = newSessionId();
         ip.aspNewSession = true;
-        if (g_resp) {
-            auto ck = std::make_shared<MapObject>();
-            ck->kind = "Cookie";
-            ck->props["value"] = Variant::mkStr(*sid);
-            ck->props["path"] = Variant::mkStr("/");
-            g_resp->outCookies["MScriptSessionID"] = ck;
-            g_resp->dirtyCookies.insert("mscriptsessionid");
-        }
-    }
-    // expiry is checked and cleaned atomically; an expired session fires
-    // OnEnd once and the continuation counts as a new session (OnStart runs)
-    if (sessionExpireIfNeeded(*sid, 20)) {
-        if (!*ended) {
-            *ended = true;
-            ip.callGlobalProc("session_onend");
-        }
-        ip.aspNewSession = true;
+        setSessionCookie(*sid);
     }
     sessionTouch(*sid);
     auto session = std::make_shared<SessionObj>(ip, sid);
