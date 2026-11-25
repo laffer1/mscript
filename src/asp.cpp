@@ -706,7 +706,39 @@ sqlite3* stateDb() {
 
 // app rows are namespaced by the ASP application (script name) so independent
 // sites sharing one database do not collide
-std::string appKey(const std::string& k) { return g_appNs + "|" + k; }
+// The namespace prefix "<ns>|" with '%' and '|' percent-escaped in <ns>, so
+// the first '|' always ends the namespace: an app directory containing '|'
+// can no longer alias (or prefix-match in Count/RemoveAll) another app's
+// keys. Ordinary paths are unchanged, so existing Application rows and the
+// onstart marker keep their keys.
+std::string nsPrefix() {
+    std::string out;
+    for (char c : g_appNs) {
+        if (c == '%') out += "%25";
+        else if (c == '|') out += "%7C";
+        else out += c;
+    }
+    return out + "|";
+}
+std::string appKey(const std::string& k) { return nsPrefix() + k; }
+
+// session rows are keyed by application too: a session id issued by one app
+// is unknown to every other app sharing the state database
+std::string sessKey(const std::string& sid) { return nsPrefix() + sid; }
+void bindSid(sqlite3_stmt* st, int idx, const std::string& sid) {
+    std::string k = sessKey(sid);
+    sqlite3_bind_text(st, idx, k.data(), (int)k.size(), SQLITE_TRANSIENT);
+}
+
+// per-application session cookie name (like IIS's ASPSESSIONIDxxxxxxxx), so
+// apps on one host never overwrite each other's session cookie
+std::string sessionCookieName() {
+    uint32_t h = 2166136261u; // FNV-1a of the app namespace
+    for (unsigned char c : g_appNs) { h ^= c; h *= 16777619u; }
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%08x", h);
+    return std::string("MScriptSessionID_") + buf;
+}
 
 // an abandoned session id is dead: reads see nothing and writes are dropped,
 // so an in-flight request holding the old id cannot recreate its state
@@ -716,7 +748,7 @@ bool sessionIsDead(const std::string& sid) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "SELECT 1 FROM dead WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
         return false;
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     bool dead = sqlite3_step(st) == SQLITE_ROW;
     sqlite3_finalize(st);
     return dead;
@@ -729,7 +761,7 @@ void sessionMarkDead(const std::string& sid) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO dead(sid, until) VALUES(?1, ?2)", -1, &st, nullptr) != SQLITE_OK)
         stateFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     sqlite3_bind_double(st, 2, (double)std::time(nullptr) + 86400.0);
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("mark dead");
     sqlite3_finalize(st);
@@ -745,7 +777,7 @@ std::string stateGet(bool isSession, const std::string& sid, const std::string& 
         : "SELECT v FROM app WHERE k=?1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) return "";
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
     } else {
         std::string ak = appKey(k);
@@ -770,7 +802,7 @@ void stateSet(bool isSession, const std::string& sid, const std::string& k, cons
         : "INSERT OR REPLACE INTO app(k, v) VALUES(?1, ?2)";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, v.data(), (int)v.size(), SQLITE_TRANSIENT);
     } else {
@@ -789,12 +821,12 @@ void stateRemoveAll(const std::string& sid) {
     // interpolated into SQL text
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
     if (sqlite3_prepare_v2(db, "DELETE FROM session_meta WHERE sid=?1", -1, &st, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
@@ -809,7 +841,7 @@ void stateRemove(bool isSession, const std::string& sid, const std::string& k) {
         : "DELETE FROM app WHERE k=?1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
         sqlite3_bind_text(st, 2, k.data(), (int)k.size(), SQLITE_TRANSIENT);
     } else {
         std::string ak = appKey(k);
@@ -829,9 +861,9 @@ long long stateCount(bool isSession, const std::string& sid) {
         : "SELECT COUNT(*) FROM app WHERE instr(k, ?1)=1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
     } else {
-        std::string ns = g_appNs + "|";
+        std::string ns = nsPrefix();
         sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
     }
     long long n = 0;
@@ -852,9 +884,9 @@ void stateRemoveAllKeys(bool isSession, const std::string& sid) {
         : "DELETE FROM app WHERE instr(k, ?1)=1";
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
     if (isSession) {
-        sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+        bindSid(st, 1, sid);
     } else {
-        std::string ns = g_appNs + "|";
+        std::string ns = nsPrefix();
         sqlite3_bind_text(st, 1, ns.data(), (int)ns.size(), SQLITE_TRANSIENT);
     }
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("removeall");
@@ -871,7 +903,7 @@ void sessionTouch(const std::string& sid) {
             "INSERT INTO session_meta(sid, last) VALUES(?1, ?2) "
             "ON CONFLICT(sid) DO UPDATE SET last=?2", -1, &st, nullptr) != SQLITE_OK)
         stateFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     sqlite3_bind_double(st, 2, (double)std::time(nullptr));
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("touch");
     sqlite3_finalize(st);
@@ -896,7 +928,7 @@ bool sessionExpireIfNeeded(const std::string& sid, long long timeoutMin) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, "SELECT last FROM session_meta WHERE sid=?1", -1, &st, nullptr) != SQLITE_OK)
         rollbackFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     int rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
         double last = sqlite3_column_double(st, 0);
@@ -907,7 +939,7 @@ bool sessionExpireIfNeeded(const std::string& sid, long long timeoutMin) {
     if (expired) {
         for (const char* sql : {"DELETE FROM sessions WHERE sid=?1", "DELETE FROM session_meta WHERE sid=?1"}) {
             if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) rollbackFail("prepare");
-            sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+            bindSid(st, 1, sid);
             rc = sqlite3_step(st);
             sqlite3_finalize(st);
             if (rc != SQLITE_DONE) rollbackFail("expire");
@@ -925,7 +957,7 @@ void sessionSetProp(const std::string& sid, const char* col, long long v) {
                       "ON CONFLICT(sid) DO UPDATE SET " + col + "=?3";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) stateFail("prepare");
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     sqlite3_bind_double(st, 2, (double)std::time(nullptr));
     sqlite3_bind_int64(st, 3, v);
     if (sqlite3_step(st) != SQLITE_DONE) stateFail("set prop");
@@ -938,7 +970,7 @@ long long sessionGetProp(const std::string& sid, const char* col, long long dflt
     std::string sql = std::string("SELECT ") + col + " FROM session_meta WHERE sid=?1";
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) return dflt;
-    sqlite3_bind_text(st, 1, sid.data(), (int)sid.size(), SQLITE_TRANSIENT);
+    bindSid(st, 1, sid);
     long long out = dflt;
     if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
         out = sqlite3_column_int64(st, 0);
@@ -1186,7 +1218,8 @@ Variant fromJsonText(const std::string& s) {
 // whenever the request arrived over TLS
 void setSessionCookie(const std::string& sid) {
     if (!g_resp) return;
-    auto ck = std::make_shared<CookieObj>("mscriptsessionid");
+    const std::string name = sessionCookieName();
+    auto ck = std::make_shared<CookieObj>(lower(name));
     ck->value = sid;
     ck->props["path"] = Variant::mkStr("/");
     ck->props["httponly"] = Variant::mkBool(true);
@@ -1196,11 +1229,11 @@ void setSessionCookie(const std::string& sid) {
         ck->props["secure"] = Variant::mkBool(true);
     // replace any same-named (case-insensitive) entry
     for (auto it = g_resp->outCookies.begin(); it != g_resp->outCookies.end();) {
-        if (lower(it->first) == "mscriptsessionid") it = g_resp->outCookies.erase(it);
+        if (lower(it->first) == lower(name)) it = g_resp->outCookies.erase(it);
         else ++it;
     }
-    g_resp->outCookies["MScriptSessionID"] = ck;
-    g_resp->dirtyCookies.insert("mscriptsessionid");
+    g_resp->outCookies[name] = ck;
+    g_resp->dirtyCookies.insert(lower(name));
 }
 
 // cryptographic session ids from the OS CSPRNG
@@ -1658,7 +1691,7 @@ void registerAspObjects(Interp& ip, bool cgi) {
     auto sid = std::make_shared<std::string>();
     auto ended = std::make_shared<bool>(false); // Session_OnEnd fired this request
     {
-        auto it = reqCookies.find("mscriptsessionid");
+        auto it = reqCookies.find(lower(sessionCookieName()));
         // only reuse an id this server issued that is still live: a
         // malformed, unknown (client-chosen), expired or abandoned id is
         // replaced with a fresh one, so an attacker cannot fix a victim's
@@ -1706,7 +1739,7 @@ void aspGlobalAsaHooks(Interp& ip) {
     // requests must not both run Application_OnStart, and a hook error must
     // not leave the marker unset (the claim lives in the separate meta table,
     // never visible through Application.Contents)
-    if (metaClaim(g_appNs + "|onstart")) ip.callGlobalProc("application_onstart");
+    if (metaClaim(nsPrefix() + "onstart")) ip.callGlobalProc("application_onstart");
     if (ip.aspNewSession) ip.callGlobalProc("session_onstart");
 }
 

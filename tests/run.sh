@@ -44,18 +44,16 @@ for t in tests/*.vbs tests/*.asp; do
         export MScript_ASP_STATE_DB
         QUERY_STRING="name=mscript&n=42"
         export QUERY_STRING
-        # 39_* exercises CGI headers/cookies: run as GET with a fixed session
-        # id, registered as a live session first (unknown ids are rotated to
-        # block session fixation) so no session Set-Cookie line is emitted
+        # 39_* exercises CGI headers/cookies as GET. A priming request issues
+        # a real session (unknown ids are rotated to block fixation); the test
+        # run then presents it, so no session Set-Cookie line is emitted
         case "$name" in
         39_*)
-            command -v sqlite3 >/dev/null 2>&1 || { echo "SKIP $name (no sqlite3)"; continue; }
-            sqlite3 "$MScript_ASP_STATE_DB" \
-                "CREATE TABLE IF NOT EXISTS session_meta(sid TEXT PRIMARY KEY, last REAL, lcid INTEGER, codepage INTEGER);
-                 INSERT OR REPLACE INTO session_meta(sid, last) VALUES('0123456789abcdef0123456789abcdef', strftime('%s','now'));" || continue
             REQUEST_METHOD=GET
             export REQUEST_METHOD
-            HTTP_COOKIE="MScriptSessionID=0123456789abcdef0123456789abcdef; theme=dark"
+            sess=$(env HTTP_COOKIE= "$BIN" "$t" 2>/dev/null |
+                sed -n 's/^Set-Cookie: \(MScriptSessionID_[^;]*\);.*/\1/p')
+            HTTP_COOKIE="$sess; theme=dark"
             export HTTP_COOKIE
             ;;
         esac
@@ -147,10 +145,34 @@ if [ -d tests/aspsec ]; then
     asp_check quote_swallow match 'title="x?" href=" onmouseover' tests/aspsec/encode.asp \
         'QUERY_STRING=a=x%C3&b=%20onmouseover%3Dalert(1)'
     asp_check utf8_valid match 'caf.!' tests/aspsec/encode.asp 'QUERY_STRING=a=caf%C3%A9!&b='
+    # session cookie name of an app (per-app, like IIS): $1 = a page in it
+    sess_cookie() {
+        env -u HTTP_COOKIE REQUEST_METHOD=GET MScript_ASP_STATE_DB="$sdb" "$BIN" "$1" 2>/dev/null </dev/null |
+            sed -n 's/^Set-Cookie: \(MScriptSessionID_[0-9a-f]*\)=.*/\1/p'
+    }
+    sname=$(sess_cookie tests/aspsec/sid.asp)
     # a client-chosen (never issued) session id is replaced, with a hardened cookie
     asp_check fixation nomatch 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' tests/aspsec/sid.asp \
-        'HTTP_COOKIE=MScriptSessionID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    asp_check cookie_flags match 'MScriptSessionID=[0-9a-f]*; path=/; httponly; samesite=Lax' tests/aspsec/sid.asp
+        "HTTP_COOKIE=$sname=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    asp_check cookie_flags match 'MScriptSessionID_[0-9a-f]\{8\}=[0-9a-f]\{32\}; path=/; httponly; samesite=Lax' \
+        tests/aspsec/sid.asp
+    # a session id issued by app A is unknown to app B (sessions are per app)
+    aname=$(sess_cookie tests/aspsec/appa/set.asp)
+    bname=$(sess_cookie tests/aspsec/appb/get.asp)
+    asid=$(env -u HTTP_COOKIE -u REQUEST_METHOD MScript_ASP_STATE_DB="$sdb" "$BIN" tests/aspsec/appa/set.asp 2>/dev/null </dev/null | tr -d "\r\n")
+    if [ -n "$aname" ] && [ "$aname" != "$bname" ] && expr "$asid" : '[0-9a-f]\{32\}$' >/dev/null; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "FAIL aspsec_cookie_per_app ($aname / $bname)"; fi
+    asp_check cross_app_session match '^\[\]' tests/aspsec/appb/get.asp \
+        "HTTP_COOKIE=$aname=$asid; $bname=$asid"
+    # an app directory containing '|' cannot alias a sibling app's keys
+    nsd="$tmp.ns"
+    mkdir -p "$nsd/x" "$nsd/x|y"
+    : >"$nsd/x/global.asa"; : >"$nsd/x|y/global.asa"
+    printf '<%% Application("y|k") = "leak" %%>\n' >"$nsd/x/set.asp"
+    printf '[<%%= Application("k") %%>]\n' >"$nsd/x|y/get.asp"
+    env -u HTTP_COOKIE MScript_ASP_STATE_DB="$sdb" "$BIN" "$nsd/x/set.asp" >/dev/null 2>&1 </dev/null
+    asp_check app_ns_pipe match '^\[\]' "$nsd/x|y/get.asp"
+    rm -rf "$nsd"
     asp_check cookie_secure match '; secure; httponly' tests/aspsec/sid.asp HTTPS=on
     # huge Response.Expires must not crash (gmtime NULL)
     asp_check expires_huge match 'Expires: .* 9999 ' tests/aspsec/expires.asp
